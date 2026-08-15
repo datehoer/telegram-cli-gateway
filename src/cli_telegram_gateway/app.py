@@ -72,8 +72,6 @@ HELP_TEXT = """远程 CLI 网关
 /model [名称]       查看或切换当前会话模型
 /effort [级别]      查看或切换推理力度
 /send <文本>        显式发送给当前 CLI
-/file <路径>        从允许目录发送文件到 Telegram
-/photo <路径>       从允许目录发送图片到 Telegram
 /help               查看帮助
 
 支持的 CLI：claude、codex、grok、pi。
@@ -97,8 +95,6 @@ BOT_COMMANDS = (
     ("delete", "删除会话"),
     ("model", "切换当前会话模型"),
     ("effort", "切换推理力度"),
-    ("file", "发送本地文件"),
-    ("photo", "发送本地图片"),
     ("help", "显示帮助"),
 )
 
@@ -426,9 +422,6 @@ class GatewayApp:
                 self._send(chat_id, "找不到要删除的会话。")
                 return
             self._send_delete_confirmation(chat_id, session)
-            return
-        if command in {"file", "photo"}:
-            self._send_local_path(chat_id, raw_args, as_photo=command == "photo")
             return
         if command == "send":
             if not raw_args:
@@ -1528,31 +1521,6 @@ class GatewayApp:
         )
         self.telegram.download_file(file_id, destination, self.config.telegram_max_file_bytes)
         return Attachment(destination, safe_name, mime_type, is_image)
-
-    def _send_local_path(self, chat_id: int, raw_path: str, as_photo: bool) -> None:
-        session = self._current_or_reply(chat_id)
-        if not session:
-            return
-        args = self._parse_args(chat_id, raw_path)
-        if args is None:
-            return
-        if len(args) != 1:
-            self._send(chat_id, "用法：/photo <图片路径>" if as_photo else "用法：/file <文件路径>")
-            return
-        candidate = Path(args[0]).expanduser()
-        if not candidate.is_absolute():
-            candidate = Path(session.cwd) / candidate
-        try:
-            candidate = candidate.resolve(strict=True)
-            if not candidate.is_file():
-                raise ValueError("不是普通文件")
-            if not any(candidate == root or candidate.is_relative_to(root) for root in self.config.allowed_roots):
-                raise ValueError("文件不在 ALLOWED_WORKDIRS 中")
-            if candidate.stat().st_size > self.config.telegram_max_file_bytes:
-                raise ValueError("文件超过配置的发送大小限制")
-            self.telegram.send_local_file(chat_id, candidate, as_photo=as_photo)
-        except (OSError, ValueError, TelegramError) as exc:
-            self._send(chat_id, f"发送文件失败：{exc}")
 
     def _prepare_sessions(self) -> None:
         for session in self.sessions.all_sessions():

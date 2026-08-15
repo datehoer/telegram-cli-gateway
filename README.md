@@ -21,7 +21,6 @@
 - 使用原生 Rich Markdown 渲染表格、标题、列表、任务列表、链接、引用、公式和代码块
 - Rich Messages 不可用时自动回退到安全 HTML/纯文本
 - 接收 Telegram 文件和图片并交给当前 CLI
-- `/file <路径>` 与 `/photo <路径>` 把允许目录中的本地文件发回 Telegram
 - 回答提到允许目录内真实存在的文件时，自动附加“一键发送文件/图片”按钮
 - 回答完成后自动发送产物：`AUTO_SEND_ARTIFACTS=images`（默认，只自动发≤10MB 的图片）/ `all`（图片+文件）/ `off`（仅按钮）
 - 会话 ID、本地状态和 CLI 上下文持久化
@@ -40,7 +39,7 @@
 
 这意味着白名单账号发出的提示可以让 CLI 读写本机文件并执行命令。请把 Telegram Bot token 和白名单账号视为高权限凭据，不要开启陌生用户或不受控群聊。
 
-`ALLOWED_WORKDIRS` 限制会话起始目录以及 `/file`、`/photo` 可主动发送的路径，但它不是 CLI 的文件系统沙箱；免审批 CLI 本身仍能访问其操作系统账号有权访问的内容。
+`ALLOWED_WORKDIRS` 限制会话起始目录以及网关可发送的本地产物路径，但它不是 CLI 的文件系统沙箱；免审批 CLI 本身仍能访问其操作系统账号有权访问的内容。
 
 ## 配置
 
@@ -87,8 +86,6 @@ ENABLED_CLIS=claude,codex,grok,pi
 /model
 /model sonnet
 /effort high
-/file README.md
-/photo /srv/projects/example/screenshot.png
 ```
 
 普通文字直接发给当前会话。发送文件或图片时，caption 会作为提示；没有 caption 时使用“请查看并处理这个附件”。

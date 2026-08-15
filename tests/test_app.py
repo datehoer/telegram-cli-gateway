@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from cli_telegram_gateway.app import (
+    BOT_COMMANDS,
+    HELP_TEXT,
     MAX_PENDING_INPUTS_PER_SESSION,
     RESUME_PROMPT,
     STATE_FAILED,
@@ -50,6 +52,27 @@ class GatewayEventTests(unittest.TestCase):
             auto_resume=auto_resume,
         )
         return GatewayApp(config)
+
+    def test_local_file_commands_are_not_exposed_or_handled(self) -> None:
+        command_names = {name for name, _description in BOT_COMMANDS}
+        self.assertNotIn("file", command_names)
+        self.assertNotIn("photo", command_names)
+        self.assertNotIn("/file", HELP_TEXT)
+        self.assertNotIn("/photo", HELP_TEXT)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            sent: list[str] = []
+            app._send = lambda _chat_id, text: sent.append(text)  # type: ignore[method-assign]
+
+            for command in ("/file report.txt", "/photo chart.png"):
+                app.handle_update({"message": {
+                    "from": {"id": 1},
+                    "chat": {"id": 1, "type": "private"},
+                    "text": command,
+                }})
+
+            self.assertEqual(sent, ["未知命令。使用 /help 查看可用命令。"] * 2)
 
     def test_new_command_without_args_shows_enabled_cli_buttons(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
