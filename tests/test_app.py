@@ -28,7 +28,12 @@ class FakeCodex:
 
 
 class GatewayEventTests(unittest.TestCase):
-    def make_app(self, project: Path, auto_resume: bool = False) -> GatewayApp:
+    def make_app(
+        self,
+        project: Path,
+        auto_resume: bool = False,
+        enabled_clis: tuple[str, ...] = ("claude", "codex", "grok", "pi"),
+    ) -> GatewayApp:
         config = Config(
             project_dir=project,
             bot_token="test",
@@ -41,9 +46,110 @@ class GatewayEventTests(unittest.TestCase):
             output_poll_interval=0.1,
             output_max_bytes=65536,
             tmux_socket_name="tcg-app-test",
+            enabled_clis=enabled_clis,
             auto_resume=auto_resume,
         )
         return GatewayApp(config)
+
+    def test_new_command_without_args_shows_enabled_cli_buttons(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project, enabled_clis=("codex", "pi"))
+            sent: list[tuple[str, dict[str, Any]]] = []
+            app.telegram.send_message = (  # type: ignore[method-assign]
+                lambda _chat_id, text, reply_markup=None: sent.append((text, reply_markup))
+            )
+
+            app.handle_update({"message": {
+                "from": {"id": 1},
+                "chat": {"id": 1, "type": "private"},
+                "text": "/new",
+            }})
+
+            self.assertEqual(len(sent), 1)
+            self.assertIn(f"默认目录：{project}", sent[0][0])
+            callbacks = {
+                button["callback_data"]
+                for row in sent[0][1]["inline_keyboard"]
+                for button in row
+            }
+            self.assertEqual(callbacks, {"new:codex", "new:pi"})
+
+    def test_new_callback_creates_selected_cli_and_closes_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            created: list[tuple[int, str, str | None]] = []
+            answered: list[tuple[str, str]] = []
+            edited: list[tuple[int, int, str]] = []
+            app._new_session = (  # type: ignore[method-assign]
+                lambda chat_id, cli, cwd: created.append((chat_id, cli, cwd))
+            )
+            app.telegram.answer_callback_query = (  # type: ignore[method-assign]
+                lambda query_id, text="": answered.append((query_id, text))
+            )
+            app.telegram.edit_message = (  # type: ignore[method-assign]
+                lambda chat_id, message_id, text, reply_markup=None: edited.append(
+                    (chat_id, message_id, text)
+                )
+            )
+
+            app.handle_update({"callback_query": {
+                "id": "new-pi",
+                "from": {"id": 1},
+                "data": "new:pi",
+                "message": {"message_id": 42, "chat": {"id": 1, "type": "private"}},
+            }})
+
+            self.assertEqual(created, [(1, "pi", None)])
+            self.assertEqual(answered, [("new-pi", "正在创建 pi")])
+            self.assertEqual(edited, [(1, 42, "已选择 pi，正在创建…")])
+
+    def test_new_callback_rejects_disabled_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project, enabled_clis=("codex",))
+            created: list[str] = []
+            answered: list[str] = []
+            app._new_session = (  # type: ignore[method-assign]
+                lambda _chat_id, cli, _cwd: created.append(cli)
+            )
+            app.telegram.answer_callback_query = (  # type: ignore[method-assign]
+                lambda _query_id, text="": answered.append(text)
+            )
+
+            app.handle_update({"callback_query": {
+                "id": "stale-pi",
+                "from": {"id": 1},
+                "data": "new:pi",
+                "message": {"message_id": 42, "chat": {"id": 1, "type": "private"}},
+            }})
+
+            self.assertEqual(created, [])
+            self.assertEqual(answered, ["CLI 已失效，请重新 /new"])
+
+    def test_new_callback_rejects_unapproved_user(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            created: list[str] = []
+            answered: list[str] = []
+            app._new_session = (  # type: ignore[method-assign]
+                lambda _chat_id, cli, _cwd: created.append(cli)
+            )
+            app.telegram.answer_callback_query = (  # type: ignore[method-assign]
+                lambda _query_id, text="": answered.append(text)
+            )
+
+            app.handle_update({"callback_query": {
+                "id": "unauthorized-pi",
+                "from": {"id": 2},
+                "data": "new:pi",
+                "message": {"message_id": 42, "chat": {"id": 1, "type": "private"}},
+            }})
+
+            self.assertEqual(created, [])
+            self.assertEqual(answered, ["没有权限"])
 
     def test_codex_deltas_accumulate_and_render_as_one_completed_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -73,6 +73,7 @@ ENABLED_CLIS=claude,codex,grok,pi
 ## 使用
 
 ```text
+/new
 /new codex /srv/projects/my-project
 /new claude
 /use grok

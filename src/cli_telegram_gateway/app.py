@@ -54,7 +54,7 @@ RESUME_PROMPT = (
 
 HELP_TEXT = """远程 CLI 网关
 
-/new <cli> [目录]  新建独立会话
+/new [cli] [目录]  新建会话；无参数时点选 CLI
 /use <会话ID|cli>  切换；该 CLI 无会话时自动新建
 /back               回到上一个会话
 /sessions           查看会话列表
@@ -171,8 +171,7 @@ class GatewayApp:
     def _current_or_reply(self, chat_id: int) -> CliSession | None:
         session = self.sessions.current(chat_id)
         if not session:
-            choices = "、".join(self.config.enabled_clis)
-            self._send(chat_id, f"当前没有活动会话。使用 /new <{choices}> 创建一个。")
+            self._send(chat_id, "当前没有活动会话。使用 /new 选择并创建一个。")
             return None
         if session.cli not in self.config.enabled_clis:
             self._send(chat_id, f"此 Bot 未启用 {session.cli}，请新建已启用的 CLI 会话。")
@@ -204,6 +203,23 @@ class GatewayApp:
             f"已创建并切换到 {session.session_id}\nCLI：{session.cli}\n目录：{session.cwd}\n权限：免审批",
         )
 
+    def _send_new_session_picker(self, chat_id: int) -> None:
+        buttons = [
+            [
+                {"text": cli, "callback_data": f"new:{cli}"}
+                for cli in self.config.enabled_clis[index : index + 2]
+            ]
+            for index in range(0, len(self.config.enabled_clis), 2)
+        ]
+        try:
+            self.telegram.send_message(
+                chat_id,
+                f"选择要创建的 CLI：\n默认目录：{self.config.default_workdir}",
+                reply_markup={"inline_keyboard": buttons},
+            )
+        except TelegramError:
+            LOGGER.exception("could not send new-session picker to chat %s", chat_id)
+
     def _parse_args(self, chat_id: int, raw_args: str) -> list[str] | None:
         try:
             return shlex.split(raw_args)
@@ -226,7 +242,10 @@ class GatewayApp:
             args = self._parse_args(chat_id, raw_args)
             if args is None:
                 return
-            if not args or len(args) > 2:
+            if not args:
+                self._send_new_session_picker(chat_id)
+                return
+            if len(args) > 2:
                 self._send(chat_id, f"用法：/new <{'|'.join(self.config.enabled_clis)}> [目录]")
                 return
             self._new_session(chat_id, args[0], args[1] if len(args) == 2 else None)
@@ -656,6 +675,25 @@ class GatewayApp:
                 pass
             return
         action, target = data.split(":", 1)
+        if action == "new":
+            if target not in self.config.enabled_clis:
+                try:
+                    self.telegram.answer_callback_query(query_id, "CLI 已失效，请重新 /new")
+                except TelegramError:
+                    pass
+                return
+            try:
+                self.telegram.answer_callback_query(query_id, f"正在创建 {target}")
+            except TelegramError:
+                LOGGER.exception("could not answer new-session callback for chat %s", chat_id)
+            if isinstance(message_id, int):
+                try:
+                    self.telegram.edit_message(chat_id, message_id, f"已选择 {target}，正在创建…")
+                except TelegramError:
+                    LOGGER.exception("could not close new-session picker for chat %s", chat_id)
+            self._new_session(chat_id, target, None)
+            return
+
         if action in {"file", "photo"}:
             resolved = self.sessions.resolve_artifact(chat_id, target)
             if not resolved:
