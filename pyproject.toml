@@ -1,0 +1,20 @@
+[project]
+name = "telegram-cli-gateway"
+version = "0.1.0"
+description = "A small Telegram gateway for switching between persistent AI CLI sessions."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+telegram-cli-gateway = "cli_telegram_gateway.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

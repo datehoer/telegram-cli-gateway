@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import secrets
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from cli_telegram_gateway.config import Config
+from cli_telegram_gateway.sessions import SessionManager, clean_terminal_output
+
+
+class TerminalOutputTests(unittest.TestCase):
+    def test_removes_ansi_and_applies_backspace(self) -> None:
+        raw = b"\x1b[31mred\x1b[0m ab\bcd\r\n"
+        self.assertEqual(clean_terminal_output(raw), "red acd")
+
+
+class SessionStateTests(unittest.TestCase):
+    def make_manager(self, project: Path) -> SessionManager:
+        return SessionManager(
+            Config(
+                project_dir=project,
+                bot_token="test",
+                allowed_user_ids=frozenset({1}),
+                allow_groups=False,
+                allowed_roots=(project,),
+                default_workdir=project,
+                cli_commands={"pi": ("pi",)},
+                poll_timeout=1,
+                output_poll_interval=0.1,
+                output_max_bytes=65536,
+                tmux_socket_name="unused",
+            )
+        )
+
+    def test_message_routes_names_and_archives_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.rename(session.session_id, "研究助手")
+            manager.bind_message(1, 99, session.session_id)
+            reloaded = self.make_manager(project)
+            self.assertEqual(reloaded.session_for_message(1, 99).label, "研究助手")  # type: ignore[union-attr]
+            reloaded.set_archived(session.session_id, True)
+            self.assertIsNone(reloaded.session_for_message(1, 99))
+            self.assertEqual(reloaded.list_for_chat(1), [])
+            self.assertEqual(len(reloaded.list_for_chat(1, include_archived=True)), 1)
+
+    def test_model_and_effort_persist_and_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            self.assertIsNone(session.model)
+            self.assertIsNone(session.effort)
+            manager.set_model(session.session_id, "gpt-5.5")
+            manager.set_effort(session.session_id, "low")
+            reloaded = self.make_manager(project)
+            restored = reloaded.get(session.session_id)
+            self.assertEqual(restored.model, "gpt-5.5")  # type: ignore[union-attr]
+            self.assertEqual(restored.effort, "low")  # type: ignore[union-attr]
+            reloaded.set_model(session.session_id, None)
+            reloaded.set_effort(session.session_id, None)
+            cleared = reloaded.get(session.session_id)
+            self.assertIsNone(cleared.model)  # type: ignore[union-attr]
+            self.assertIsNone(cleared.effort)  # type: ignore[union-attr]
+
+
+class TmuxIntegrationTests(unittest.TestCase):
+    def test_create_send_read_and_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            socket_name = f"tcg-test-{secrets.token_hex(4)}"
+            config = Config(
+                project_dir=project,
+                bot_token="test",
+                allowed_user_ids=frozenset({1}),
+                allow_groups=False,
+                allowed_roots=(project,),
+                default_workdir=project,
+                cli_commands={"sh": ("/bin/sh", "-i")},
+                poll_timeout=1,
+                output_poll_interval=0.1,
+                output_max_bytes=65536,
+                tmux_socket_name=socket_name,
+            )
+            manager = SessionManager(config)
+            session = manager.create("sh", project, 1)
+            try:
+                self.assertTrue(manager.is_alive(session))
+                time.sleep(0.2)
+                manager.read_new_output(session)
+                manager.send_text(session, "printf 'gateway-test-output\\n'")
+
+                output = ""
+                deadline = time.monotonic() + 4
+                while "gateway-test-output" not in output and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                    output += manager.read_new_output(session)
+                self.assertIn("gateway-test-output", output)
+            finally:
+                manager.stop(session)
+            self.assertFalse(manager.is_alive(session))
+
+
+if __name__ == "__main__":
+    unittest.main()

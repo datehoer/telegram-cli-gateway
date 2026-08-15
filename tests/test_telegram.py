@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import io
+import json
+import unittest
+import urllib.error
+from unittest.mock import patch
+
+from cli_telegram_gateway.telegram import TelegramClient, TelegramError, split_message
+
+
+class TelegramTests(unittest.TestCase):
+    def test_http_error_exposes_telegram_retry_after(self) -> None:
+        client = TelegramClient("test")
+        body = json.dumps({
+            "ok": False,
+            "description": "Too Many Requests",
+            "parameters": {"retry_after": 7},
+        }).encode("utf-8")
+        error = urllib.error.HTTPError(
+            "https://api.telegram.org/test",
+            429,
+            "Too Many Requests",
+            {},
+            io.BytesIO(body),
+        )
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(TelegramError) as caught:
+                client._call("sendMessage", {"chat_id": 1, "text": "hello"})
+        self.assertEqual(caught.exception.retry_after, 7)
+
+    def test_split_message_prefers_newline(self) -> None:
+        chunks = split_message("a" * 6 + "\n" + "b" * 6, limit=10)
+        self.assertEqual(chunks, ["aaaaaa", "bbbbbb"])
+
+    def test_split_message_hard_splits_long_line(self) -> None:
+        chunks = split_message("abcdefghijk", limit=5)
+        self.assertEqual(chunks, ["abcde", "fghij", "k"])
+
+    def test_send_message_returns_first_message_id(self) -> None:
+        client = TelegramClient("test")
+        calls: list[str] = []
+
+        def fake_call(method: str, _payload: object = None) -> object:
+            calls.append(method)
+            return {"message_id": len(calls)}
+
+        client._call = fake_call  # type: ignore[method-assign]
+        self.assertEqual(client.send_message(1, "hello"), 1)
+        self.assertEqual(calls, ["sendMessage"])
+
+    def test_session_keyboard_is_sent_as_reply_markup(self) -> None:
+        client = TelegramClient("test")
+        payloads: list[object] = []
+
+        def fake_call(_method: str, payload: object = None) -> object:
+            payloads.append(payload)
+            return {"message_id": 1}
+
+        client._call = fake_call  # type: ignore[method-assign]
+        markup = {"inline_keyboard": [[{"text": "one", "callback_data": "use:one"}]]}
+        client.send_message(1, "sessions", reply_markup=markup)
+        self.assertEqual(payloads[0]["reply_markup"], markup)  # type: ignore[index]
+
+    def test_send_markdown_uses_safe_html_parse_mode(self) -> None:
+        client = TelegramClient("test")
+        payloads: list[object] = []
+
+        def fake_call(_method: str, payload: object = None) -> object:
+            payloads.append(payload)
+            return {"message_id": 1}
+
+        client._call = fake_call  # type: ignore[method-assign]
+        client.send_markdown(1, "**hello** <world>")
+        self.assertEqual(payloads[0]["parse_mode"], "HTML")  # type: ignore[index]
+        self.assertEqual(payloads[0]["text"], "<b>hello</b> &lt;world&gt;")  # type: ignore[index]
+
+    def test_send_rich_markdown_passes_gfm_table_to_rich_message_api(self) -> None:
+        client = TelegramClient("test")
+        calls: list[tuple[str, object]] = []
+
+        def fake_call(method: str, payload: object = None) -> object:
+            calls.append((method, payload))
+            return {"message_id": 7}
+
+        client._call = fake_call  # type: ignore[method-assign]
+        table = "| Name | Value |\n|---|---|\n| one | two |"
+        self.assertEqual(client.send_rich_markdown(1, table), 7)
+        self.assertEqual(calls[0][0], "sendRichMessage")
+        self.assertEqual(calls[0][1]["rich_message"], {"markdown": table})  # type: ignore[index]
+
+    def test_edit_rich_markdown_replaces_fallback_message_with_rich_content(self) -> None:
+        client = TelegramClient("test")
+        calls: list[tuple[str, object]] = []
+        client._call = (  # type: ignore[method-assign]
+            lambda method, payload=None: calls.append((method, payload)) or {"message_id": 1}
+        )
+        table = "| A | B |\n|---|---|\n| 1 | 2 |"
+        client.edit_rich_markdown(1, 9, table)
+        self.assertEqual(calls[0][0], "editMessageText")
+        self.assertEqual(calls[0][1]["message_id"], 9)  # type: ignore[index]
+        self.assertEqual(calls[0][1]["rich_message"], {"markdown": table})  # type: ignore[index]
+
+    def test_edit_rich_markdown_tolerates_unchanged_message(self) -> None:
+        client = TelegramClient("test")
+        client._call = (  # type: ignore[method-assign]
+            lambda _method, _payload=None: (_ for _ in ()).throw(
+                TelegramError("message is not modified")
+            )
+        )
+        client.edit_rich_markdown(1, 9, "same content")  # 不应抛出
+
+
+if __name__ == "__main__":
+    unittest.main()

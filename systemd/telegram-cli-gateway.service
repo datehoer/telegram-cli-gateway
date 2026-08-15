@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram CLI Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/projects/telegram-cli-gateway
+ExecStart=/srv/projects/telegram-cli-gateway/scripts/run.sh
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target
