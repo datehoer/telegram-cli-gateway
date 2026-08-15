@@ -171,7 +171,11 @@ class GatewayApp:
     def _current_or_reply(self, chat_id: int) -> CliSession | None:
         session = self.sessions.current(chat_id)
         if not session:
-            self._send(chat_id, "当前没有活动会话。使用 /new claude 或 /use codex 创建一个。")
+            choices = "、".join(self.config.enabled_clis)
+            self._send(chat_id, f"当前没有活动会话。使用 /new <{choices}> 创建一个。")
+            return None
+        if session.cli not in self.config.enabled_clis:
+            self._send(chat_id, f"此 Bot 未启用 {session.cli}，请新建已启用的 CLI 会话。")
             return None
         if not self.sessions.is_alive(session):
             self._send(chat_id, f"会话 {session.session_id} 已经退出，请创建或切换到其他会话。")
@@ -180,8 +184,8 @@ class GatewayApp:
 
     def _new_session(self, chat_id: int, cli: str, requested_cwd: str | None) -> None:
         cli = cli.lower()
-        if cli not in self.config.cli_commands:
-            self._send(chat_id, f"不支持的 CLI：{cli}。可选：{', '.join(self.config.cli_commands)}")
+        if cli not in self.config.enabled_clis:
+            self._send(chat_id, f"此 Bot 未启用 {cli}。可选：{', '.join(self.config.enabled_clis)}")
             return
         try:
             cwd = self.config.resolve_workdir(requested_cwd)
@@ -209,27 +213,34 @@ class GatewayApp:
 
     def _handle_command(self, chat_id: int, command: str, raw_args: str) -> None:
         if command in ("start", "help"):
-            self._send(chat_id, HELP_TEXT)
+            supported = "、".join(self.config.enabled_clis)
+            self._send(
+                chat_id,
+                HELP_TEXT.replace(
+                    "支持的 CLI：claude、codex、grok、pi。",
+                    f"此 Bot 启用的 CLI：{supported}。",
+                ),
+            )
             return
         if command == "new":
             args = self._parse_args(chat_id, raw_args)
             if args is None:
                 return
             if not args or len(args) > 2:
-                self._send(chat_id, "用法：/new <claude|codex|grok|pi> [目录]")
+                self._send(chat_id, f"用法：/new <{'|'.join(self.config.enabled_clis)}> [目录]")
                 return
             self._new_session(chat_id, args[0], args[1] if len(args) == 2 else None)
             return
         if command == "use":
             target = raw_args.strip().lower()
             if not target:
-                self._send(chat_id, "用法：/use <会话ID|claude|codex|grok|pi>")
+                self._send(chat_id, f"用法：/use <会话ID|{'|'.join(self.config.enabled_clis)}>")
                 return
             session = self.sessions.resolve(chat_id, target)
-            if session:
+            if session and session.cli in self.config.enabled_clis:
                 self.sessions.switch(chat_id, session.session_id)
                 self._send(chat_id, f"已切换到 {session.session_id}\n目录：{session.cwd}")
-            elif target in self.config.cli_commands:
+            elif target in self.config.enabled_clis:
                 current = self.sessions.current(chat_id)
                 self._new_session(chat_id, target, current.cwd if current else None)
             else:
@@ -897,6 +908,9 @@ class GatewayApp:
         text: str,
         attachments: tuple[Attachment, ...] = (),
     ) -> None:
+        if session.cli not in self.config.enabled_clis:
+            self._send(chat_id, f"此 Bot 未启用 {session.cli}，不能继续该会话。")
+            return
         if self._session_is_busy(session):
             if session.backend == "codex-app-server" and session.external_id:
                 with self._state_lock:
@@ -954,6 +968,9 @@ class GatewayApp:
         text: str,
         attachments: tuple[Attachment, ...] = (),
     ) -> None:
+        if session.cli not in self.config.enabled_clis:
+            self._send(chat_id, f"此 Bot 未启用 {session.cli}，不能启动任务。")
+            return
         try:
             self.telegram.send_action(chat_id)
         except TelegramError:
@@ -1381,22 +1398,24 @@ class GatewayApp:
             with self._state_lock:
                 views = list(self._turns.values())
             for view in views:
-                if now < view.next_publish_at:
-                    continue
-                should_update = (
-                    not view.published
-                    or view.status != "running"
-                    or now - view.last_edit >= self.config.stream_update_interval
-                )
-                if not should_update:
-                    continue
-                rendered, _answer = self._render_turn(view, now)
+                with self._state_lock:
+                    if now < view.next_publish_at:
+                        continue
+                    should_update = (
+                        not view.published
+                        or view.status != "running"
+                        or now - view.last_edit >= self.config.stream_update_interval
+                    )
+                    if not should_update:
+                        continue
+                    published_status = view.status
+                    rendered, _answer = self._render_turn(view, now)
                 try:
-                    if view.status == "running":
+                    if published_status == "running":
                         self._publish_running_turn(view, rendered)
                     else:
                         self._publish_final_turn(
-                            view, rendered, with_artifacts=view.status != "interrupted"
+                            view, rendered, with_artifacts=published_status != "interrupted"
                         )
                 except TelegramError as exc:
                     delay = self._schedule_publish_retry(view, exc, now)
@@ -1409,10 +1428,16 @@ class GatewayApp:
                     continue
                 with self._state_lock:
                     view.last_edit = now
-                    view.dirty = False
                     view.publish_failures = 0
                     view.next_publish_at = 0.0
-                    if view.status != "running":
+                    if view.status != published_status:
+                        # A terminal event arrived while Telegram was publishing the
+                        # running snapshot. Keep the view so the next pass replaces
+                        # that stale message with the terminal status.
+                        view.dirty = True
+                        continue
+                    view.dirty = False
+                    if published_status != "running":
                         self._turns.pop((view.session.session_id, view.turn_id), None)
 
     @staticmethod
@@ -1493,6 +1518,8 @@ class GatewayApp:
 
     def _prepare_sessions(self) -> None:
         for session in self.sessions.all_sessions():
+            if session.cli not in self.config.enabled_clis:
+                continue
             if session.cli == "codex":
                 if session.backend == "codex-app-server" and session.external_id:
                     try:
@@ -1584,7 +1611,8 @@ class GatewayApp:
         self._acquire_singleton_lock()
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
-        self.codex.start()
+        if "codex" in self.config.enabled_clis:
+            self.codex.start()
         self._prepare_sessions()
         self._recover_interrupted_turns()
         try:
@@ -1612,5 +1640,6 @@ class GatewayApp:
             status_thread.join(timeout=3)
         finally:
             self.headless.close()
-            self.codex.close()
+            if "codex" in self.config.enabled_clis:
+                self.codex.close()
         LOGGER.info("gateway stopped; CLI session IDs remain resumable")

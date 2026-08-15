@@ -68,6 +68,37 @@ class GatewayEventTests(unittest.TestCase):
             self.assertIn("完成 2秒", rendered)
             self.assertNotIn("thread-1", app._codex_active_turns)
 
+    def test_disabled_cli_cannot_create_or_switch_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            disabled = app.sessions.create_headless("claude", project, 1)
+            enabled = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-enabled"
+            )
+            app.config = Config(
+                project_dir=project,
+                bot_token="test",
+                allowed_user_ids=frozenset({1}),
+                allow_groups=False,
+                allowed_roots=(project,),
+                default_workdir=project,
+                cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
+                poll_timeout=1,
+                output_poll_interval=0.1,
+                output_max_bytes=65536,
+                tmux_socket_name="tcg-app-test",
+                enabled_clis=("codex",),
+            )
+            sent: list[str] = []
+            app._send = lambda _chat_id, text: sent.append(text)  # type: ignore[method-assign]
+            app._new_session(1, "claude", None)
+            self.assertIn("未启用 claude", sent[-1])
+            app._handle_command(1, "use", disabled.session_id)
+            self.assertEqual(app.sessions.current(1).session_id, enabled.session_id)  # type: ignore[union-attr]
+            app._send_to_session(1, disabled, "do not run")
+            self.assertIn("不能继续该会话", sent[-1])
+
     def test_codex_approval_is_automatically_accepted_for_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = self.make_app(Path(temporary))
@@ -161,6 +192,48 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(len(published), 1)
             self.assertIn("运行中", published[0])
+
+    def test_completion_during_running_publish_still_publishes_final_status(self) -> None:
+        """运行态编辑期间到达 completed 时，下一轮必须补发完成态，不能提前移除。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_headless("pi", project, 1)
+            view = app._register_turn(session, "turn-race")
+            view.parts.append("complete answer")
+            view.message_id = 88
+            view.published = True
+            view.last_edit = -10.0
+            app.sessions.set_in_flight(session.session_id, session.chat_id, view.turn_id)
+
+            running_updates: list[str] = []
+            final_updates: list[str] = []
+
+            def publish_running(_view: object, rendered: str) -> None:
+                running_updates.append(rendered)
+                app._update_turn(session, view.turn_id, "completed")
+
+            app._publish_running_turn = publish_running  # type: ignore[method-assign]
+            app._publish_final_turn = (  # type: ignore[method-assign]
+                lambda _view, rendered, with_artifacts=True: final_updates.append(rendered)
+            )
+
+            class StopAfterTwoIterations:
+                calls = 0
+
+                def wait(self, _timeout: float) -> bool:
+                    self.calls += 1
+                    return self.calls > 2
+
+            app.stop_event = StopAfterTwoIterations()  # type: ignore[assignment]
+            app._status_loop()
+
+            self.assertEqual(len(running_updates), 1)
+            self.assertIn("运行中", running_updates[0])
+            self.assertEqual(len(final_updates), 1)
+            self.assertIn("完成", final_updates[0])
+            self.assertNotIn((session.session_id, view.turn_id), app._turns)
+            self.assertEqual(app.sessions.stale_in_flight(), [])
 
     def test_completed_turn_keeps_full_rich_markdown_table(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

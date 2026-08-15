@@ -34,6 +34,7 @@ class ConfigTests(unittest.TestCase):
                         "CLI_CODEX=/bin/sh",
                         "CLI_GROK=/bin/sh",
                         "CLI_PI=/bin/sh",
+                        "ENABLED_CLIS=codex, claude codex",
                     ]
                 ),
                 encoding="utf-8",
@@ -47,11 +48,13 @@ class ConfigTests(unittest.TestCase):
                 "CLI_CODEX",
                 "CLI_GROK",
                 "CLI_PI",
+                "ENABLED_CLIS",
             }
             clean_environment = {key: value for key, value in os.environ.items() if key not in keys}
             with patch.dict(os.environ, clean_environment, clear=True):
                 config = Config.load(project)
             self.assertEqual(config.allowed_user_ids, frozenset({100, 200}))
+            self.assertEqual(config.enabled_clis, ("codex", "claude"))
             self.assertEqual(config.resolve_workdir(str(child)), child.resolve())
             with self.assertRaises(ConfigError):
                 config.resolve_workdir("/etc")
@@ -84,6 +87,23 @@ class ConfigTests(unittest.TestCase):
             with patch.dict(os.environ, {**clean_environment, **values}, clear=True):
                 with self.assertRaises(ConfigError):
                     Config.load(project)
+
+    def test_enabled_clis_must_be_known_and_nonempty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            allowed = project / "projects"
+            allowed.mkdir()
+            base_env = {
+                "TELEGRAM_BOT_TOKEN": "123:test",
+                "TELEGRAM_ALLOWED_USERS": "100",
+                "DEFAULT_WORKDIR": str(allowed),
+                "ALLOWED_WORKDIRS": str(allowed),
+            }
+            for raw in ("", "codex,unknown"):
+                values = {**base_env, "ENABLED_CLIS": raw}
+                with patch.dict(os.environ, values, clear=True):
+                    with self.assertRaises(ConfigError):
+                        Config.load(project)
 
 
 if __name__ == "__main__":

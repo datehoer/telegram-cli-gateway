@@ -85,6 +85,7 @@ class Config:
     output_poll_interval: float
     output_max_bytes: int
     tmux_socket_name: str
+    enabled_clis: tuple[str, ...] = ("claude", "codex", "grok", "pi")
     stream_update_interval: float = 5.0
     telegram_max_file_bytes: int = 20 * 1024 * 1024
     auto_send_artifacts: str = "images"
@@ -144,12 +145,27 @@ class Config:
             raise ConfigError("DEFAULT_WORKDIR must be inside ALLOWED_WORKDIRS")
 
         commands: dict[str, tuple[str, ...]] = {}
-        for cli_name in ("claude", "codex", "grok", "pi"):
+        known_clis = ("claude", "codex", "grok", "pi")
+        for cli_name in known_clis:
             raw_command = values.get(f"CLI_{cli_name.upper()}", cli_name)
             command = tuple(shlex.split(raw_command))
             if not command:
                 raise ConfigError(f"CLI_{cli_name.upper()} is empty")
             commands[cli_name] = command
+
+        raw_enabled_clis = values.get("ENABLED_CLIS", ",".join(known_clis))
+        enabled_clis = tuple(
+            dict.fromkeys(
+                item.strip().lower()
+                for item in raw_enabled_clis.replace(",", " ").split()
+                if item.strip()
+            )
+        )
+        if not enabled_clis:
+            raise ConfigError("ENABLED_CLIS is empty")
+        unknown_clis = [cli for cli in enabled_clis if cli not in known_clis]
+        if unknown_clis:
+            raise ConfigError(f"ENABLED_CLIS contains unsupported CLI: {', '.join(unknown_clis)}")
 
         socket_name = values.get("TMUX_SOCKET_NAME", "telegram-cli-gateway").strip()
         if not socket_name or not all(ch.isalnum() or ch in "-_" for ch in socket_name):
@@ -167,6 +183,7 @@ class Config:
             output_poll_interval=_positive_float(values, "OUTPUT_POLL_INTERVAL", 1.0),
             output_max_bytes=_positive_int(values, "OUTPUT_MAX_BYTES", 65536),
             tmux_socket_name=socket_name,
+            enabled_clis=enabled_clis,
             stream_update_interval=_positive_float(values, "STREAM_UPDATE_INTERVAL", 5.0),
             telegram_max_file_bytes=_positive_int(
                 values, "TELEGRAM_MAX_FILE_BYTES", 20 * 1024 * 1024

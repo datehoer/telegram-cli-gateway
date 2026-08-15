@@ -24,7 +24,9 @@ def check_config(config: Config) -> int:
     if not tmux_path:
         problems.append("tmux is missing")
 
-    for cli, command in config.cli_commands.items():
+    print(f"enabled CLIs: {', '.join(config.enabled_clis)}")
+    for cli in config.enabled_clis:
+        command = config.cli_commands[cli]
         executable = shutil.which(command[0]) if not Path(command[0]).is_absolute() else command[0]
         exists = bool(executable and Path(executable).exists())
         print(f"{cli}: {executable if exists else 'MISSING'}")

@@ -1,0 +1,153 @@
+name: telegram-cli-experiments
+
+x-gateway-environment: &gateway-environment
+  TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS:?set TELEGRAM_ALLOWED_USERS in the project .env}
+  TELEGRAM_ALLOW_GROUPS: "false"
+  DEFAULT_WORKDIR: /workspace/project
+  ALLOWED_WORKDIRS: /workspace
+  TELEGRAM_POLL_TIMEOUT: "10"
+  OUTPUT_POLL_INTERVAL: "1.0"
+  OUTPUT_MAX_BYTES: "65536"
+  STREAM_UPDATE_INTERVAL: "5"
+  AUTO_RESUME: "false"
+  AUTO_SEND_ARTIFACTS: images
+
+x-gateway-service: &gateway-service
+  restart: unless-stopped
+  init: true
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,mode=1777
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - TELEGRAM_BOT_TOKEN="$$(tr -d '\r\n' < /run/secrets/telegram_bot_token)" python3 -m cli_telegram_gateway --check >/dev/null
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 10s
+
+services:
+  codex:
+    <<: *gateway-service
+    image: telegram-cli-gateway-codex:local
+    build:
+      context: ../..
+      dockerfile: docker/experiments/Dockerfile
+      target: codex-agent
+      additional_contexts:
+        codex_cli: /home/openclaw/.npm-global/lib/node_modules/@openai/codex
+        claude_cli: /home/openclaw/.local/share/claude/versions
+        grok_cli: /home/openclaw/.grok/downloads
+    environment:
+      <<: *gateway-environment
+      AGENT_BACKEND: codex
+      ENABLED_CLIS: codex
+      CLI_CODEX: /usr/local/bin/codex
+      TMUX_SOCKET_NAME: telegram-cli-codex
+    volumes:
+      - codex_home:/home/agent
+      - codex_workspace:/workspace
+      - codex_runtime:/opt/gateway/.runtime
+    secrets:
+      - source: codex_bot_token
+        target: telegram_bot_token
+      - codex_auth
+      - codex_config
+    networks:
+      - codex_net
+
+  claude:
+    <<: *gateway-service
+    image: telegram-cli-gateway-claude:local
+    build:
+      context: ../..
+      dockerfile: docker/experiments/Dockerfile
+      target: claude-agent
+      additional_contexts:
+        codex_cli: /home/openclaw/.npm-global/lib/node_modules/@openai/codex
+        claude_cli: /home/openclaw/.local/share/claude/versions
+        grok_cli: /home/openclaw/.grok/downloads
+    environment:
+      <<: *gateway-environment
+      AGENT_BACKEND: claude
+      ENABLED_CLIS: claude
+      CLI_CLAUDE: /usr/local/bin/claude
+      TMUX_SOCKET_NAME: telegram-cli-claude
+    volumes:
+      - claude_home:/home/agent
+      - claude_workspace:/workspace
+      - claude_runtime:/opt/gateway/.runtime
+    secrets:
+      - source: claude_bot_token
+        target: telegram_bot_token
+      - claude_settings
+    networks:
+      - claude_net
+
+  grok:
+    <<: *gateway-service
+    image: telegram-cli-gateway-grok:local
+    build:
+      context: ../..
+      dockerfile: docker/experiments/Dockerfile
+      target: grok-agent
+      additional_contexts:
+        codex_cli: /home/openclaw/.npm-global/lib/node_modules/@openai/codex
+        claude_cli: /home/openclaw/.local/share/claude/versions
+        grok_cli: /home/openclaw/.grok/downloads
+    environment:
+      <<: *gateway-environment
+      AGENT_BACKEND: grok
+      ENABLED_CLIS: grok
+      CLI_GROK: /usr/local/bin/grok
+      TMUX_SOCKET_NAME: telegram-cli-grok
+    volumes:
+      - grok_home:/home/agent
+      - grok_workspace:/workspace
+      - grok_runtime:/opt/gateway/.runtime
+    secrets:
+      - source: grok_bot_token
+        target: telegram_bot_token
+      - grok_auth
+      - grok_config
+    networks:
+      - grok_net
+
+secrets:
+  codex_bot_token:
+    file: ./secrets/codex.bot-token
+  claude_bot_token:
+    file: ./secrets/claude.bot-token
+  grok_bot_token:
+    file: ./secrets/grok.bot-token
+  codex_auth:
+    file: /home/openclaw/.codex/auth.json
+  codex_config:
+    file: ./secrets/codex-config.toml
+  claude_settings:
+    file: ./secrets/claude-settings.json
+  grok_auth:
+    file: /home/openclaw/.grok/auth.json
+  grok_config:
+    file: ./secrets/grok-config.toml
+
+volumes:
+  codex_home:
+  codex_workspace:
+  codex_runtime:
+  claude_home:
+  claude_workspace:
+  claude_runtime:
+  grok_home:
+  grok_workspace:
+  grok_runtime:
+
+networks:
+  codex_net:
+  claude_net:
+  grok_net:

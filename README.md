@@ -61,9 +61,12 @@ ALLOWED_WORKDIRS=/srv/projects
 STREAM_UPDATE_INTERVAL=5
 TELEGRAM_MAX_FILE_BYTES=20971520
 AUTO_RESUME=false
+ENABLED_CLIS=claude,codex,grok,pi
 ```
 
 `AUTO_RESUME=true` 时，网关重启后会自动续跑上次被意外中断的任务（用户主动 /interrupt 的除外）；默认 `false`，收到提示后用 `/resume` 手动恢复、用 `/cancel` 放弃。
+
+`ENABLED_CLIS` 可把一个网关实例限制为指定 CLI；例如 `ENABLED_CLIS=codex`。未启用的 CLI 不能创建或切换会话，Codex 未启用时也不会启动其 app-server。
 
 附件保存在 `.runtime/uploads/`，目录权限为 `0700`、文件权限为 `0600`。默认最大 20 MiB。
 
@@ -108,3 +111,7 @@ journalctl --user -u telegram-cli-gateway -f
 ```bash
 uv run python -W error::ResourceWarning -m unittest discover -s tests -v
 ```
+
+## 三 Bot 隔离实验
+
+Codex、Claude Code 和 Grok 的三容器隔离部署见 [`docker/experiments/README.md`](docker/experiments/README.md)。这是独立 gateway 实例的部署方式，不在 gateway 内增加多 Agent 编排。
