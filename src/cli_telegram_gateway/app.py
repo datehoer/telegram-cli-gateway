@@ -29,6 +29,9 @@ MAX_PENDING_INPUTS_PER_SESSION = 20
 MAX_PUBLISH_RETRY_SECONDS = 30.0
 MAX_AUTO_SENT_ARTIFACTS = 3
 PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Telegram sendPhoto 上限
+# 空回答自动重试：模型调用工具后最终文本过短（只有开场白、没有结论）视为无效回答
+MIN_ANSWER_CHARS = 60
+MAX_AUTO_RETRIES = 1
 
 # 会话状态（展示用，事件驱动；busy 判定仍是运行逻辑的权威）
 STATE_IDLE = "idle"
@@ -105,6 +108,7 @@ class TurnView:
     turn_id: str
     started_at: float = field(default_factory=time.monotonic)
     parts: list[str] = field(default_factory=list)
+    thinking_parts: list[str] = field(default_factory=list)
     command: str = ""
     command_output: str = ""
     status: str = "running"
@@ -120,6 +124,11 @@ class TurnView:
     publish_failures: int = 0
     next_publish_at: float = 0.0
     resumable: bool = False
+    text: str = ""
+    attachments: tuple[Attachment, ...] = ()
+    retry_count: int = 0
+    had_tool_call: bool = False
+    will_retry: bool = False
 
 
 @dataclass(frozen=True)
@@ -998,6 +1007,7 @@ class GatewayApp:
         session: CliSession,
         text: str,
         attachments: tuple[Attachment, ...] = (),
+        retry_count: int = 0,
     ) -> None:
         if session.cli not in self.config.enabled_clis:
             self._send(chat_id, f"此 Bot 未启用 {session.cli}，不能启动任务。")
@@ -1024,11 +1034,11 @@ class GatewayApp:
                     raise
                 with self._state_lock:
                     self._codex_active_turns[session.external_id] = turn_id
-                self._register_turn(session, turn_id)
+                self._register_turn(session, turn_id, text=text, attachments=attachments, retry_count=retry_count)
             elif session.backend == "headless-json":
                 turn_id = self.headless.start_turn(session, text, attachments)
                 self.sessions.increment_turn_count(session.session_id)
-                self._register_turn(session, turn_id)
+                self._register_turn(session, turn_id, text=text, attachments=attachments, retry_count=retry_count)
             else:
                 raise SessionError("旧 TUI 会话尚未迁移，请重启网关后重试")
             self.sessions.set_in_flight(session.session_id, session.chat_id, turn_id)
@@ -1037,19 +1047,38 @@ class GatewayApp:
         except (CodexBackendError, HeadlessBackendError, SessionError) as exc:
             self._send(chat_id, f"发送失败：{exc}")
 
-    def _register_turn(self, session: CliSession, turn_id: str) -> TurnView:
+    def _register_turn(
+        self,
+        session: CliSession,
+        turn_id: str,
+        text: str | None = None,
+        attachments: tuple[Attachment, ...] | None = None,
+        retry_count: int = 0,
+    ) -> TurnView:
         key = (session.session_id, turn_id)
         with self._state_lock:
-            return self._turns.setdefault(key, TurnView(session=session, turn_id=turn_id))
+            view = self._turns.get(key)
+            if view is None:
+                view = TurnView(session=session, turn_id=turn_id)
+                self._turns[key] = view
+            if text is not None:
+                view.text = text
+                view.attachments = attachments or ()
+                view.retry_count = retry_count
+            return view
 
     def _update_turn(self, session: CliSession, turn_id: str, kind: str, data: Any = None) -> None:
         view = self._register_turn(session, turn_id)
+        should_retry = False
         with self._state_lock:
             if kind == "delta" and isinstance(data, str):
                 view.parts.append(data)
+            elif kind == "thinking" and isinstance(data, str):
+                view.thinking_parts.append(data)
             elif kind == "command":
                 view.command = self._display_value(data)[:1000]
                 view.command_output = ""
+                view.had_tool_call = True
             elif kind == "command_output":
                 view.command_output = (view.command_output + self._display_value(data))[-1200:]
             elif kind == "completed":
@@ -1057,6 +1086,9 @@ class GatewayApp:
                 self.sessions.clear_in_flight(session.session_id, turn_id)
                 self._interrupted_sessions.discard(session.session_id)
                 self._set_session_state(session.session_id, STATE_IDLE)
+                should_retry = self._should_retry_empty_answer(view)
+                if should_retry:
+                    view.will_retry = True
             elif kind == "error":
                 view.status = "failed"
                 view.error = self._display_value(data)[:2000]
@@ -1079,6 +1111,49 @@ class GatewayApp:
                     view.resumable = True
                     self._set_session_state(session.session_id, STATE_INTERRUPTED)
             view.dirty = True
+        if should_retry:
+            threading.Thread(
+                target=self._retry_empty_answer,
+                args=(view,),
+                name=f"retry-{session.session_id}",
+                daemon=True,
+            ).start()
+
+    def _should_retry_empty_answer(self, view: TurnView) -> bool:
+        """判定 completed 时是否因“空/无效回答”需要自动重试。
+
+        只处理明显异常：模型调用了工具（说明在干活），但最终文本为空，
+        或短到基本只有一句开场白（没有给出结论）。没有工具调用时，
+        短回答可能是正常结果（如“已完成”），不重试。
+        """
+        if view.retry_count >= MAX_AUTO_RETRIES:
+            return False
+        if not view.text:
+            return False
+        if not view.had_tool_call:
+            return False
+        answer = "".join(view.parts).strip()
+        if not answer:
+            return True
+        return len(answer) < MIN_ANSWER_CHARS
+
+    def _retry_empty_answer(self, view: TurnView) -> None:
+        """用原始输入重新发起一次 turn；提示已并入旧消息渲染（view.will_retry）。"""
+        session = view.session
+        if self._session_is_busy(session):
+            # 已有后续任务（如排队消息）接手，放弃重试并说明
+            self._send(session.chat_id, f"⚠️ {session.label} 自动重试已取消：有后续任务在等待。")
+            return
+        try:
+            self._start_session_turn(
+                session.chat_id,
+                session,
+                view.text,
+                view.attachments,
+                retry_count=view.retry_count + 1,
+            )
+        except (CodexBackendError, HeadlessBackendError, SessionError) as exc:
+            self._send(session.chat_id, f"自动重试失败：{exc}")
 
     @staticmethod
     def _display_value(value: Any) -> str:
@@ -1231,8 +1306,21 @@ class GatewayApp:
                 sections.append(f"命令输出：\n```text\n{output}\n```")
         elif answer:
             sections.append(answer)
+        elif view.status == "completed":
+            thinking = "".join(view.thinking_parts).strip()
+            if thinking:
+                if len(thinking) > 4000:
+                    thinking = "…" + thinking[-4000:]
+                sections.append(
+                    "⚠️ 模型未返回可见回答（输出全部落在思考过程里），以下为思考内容：\n"
+                    + thinking
+                )
+            else:
+                sections.append("（无返回内容）")
         if view.status == "interrupted" and view.resumable:
             sections.append("⚠️ 任务被中断。回复 /resume 继续，或 /cancel 放弃。")
+        if view.will_retry:
+            sections.append("⚠️ 未返回有效回答，正在自动重试…")
         if view.error:
             error = view.error.replace("```", "` ` `")
             sections.append(f"错误：\n```text\n{error}\n```")
@@ -1546,6 +1634,80 @@ class GatewayApp:
                 except SessionError:
                     LOGGER.exception("could not migrate session %s", session.session_id)
 
+    def _coalesce_updates(self, updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把同一 media_group_id 的媒体组消息合并成单条更新。
+
+        Telegram 会把相册/多文件媒体组的每一项作为独立 message 下发，但共享
+        同一个 media_group_id。若逐条处理，第一张图会先启动一个任务，后续
+        图片会因会话忙碌而被当作追加（steer）或排队，而不是组成一个任务。
+        这里按 batch 内顺序把相邻、同 media_group_id 的消息合并成一条携带
+        ``media`` 列表的消息，并把 update_id 提升为组内最大值，避免重复消费。
+        跨 batch 拆开的媒体组（罕见）不受影响，仍按单条处理。
+        """
+        merged: list[dict[str, Any]] = []
+        index = 0
+        while index < len(updates):
+            update = updates[index]
+            message = update.get("message")
+            group_id = message.get("media_group_id") if isinstance(message, dict) else None
+            if not isinstance(group_id, str):
+                merged.append(update)
+                index += 1
+                continue
+            members = [update]
+            max_update_id: Any = update.get("update_id")
+            index += 1
+            while index < len(updates):
+                candidate = updates[index]
+                candidate_message = candidate.get("message")
+                if (
+                    isinstance(candidate_message, dict)
+                    and candidate_message.get("media_group_id") == group_id
+                ):
+                    members.append(candidate)
+                    candidate_id = candidate.get("update_id")
+                    if isinstance(candidate_id, int) and (
+                        not isinstance(max_update_id, int) or candidate_id > max_update_id
+                    ):
+                        max_update_id = candidate_id
+                    index += 1
+                else:
+                    break
+            merged.append(self._merge_media_members(members, max_update_id))
+        return merged
+
+    @staticmethod
+    def _merge_media_members(
+        members: list[dict[str, Any]], max_update_id: Any
+    ) -> dict[str, Any]:
+        first = members[0].get("message")
+        first = first if isinstance(first, dict) else {}
+        media: list[dict[str, Any]] = []
+        caption = ""
+        for member in members:
+            message = member.get("message")
+            if not isinstance(message, dict):
+                continue
+            document = message.get("document")
+            photos = message.get("photo")
+            if isinstance(document, dict):
+                media.append({"document": document})
+            elif isinstance(photos, list):
+                media.append({"photo": photos})
+            if not caption:
+                item_caption = message.get("caption")
+                if isinstance(item_caption, str) and item_caption.strip():
+                    caption = item_caption.strip()
+        combined = {
+            key: value
+            for key, value in first.items()
+            if key not in {"document", "photo", "caption"}
+        }
+        combined["media"] = media
+        if caption:
+            combined["caption"] = caption
+        return {"update_id": max_update_id, "message": combined}
+
     def handle_update(self, update: dict[str, Any]) -> None:
         callback = update.get("callback_query")
         if isinstance(callback, dict):
@@ -1591,6 +1753,29 @@ class GatewayApp:
                 else:
                     self._send_to_current(chat_id, text)
             return
+        media_items = message.get("media")
+        if isinstance(media_items, list) and media_items:
+            session = routed_session or self._current_or_reply(chat_id)
+            if not session:
+                return
+            attachments: list[Attachment] = []
+            for item in media_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    attachment = self._download_attachment(item, session)
+                except TelegramError as exc:
+                    self._send(chat_id, f"接收文件失败：{exc}")
+                    return
+                if attachment:
+                    attachments.append(attachment)
+            if not attachments:
+                self._send(chat_id, "无法识别这个附件。")
+                return
+            caption = message.get("caption")
+            prompt = caption.strip() if isinstance(caption, str) and caption.strip() else "请查看并处理这些附件。"
+            self._send_to_session(chat_id, session, prompt, tuple(attachments))
+            return
         if isinstance(message.get("document"), dict) or isinstance(message.get("photo"), list):
             session = routed_session or self._current_or_reply(chat_id)
             if not session:
@@ -1630,7 +1815,7 @@ class GatewayApp:
             while not self.stop_event.is_set():
                 try:
                     updates = self.telegram.get_updates(offset, self.config.poll_timeout)
-                    for update in updates:
+                    for update in self._coalesce_updates(updates):
                         update_id = update.get("update_id")
                         if isinstance(update_id, int):
                             offset = update_id + 1

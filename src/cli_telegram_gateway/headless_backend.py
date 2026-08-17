@@ -363,9 +363,13 @@ class HeadlessBackend:
         value_type = value.get("type")
         if value_type == "message_update":
             event = value.get("assistantMessageEvent")
-            if isinstance(event, dict) and event.get("type") == "text_delta":
+            if isinstance(event, dict):
+                event_type = event.get("type")
                 delta = event.get("delta")
-                return [("delta", delta)] if isinstance(delta, str) else []
+                if event_type == "text_delta" and isinstance(delta, str):
+                    return [("delta", delta)]
+                if event_type == "thinking_delta" and isinstance(delta, str):
+                    return [("thinking", delta)]
         if value_type == "tool_execution_start":
             return [("command", self._format_tool(str(value.get("toolName") or "tool"), value.get("args")))]
         if value_type == "tool_execution_update":

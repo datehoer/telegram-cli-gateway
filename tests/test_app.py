@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -280,6 +281,138 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(forwarded[0][1], "看看这张图")
             self.assertTrue(forwarded[0][2][0].is_image)
             self.assertEqual(app.sessions.current(1).session_id, session.session_id)  # type: ignore[union-attr]
+
+    def test_media_group_is_coalesced_into_single_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            updates = [
+                {
+                    "update_id": 10,
+                    "message": {
+                        "message_id": 1,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "media_group_id": "mg-1",
+                        "caption": "看这些图",
+                        "photo": [{"file_id": "a"}],
+                    },
+                },
+                {
+                    "update_id": 11,
+                    "message": {
+                        "message_id": 2,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "media_group_id": "mg-1",
+                        "photo": [{"file_id": "b"}],
+                    },
+                },
+                {
+                    "update_id": 12,
+                    "message": {
+                        "message_id": 3,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "media_group_id": "mg-1",
+                        "document": {"file_id": "c", "file_name": "c.txt"},
+                    },
+                },
+                {
+                    "update_id": 13,
+                    "message": {
+                        "message_id": 4,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "text": "after album",
+                    },
+                },
+            ]
+            coalesced = app._coalesce_updates(updates)
+            self.assertEqual(len(coalesced), 2)
+            merged = coalesced[0]
+            self.assertEqual(merged["update_id"], 12)
+            message = merged["message"]
+            self.assertEqual(message["media_group_id"], "mg-1")
+            self.assertEqual(message["caption"], "看这些图")
+            self.assertEqual(
+                [item["photo"][0]["file_id"] if "photo" in item else item["document"]["file_id"]
+                 for item in message["media"]],
+                ["a", "b", "c"],
+            )
+            self.assertNotIn("photo", message)
+            self.assertNotIn("document", message)
+            self.assertEqual(coalesced[1], updates[3])
+
+    def test_media_group_forwards_all_attachments_in_one_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_headless("claude", project, 1)
+            downloaded: list[str] = []
+
+            def fake_download(file_id: str, destination: Path, _max_bytes: int) -> int:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"data")
+                downloaded.append(file_id)
+                return 4
+
+            forwarded: list[tuple[int, str, tuple[Any, ...]]] = []
+            app.telegram.download_file = fake_download  # type: ignore[method-assign]
+            app._send_to_session = (  # type: ignore[method-assign]
+                lambda chat_id, _session, text, attachments=(): forwarded.append(
+                    (chat_id, text, attachments)
+                )
+            )
+            app.handle_update(
+                {
+                    "message": {
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "media_group_id": "mg-1",
+                        "caption": "一起看",
+                        "media": [
+                            {"photo": [{"file_id": "p1", "file_size": 2}]},
+                            {"document": {"file_id": "d1", "file_name": "a.pdf"}},
+                        ],
+                    }
+                }
+            )
+            self.assertEqual(downloaded, ["p1", "d1"])
+            self.assertEqual(len(forwarded), 1)
+            self.assertEqual(forwarded[0][1], "一起看")
+            self.assertEqual(len(forwarded[0][2]), 2)
+            self.assertTrue(forwarded[0][2][0].is_image)
+            self.assertFalse(forwarded[0][2][1].is_image)
+            self.assertEqual(app.sessions.current(1).session_id, session.session_id)  # type: ignore[union-attr]
+
+    def test_media_group_without_caption_uses_default_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            app.sessions.create_headless("claude", project, 1)
+
+            def fake_download(file_id: str, destination: Path, _max_bytes: int) -> int:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"data")
+                return 4
+
+            forwarded: list[tuple[int, str, tuple[Any, ...]]] = []
+            app.telegram.download_file = fake_download  # type: ignore[method-assign]
+            app._send_to_session = (  # type: ignore[method-assign]
+                lambda chat_id, _session, text, attachments=(): forwarded.append(
+                    (chat_id, text, attachments)
+                )
+            )
+            app.handle_update(
+                {
+                    "message": {
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "media": [{"document": {"file_id": "d2", "file_name": "b.txt"}}],
+                    }
+                }
+            )
+            self.assertEqual(forwarded[0][1], "请查看并处理这些附件。")
 
     def test_running_turn_render_includes_command_and_elapsed_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -911,6 +1044,63 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(app._session_states[session.session_id], STATE_FAILED)
             self.assertEqual(view.status, "failed")
             self.assertIn("boom", view.error)
+
+    def test_empty_answer_retry_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_headless("pi", project, 1)
+
+            # 没有原始输入：无法重试
+            view = app._register_turn(session, "turn-no-text")
+            self.assertFalse(app._should_retry_empty_answer(view))
+
+            # 有输入但没调工具：短回答是正常结果，不重试
+            view = app._register_turn(session, "turn-no-tool", text="ping")
+            self.assertFalse(app._should_retry_empty_answer(view))
+
+            # 调了工具但完全没文字：重试
+            view = app._register_turn(session, "turn-empty", text="do it")
+            view.had_tool_call = True
+            self.assertTrue(app._should_retry_empty_answer(view))
+
+            # 调了工具但只有一句开场白：重试
+            view = app._register_turn(session, "turn-short", text="do it")
+            view.had_tool_call = True
+            view.parts.append("让我查一下")
+            self.assertTrue(app._should_retry_empty_answer(view))
+
+            # 调了工具且给出了完整回答：不重试
+            view = app._register_turn(session, "turn-long", text="do it")
+            view.had_tool_call = True
+            view.parts.append("结论是" + "很" * 80 + "长的回答。")
+            self.assertFalse(app._should_retry_empty_answer(view))
+
+            # 已达到重试上限：不再重试
+            view = app._register_turn(session, "turn-capped", text="do it", retry_count=1)
+            view.had_tool_call = True
+            self.assertFalse(app._should_retry_empty_answer(view))
+
+    def test_completed_empty_answer_marks_will_retry_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_headless("pi", project, 1)
+
+            retried: list[str] = []
+            app._retry_empty_answer = (  # type: ignore[method-assign]
+                lambda view: retried.append(view.turn_id)
+            )
+
+            view = app._register_turn(session, "turn-empty", text="do it")
+            view.had_tool_call = True
+            app._update_turn(session, "turn-empty", "completed")
+
+            self.assertTrue(view.will_retry)
+            deadline = time.time() + 2
+            while not retried and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(retried, ["turn-empty"])
 
     def test_interrupted_session_does_not_show_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
