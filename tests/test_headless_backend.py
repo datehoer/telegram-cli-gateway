@@ -75,7 +75,94 @@ class HeadlessParserTests(unittest.TestCase):
             self.backend._parse_pi_event({"type": "tool_execution_start", "toolName": "bash", "args": {"command": "ls"}}),
             [("command", "ls")],
         )
+        self.assertEqual(
+            self.backend._parse_pi_event(
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "final"}],
+                        "stopReason": "stop",
+                    },
+                }
+            ),
+            [("delta", "final"), ("completed", None)],
+        )
+        self.assertEqual(
+            self.backend._parse_pi_event(
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "content": [],
+                        "stopReason": "error",
+                        "errorMessage": "quota exceeded",
+                    },
+                }
+            ),
+            [("error", "quota exceeded")],
+        )
+        self.assertEqual(
+            self.backend._parse_pi_event(
+                {
+                    "type": "message_end",
+                    "message": {"role": "assistant", "content": [], "stopReason": "length"},
+                }
+            ),
+            [("error", "Pi stopped before completing the answer because the model output limit was reached")],
+        )
+        self.assertEqual(
+            self.backend._parse_pi_event({"type": "agent_end", "willRetry": True}),
+            [("retrying", None)],
+        )
         self.assertEqual(self.backend._parse_pi_event({"type": "agent_end"}), [("completed", None)])
+
+    def test_pi_message_error_is_not_overwritten_by_agent_end_or_exit_zero(self) -> None:
+        events: list[tuple[str, object]] = []
+        backend = HeadlessBackend({}, lambda _sid, _tid, kind, data: events.append((kind, data)))
+        script = """
+import json
+print(json.dumps({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"quota exceeded"}}))
+print(json.dumps({"type":"agent_end","willRetry":False}))
+"""
+        process = subprocess.Popen(
+            ["python3", "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        session = CliSession("pi-test", "pi", "/tmp", "", "", 1, "now", "headless-json", "id")
+
+        backend._read_process(session, "turn", process)
+
+        self.assertEqual(events, [("error", "quota exceeded")])
+
+    def test_pi_native_retry_can_replace_a_temporary_error(self) -> None:
+        events: list[tuple[str, object]] = []
+        backend = HeadlessBackend({}, lambda _sid, _tid, kind, data: events.append((kind, data)))
+        script = """
+import json
+values = [
+    {"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"temporary"}},
+    {"type":"agent_end","willRetry":True},
+    {"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"done"}},
+    {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}},
+    {"type":"agent_end","willRetry":False},
+]
+for value in values:
+    print(json.dumps(value))
+"""
+        process = subprocess.Popen(
+            ["python3", "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        session = CliSession("pi-test", "pi", "/tmp", "", "", 1, "now", "headless-json", "id")
+
+        backend._read_process(session, "turn", process)
+
+        self.assertEqual(events, [("delta", "done"), ("completed", None)])
 
     def test_process_exit_always_emits_one_terminal_event(self) -> None:
         events: list[tuple[str, object]] = []

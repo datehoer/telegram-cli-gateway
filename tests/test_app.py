@@ -1045,62 +1045,24 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(view.status, "failed")
             self.assertIn("boom", view.error)
 
-    def test_empty_answer_retry_detection(self) -> None:
+    def test_completed_empty_answer_is_not_retried_or_exposes_thinking(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
             session = app.sessions.create_headless("pi", project, 1)
 
-            # 没有原始输入：无法重试
-            view = app._register_turn(session, "turn-no-text")
-            self.assertFalse(app._should_retry_empty_answer(view))
-
-            # 有输入但没调工具：短回答是正常结果，不重试
-            view = app._register_turn(session, "turn-no-tool", text="ping")
-            self.assertFalse(app._should_retry_empty_answer(view))
-
-            # 调了工具但完全没文字：重试
-            view = app._register_turn(session, "turn-empty", text="do it")
-            view.had_tool_call = True
-            self.assertTrue(app._should_retry_empty_answer(view))
-
-            # 调了工具但只有一句开场白：重试
-            view = app._register_turn(session, "turn-short", text="do it")
-            view.had_tool_call = True
-            view.parts.append("让我查一下")
-            self.assertTrue(app._should_retry_empty_answer(view))
-
-            # 调了工具且给出了完整回答：不重试
-            view = app._register_turn(session, "turn-long", text="do it")
-            view.had_tool_call = True
-            view.parts.append("结论是" + "很" * 80 + "长的回答。")
-            self.assertFalse(app._should_retry_empty_answer(view))
-
-            # 已达到重试上限：不再重试
-            view = app._register_turn(session, "turn-capped", text="do it", retry_count=1)
-            view.had_tool_call = True
-            self.assertFalse(app._should_retry_empty_answer(view))
-
-    def test_completed_empty_answer_marks_will_retry_and_retries(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary)
-            app = self.make_app(project)
-            session = app.sessions.create_headless("pi", project, 1)
-
-            retried: list[str] = []
-            app._retry_empty_answer = (  # type: ignore[method-assign]
-                lambda view: retried.append(view.turn_id)
-            )
-
-            view = app._register_turn(session, "turn-empty", text="do it")
-            view.had_tool_call = True
+            view = app._register_turn(session, "turn-empty")
+            app._update_turn(session, "turn-empty", "thinking", "private reasoning")
+            app._update_turn(session, "turn-empty", "command", "write target.txt")
             app._update_turn(session, "turn-empty", "completed")
+            rendered, answer = app._render_turn(view, view.started_at + 2)
 
-            self.assertTrue(view.will_retry)
-            deadline = time.time() + 2
-            while not retried and time.time() < deadline:
-                time.sleep(0.01)
-            self.assertEqual(retried, ["turn-empty"])
+            self.assertEqual(view.status, "completed")
+            self.assertEqual(answer, "")
+            self.assertIn("没有返回可见回答", rendered)
+            self.assertIn("未自动重试", rendered)
+            self.assertNotIn("private reasoning", rendered)
+            self.assertNotIn("正在自动重试", rendered)
 
     def test_interrupted_session_does_not_show_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

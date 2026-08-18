@@ -263,8 +263,14 @@ class HeadlessBackend:
                     for kind, data in events:
                         if kind == "delta" and data:
                             emitted_text = True
-                        if kind in {"completed", "error"}:
-                            terminal_result = (kind, data)
+                        if kind == "retrying":
+                            # Pi may retry a provider failure internally. Its preceding
+                            # message_end is not terminal when agent_end says willRetry.
+                            terminal_result = None
+                        elif kind in {"completed", "error", "interrupted"}:
+                            priority = {"completed": 1, "interrupted": 2, "error": 3}
+                            if terminal_result is None or priority[kind] >= priority[terminal_result[0]]:
+                                terminal_result = (kind, data)
                         else:
                             self.on_event(session.session_id, turn_id, kind, data)
             return_code = process.wait()
@@ -272,10 +278,11 @@ class HeadlessBackend:
             with self._lock:
                 if self._active.get(session.session_id) is process:
                     self._active.pop(session.session_id, None)
-            if terminal_result and terminal_result[0] == "error":
-                # CLI 自己在 stdout 里报告失败：明确的错误，不进入恢复候选。
+            if terminal_result:
+                # Structured terminal state is authoritative. In particular, Pi JSON
+                # mode can exit 0 after an assistant message with stopReason=error.
                 self.on_event(session.session_id, turn_id, *terminal_result)
-            elif return_code == 0 or (terminal_result and terminal_result[0] == "completed"):
+            elif return_code == 0:
                 self.on_event(session.session_id, turn_id, "completed", None)
             else:
                 # 非零退出且没有明确的 error 事件：可能是被信号杀死（网关重启/关机
@@ -303,7 +310,7 @@ class HeadlessBackend:
     ) -> list[tuple[str, Any]]:
         if cli in {"claude", "grok"}:
             return self._parse_anthropic_event(value, tool_json_parts, emitted_text)
-        return self._parse_pi_event(value)
+        return self._parse_pi_event(value, emitted_text)
 
     def _parse_anthropic_event(
         self,
@@ -359,7 +366,10 @@ class HeadlessBackend:
                 output.append(("completed", None))
         return output
 
-    def _parse_pi_event(self, value: dict[str, Any]) -> list[tuple[str, Any]]:
+    def _parse_pi_event(
+        self, value: dict[str, Any], emitted_text: bool = False
+    ) -> list[tuple[str, Any]]:
+        output: list[tuple[str, Any]] = []
         value_type = value.get("type")
         if value_type == "message_update":
             event = value.get("assistantMessageEvent")
@@ -370,6 +380,28 @@ class HeadlessBackend:
                     return [("delta", delta)]
                 if event_type == "thinking_delta" and isinstance(delta, str):
                     return [("thinking", delta)]
+        if value_type == "message_end":
+            message = value.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                return output
+            if not emitted_text:
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text")
+                            if isinstance(text, str) and text:
+                                output.append(("delta", text))
+            stop_reason = message.get("stopReason")
+            if stop_reason == "stop":
+                output.append(("completed", None))
+            elif stop_reason == "error":
+                output.append(("error", str(message.get("errorMessage") or "Pi task failed")))
+            elif stop_reason == "length":
+                output.append(("error", "Pi stopped before completing the answer because the model output limit was reached"))
+            elif stop_reason == "aborted":
+                output.append(("interrupted", None))
+            return output
         if value_type == "tool_execution_start":
             return [("command", self._format_tool(str(value.get("toolName") or "tool"), value.get("args")))]
         if value_type == "tool_execution_update":
@@ -381,6 +413,8 @@ class HeadlessBackend:
             if result is not None:
                 return [("command_output", self._stringify(result))]
         if value_type == "agent_end":
+            if value.get("willRetry") is True:
+                return [("retrying", None)]
             return [("completed", None)]
         return []
 

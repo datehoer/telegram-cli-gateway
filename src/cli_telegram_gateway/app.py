@@ -29,9 +29,6 @@ MAX_PENDING_INPUTS_PER_SESSION = 20
 MAX_PUBLISH_RETRY_SECONDS = 30.0
 MAX_AUTO_SENT_ARTIFACTS = 3
 PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Telegram sendPhoto 上限
-# 空回答自动重试：模型调用工具后最终文本过短（只有开场白、没有结论）视为无效回答
-MIN_ANSWER_CHARS = 60
-MAX_AUTO_RETRIES = 1
 
 # 会话状态（展示用，事件驱动；busy 判定仍是运行逻辑的权威）
 STATE_IDLE = "idle"
@@ -108,7 +105,6 @@ class TurnView:
     turn_id: str
     started_at: float = field(default_factory=time.monotonic)
     parts: list[str] = field(default_factory=list)
-    thinking_parts: list[str] = field(default_factory=list)
     command: str = ""
     command_output: str = ""
     status: str = "running"
@@ -124,11 +120,6 @@ class TurnView:
     publish_failures: int = 0
     next_publish_at: float = 0.0
     resumable: bool = False
-    text: str = ""
-    attachments: tuple[Attachment, ...] = ()
-    retry_count: int = 0
-    had_tool_call: bool = False
-    will_retry: bool = False
 
 
 @dataclass(frozen=True)
@@ -1007,7 +998,6 @@ class GatewayApp:
         session: CliSession,
         text: str,
         attachments: tuple[Attachment, ...] = (),
-        retry_count: int = 0,
     ) -> None:
         if session.cli not in self.config.enabled_clis:
             self._send(chat_id, f"此 Bot 未启用 {session.cli}，不能启动任务。")
@@ -1034,11 +1024,11 @@ class GatewayApp:
                     raise
                 with self._state_lock:
                     self._codex_active_turns[session.external_id] = turn_id
-                self._register_turn(session, turn_id, text=text, attachments=attachments, retry_count=retry_count)
+                self._register_turn(session, turn_id)
             elif session.backend == "headless-json":
                 turn_id = self.headless.start_turn(session, text, attachments)
                 self.sessions.increment_turn_count(session.session_id)
-                self._register_turn(session, turn_id, text=text, attachments=attachments, retry_count=retry_count)
+                self._register_turn(session, turn_id)
             else:
                 raise SessionError("旧 TUI 会话尚未迁移，请重启网关后重试")
             self.sessions.set_in_flight(session.session_id, session.chat_id, turn_id)
@@ -1047,38 +1037,22 @@ class GatewayApp:
         except (CodexBackendError, HeadlessBackendError, SessionError) as exc:
             self._send(chat_id, f"发送失败：{exc}")
 
-    def _register_turn(
-        self,
-        session: CliSession,
-        turn_id: str,
-        text: str | None = None,
-        attachments: tuple[Attachment, ...] | None = None,
-        retry_count: int = 0,
-    ) -> TurnView:
+    def _register_turn(self, session: CliSession, turn_id: str) -> TurnView:
         key = (session.session_id, turn_id)
         with self._state_lock:
-            view = self._turns.get(key)
-            if view is None:
-                view = TurnView(session=session, turn_id=turn_id)
-                self._turns[key] = view
-            if text is not None:
-                view.text = text
-                view.attachments = attachments or ()
-                view.retry_count = retry_count
-            return view
+            return self._turns.setdefault(key, TurnView(session=session, turn_id=turn_id))
 
     def _update_turn(self, session: CliSession, turn_id: str, kind: str, data: Any = None) -> None:
         view = self._register_turn(session, turn_id)
-        should_retry = False
         with self._state_lock:
             if kind == "delta" and isinstance(data, str):
                 view.parts.append(data)
-            elif kind == "thinking" and isinstance(data, str):
-                view.thinking_parts.append(data)
+            elif kind == "thinking":
+                # Reasoning is not user-visible output. Do not retain or publish it.
+                pass
             elif kind == "command":
                 view.command = self._display_value(data)[:1000]
                 view.command_output = ""
-                view.had_tool_call = True
             elif kind == "command_output":
                 view.command_output = (view.command_output + self._display_value(data))[-1200:]
             elif kind == "completed":
@@ -1086,9 +1060,6 @@ class GatewayApp:
                 self.sessions.clear_in_flight(session.session_id, turn_id)
                 self._interrupted_sessions.discard(session.session_id)
                 self._set_session_state(session.session_id, STATE_IDLE)
-                should_retry = self._should_retry_empty_answer(view)
-                if should_retry:
-                    view.will_retry = True
             elif kind == "error":
                 view.status = "failed"
                 view.error = self._display_value(data)[:2000]
@@ -1111,49 +1082,6 @@ class GatewayApp:
                     view.resumable = True
                     self._set_session_state(session.session_id, STATE_INTERRUPTED)
             view.dirty = True
-        if should_retry:
-            threading.Thread(
-                target=self._retry_empty_answer,
-                args=(view,),
-                name=f"retry-{session.session_id}",
-                daemon=True,
-            ).start()
-
-    def _should_retry_empty_answer(self, view: TurnView) -> bool:
-        """判定 completed 时是否因“空/无效回答”需要自动重试。
-
-        只处理明显异常：模型调用了工具（说明在干活），但最终文本为空，
-        或短到基本只有一句开场白（没有给出结论）。没有工具调用时，
-        短回答可能是正常结果（如“已完成”），不重试。
-        """
-        if view.retry_count >= MAX_AUTO_RETRIES:
-            return False
-        if not view.text:
-            return False
-        if not view.had_tool_call:
-            return False
-        answer = "".join(view.parts).strip()
-        if not answer:
-            return True
-        return len(answer) < MIN_ANSWER_CHARS
-
-    def _retry_empty_answer(self, view: TurnView) -> None:
-        """用原始输入重新发起一次 turn；提示已并入旧消息渲染（view.will_retry）。"""
-        session = view.session
-        if self._session_is_busy(session):
-            # 已有后续任务（如排队消息）接手，放弃重试并说明
-            self._send(session.chat_id, f"⚠️ {session.label} 自动重试已取消：有后续任务在等待。")
-            return
-        try:
-            self._start_session_turn(
-                session.chat_id,
-                session,
-                view.text,
-                view.attachments,
-                retry_count=view.retry_count + 1,
-            )
-        except (CodexBackendError, HeadlessBackendError, SessionError) as exc:
-            self._send(session.chat_id, f"自动重试失败：{exc}")
 
     @staticmethod
     def _display_value(value: Any) -> str:
@@ -1307,20 +1235,12 @@ class GatewayApp:
         elif answer:
             sections.append(answer)
         elif view.status == "completed":
-            thinking = "".join(view.thinking_parts).strip()
-            if thinking:
-                if len(thinking) > 4000:
-                    thinking = "…" + thinking[-4000:]
-                sections.append(
-                    "⚠️ 模型未返回可见回答（输出全部落在思考过程里），以下为思考内容：\n"
-                    + thinking
-                )
-            else:
-                sections.append("（无返回内容）")
+            sections.append(
+                "⚠️ 模型已结束，但没有返回可见回答。"
+                "为避免重复执行操作，网关未自动重试。"
+            )
         if view.status == "interrupted" and view.resumable:
             sections.append("⚠️ 任务被中断。回复 /resume 继续，或 /cancel 放弃。")
-        if view.will_retry:
-            sections.append("⚠️ 未返回有效回答，正在自动重试…")
         if view.error:
             error = view.error.replace("```", "` ` `")
             sections.append(f"错误：\n```text\n{error}\n```")
