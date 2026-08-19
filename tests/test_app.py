@@ -75,6 +75,28 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(sent, ["未知命令。使用 /help 查看可用命令。"] * 2)
 
+    def test_run_continues_when_command_refresh_is_rate_limited(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            app._acquire_singleton_lock = lambda: None  # type: ignore[method-assign]
+            app._prepare_sessions = lambda: None  # type: ignore[method-assign]
+            app._recover_interrupted_turns = lambda: None  # type: ignore[method-assign]
+            started: list[bool] = []
+            closed: list[bool] = []
+            app.codex.start = lambda: started.append(True)  # type: ignore[method-assign]
+            app.codex.close = lambda: closed.append(True)  # type: ignore[method-assign]
+            app.telegram.set_commands = (  # type: ignore[method-assign]
+                lambda _commands: (_ for _ in ()).throw(
+                    TelegramError("rate limited", retry_after=60)
+                )
+            )
+            app.stop_event.set()
+
+            app.run()
+
+            self.assertEqual(started, [True])
+            self.assertEqual(closed, [True])
+
     def test_new_command_without_args_shows_enabled_cli_buttons(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -427,8 +449,8 @@ class GatewayEventTests(unittest.TestCase):
             self.assertIn("当前命令：\n```text\nls -la\n```", rendered)
             self.assertIn("file.txt", rendered)
 
-    def test_status_loop_refreshes_elapsed_time_without_new_cli_events(self) -> None:
-        """计时刷新不能依赖新 delta；CLI 等模型时也要继续更新运行秒数。"""
+    def test_status_loop_does_not_edit_without_new_cli_events(self) -> None:
+        """CLI 无新输出时保留现有预览，避免只为刷新计时持续调用 Telegram。"""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
@@ -436,6 +458,32 @@ class GatewayEventTests(unittest.TestCase):
             view = app._register_turn(session, "turn-waiting")
             view.published = True
             view.dirty = False
+            view.last_edit = -10.0
+            published: list[str] = []
+            app._publish_running_turn = (  # type: ignore[method-assign]
+                lambda _view, rendered: published.append(rendered)
+            )
+
+            class StopAfterOneIteration:
+                calls = 0
+
+                def wait(self, _timeout: float) -> bool:
+                    self.calls += 1
+                    return self.calls > 1
+
+            app.stop_event = StopAfterOneIteration()  # type: ignore[assignment]
+            app._status_loop()
+
+            self.assertEqual(published, [])
+
+    def test_status_loop_publishes_dirty_running_turn_after_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_headless("pi", project, 1)
+            view = app._register_turn(session, "turn-dirty")
+            view.published = True
+            view.dirty = True
             view.last_edit = -10.0
             published: list[str] = []
             app._publish_running_turn = (  # type: ignore[method-assign]
@@ -1086,7 +1134,7 @@ class GatewayEventTests(unittest.TestCase):
             app._enqueue(session, PendingInput(1, "two"))
             self.assertIn("排队 2", app._session_status_text(session))
 
-    def test_publish_retry_uses_backoff_and_caps_retry_after(self) -> None:
+    def test_publish_retry_caps_local_backoff_but_honors_retry_after(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
@@ -1097,13 +1145,16 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(view.next_publish_at, 11)
             self.assertEqual(app._schedule_publish_retry(view, TelegramError("offline"), 20), 2)
             self.assertEqual(view.next_publish_at, 22)
+            view.publish_failures = 10
+            self.assertEqual(app._schedule_publish_retry(view, TelegramError("offline"), 25), 30)
+            self.assertEqual(view.next_publish_at, 55)
             self.assertEqual(
                 app._schedule_publish_retry(
                     view, TelegramError("limited", retry_after=60), 30
                 ),
-                30,
+                60,
             )
-            self.assertEqual(view.next_publish_at, 60)
+            self.assertEqual(view.next_publish_at, 90)
 
     def test_result_paths_create_artifact_buttons(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

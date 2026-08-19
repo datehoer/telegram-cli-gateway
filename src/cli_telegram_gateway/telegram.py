@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import json
-import socket
 import os
-from pathlib import Path
+import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 from typing import Any, Iterable
 
 from .formatting import markdown_to_telegram_html, split_markdown, split_rich_markdown
+
+
+# A write-side flood wait is shared across publishers, while long polling and
+# inbound file metadata stay available so the gateway can keep receiving updates.
+FLOOD_WAIT_GRACE_SECONDS = 1.0
+FLOOD_WAIT_EXEMPT_METHODS = frozenset({"getUpdates", "getFile"})
 
 
 class TelegramError(RuntimeError):
@@ -50,8 +58,30 @@ class TelegramClient:
     def __init__(self, token: str):
         self._base_url = f"https://api.telegram.org/bot{token}/"
         self._file_base_url = f"https://api.telegram.org/file/bot{token}/"
+        self._flood_wait_lock = threading.Lock()
+        self._flood_wait_until = 0.0
+
+    def _check_flood_wait(self, method: str) -> None:
+        if method in FLOOD_WAIT_EXEMPT_METHODS:
+            return
+        with self._flood_wait_lock:
+            remaining = self._flood_wait_until - time.monotonic()
+        if remaining > 0:
+            raise TelegramError(
+                f"Telegram {method} deferred by local flood control",
+                retry_after=remaining,
+            )
+
+    def _record_flood_wait(self, method: str, retry_after: float | None) -> float | None:
+        if retry_after is None or method in FLOOD_WAIT_EXEMPT_METHODS:
+            return retry_after
+        deadline = time.monotonic() + retry_after + FLOOD_WAIT_GRACE_SECONDS
+        with self._flood_wait_lock:
+            self._flood_wait_until = max(self._flood_wait_until, deadline)
+            return max(1.0, self._flood_wait_until - time.monotonic())
 
     def _call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
+        self._check_flood_wait(method)
         encoded_payload: dict[str, str] = {}
         for key, value in (payload or {}).items():
             encoded_payload[key] = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
@@ -76,7 +106,7 @@ class TelegramClient:
                 detail = f"HTTP {exc.code}"
             raise TelegramError(
                 f"Telegram {method} failed: {detail}",
-                retry_after=_retry_after(error_body),
+                retry_after=self._record_flood_wait(method, _retry_after(error_body)),
             ) from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             reason = getattr(exc, "reason", exc)
@@ -87,7 +117,7 @@ class TelegramClient:
         if not body.get("ok"):
             raise TelegramError(
                 f"Telegram {method} failed: {body.get('description', 'unknown error')}",
-                retry_after=_retry_after(body),
+                retry_after=self._record_flood_wait(method, _retry_after(body)),
             )
         return body.get("result")
 
@@ -144,7 +174,9 @@ class TelegramClient:
                 payload["reply_markup"] = reply_markup
             try:
                 result = self._call("sendMessage", payload)
-            except TelegramError:
+            except TelegramError as exc:
+                if exc.retry_after is not None:
+                    raise
                 payload["text"] = chunk
                 payload.pop("parse_mode", None)
                 result = self._call("sendMessage", payload)
@@ -243,7 +275,9 @@ class TelegramClient:
                 reply_markup=reply_markup,
                 parse_mode="HTML",
             )
-        except TelegramError:
+        except TelegramError as exc:
+            if exc.retry_after is not None:
+                raise
             self.edit_message(chat_id, message_id, markdown, reply_markup=reply_markup)
 
     def edit_message_markup(
@@ -304,6 +338,7 @@ class TelegramClient:
 
     def send_local_file(self, chat_id: int, path: Path, as_photo: bool = False) -> None:
         method = "sendPhoto" if as_photo else "sendDocument"
+        self._check_flood_wait(method)
         field_name = "photo" if as_photo else "document"
         boundary = f"----telegram-cli-gateway-{uuid.uuid4().hex}"
         file_data = path.read_bytes()
@@ -326,13 +361,31 @@ class TelegramClient:
         try:
             with urllib.request.urlopen(request, timeout=90) as response:
                 body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                error_body = json.loads(exc.read().decode("utf-8"))
+                detail = (
+                    error_body.get("description", "HTTP error")
+                    if isinstance(error_body, dict)
+                    else f"HTTP {exc.code}"
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                error_body = None
+                detail = f"HTTP {exc.code}"
+            raise TelegramError(
+                f"Telegram {method} failed: {detail}",
+                retry_after=self._record_flood_wait(method, _retry_after(error_body)),
+            ) from exc
         except (OSError, urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             reason = getattr(exc, "reason", exc)
             raise TelegramError(f"Telegram {method} failed: {reason}") from exc
         except json.JSONDecodeError as exc:
             raise TelegramError(f"Telegram {method} returned invalid JSON") from exc
         if not body.get("ok"):
-            raise TelegramError(f"Telegram {method} failed: {body.get('description', 'unknown error')}")
+            raise TelegramError(
+                f"Telegram {method} failed: {body.get('description', 'unknown error')}",
+                retry_after=self._record_flood_wait(method, _retry_after(body)),
+            )
 
     def send_action(self, chat_id: int, action: str = "typing") -> None:
         self._call("sendChatAction", {"chat_id": chat_id, "action": action})

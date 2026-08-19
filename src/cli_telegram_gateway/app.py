@@ -1440,10 +1440,15 @@ class GatewayApp:
                 with self._state_lock:
                     if now < view.next_publish_at:
                         continue
+                    # Coalesce meaningful progress; elapsed time alone does not
+                    # justify another Telegram edit and can trigger flood control.
                     should_update = (
                         not view.published
                         or view.status != "running"
-                        or now - view.last_edit >= self.config.stream_update_interval
+                        or (
+                            view.dirty
+                            and now - view.last_edit >= self.config.stream_update_interval
+                        )
                     )
                     if not should_update:
                         continue
@@ -1486,7 +1491,7 @@ class GatewayApp:
             delay = max(1.0, error.retry_after)
         else:
             delay = float(2 ** min(view.publish_failures - 1, 5))
-        delay = min(MAX_PUBLISH_RETRY_SECONDS, delay)
+            delay = min(MAX_PUBLISH_RETRY_SECONDS, delay)
         view.next_publish_at = now + delay
         return delay
 
@@ -1727,7 +1732,12 @@ class GatewayApp:
         self._prepare_sessions()
         self._recover_interrupted_turns()
         try:
-            self.telegram.set_commands(BOT_COMMANDS)
+            try:
+                self.telegram.set_commands(BOT_COMMANDS)
+            except TelegramError as exc:
+                # Command metadata is optional; Telegram flood control must not
+                # prevent the gateway from starting and receiving updates.
+                LOGGER.warning("could not refresh Telegram commands: %s", exc)
             status_thread = threading.Thread(target=self._status_loop, name="status-pump", daemon=True)
             status_thread.start()
             LOGGER.info("gateway started; allowed users=%d", len(self.config.allowed_user_ids))
@@ -1744,7 +1754,7 @@ class GatewayApp:
                 except TelegramError as exc:
                     LOGGER.error("%s", exc)
                     delay = max(1.0, exc.retry_after or 3.0)
-                    self.stop_event.wait(min(MAX_PUBLISH_RETRY_SECONDS, delay))
+                    self.stop_event.wait(delay)
                 except Exception:
                     LOGGER.exception("unexpected error in update loop")
                     self.stop_event.wait(3)

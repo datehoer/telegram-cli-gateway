@@ -4,7 +4,7 @@ import io
 import json
 import unittest
 import urllib.error
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from cli_telegram_gateway.telegram import TelegramClient, TelegramError, split_message
 
@@ -24,10 +24,69 @@ class TelegramTests(unittest.TestCase):
             {},
             io.BytesIO(body),
         )
-        with patch("urllib.request.urlopen", side_effect=error):
-            with self.assertRaises(TelegramError) as caught:
-                client._call("sendMessage", {"chat_id": 1, "text": "hello"})
-        self.assertEqual(caught.exception.retry_after, 7)
+        with patch("cli_telegram_gateway.telegram.time.monotonic", return_value=100):
+            with patch("urllib.request.urlopen", side_effect=error):
+                with self.assertRaises(TelegramError) as caught:
+                    client._call("sendMessage", {"chat_id": 1, "text": "hello"})
+        self.assertEqual(caught.exception.retry_after, 8)
+
+    def test_retry_after_defers_other_writes_but_not_update_polling(self) -> None:
+        client = TelegramClient("test")
+        body = json.dumps({
+            "ok": False,
+            "description": "Too Many Requests",
+            "parameters": {"retry_after": 60},
+        }).encode("utf-8")
+        error = urllib.error.HTTPError(
+            "https://api.telegram.org/test",
+            429,
+            "Too Many Requests",
+            {},
+            io.BytesIO(body),
+        )
+        with patch("cli_telegram_gateway.telegram.time.monotonic", return_value=100):
+            with patch("urllib.request.urlopen", side_effect=error):
+                with self.assertRaises(TelegramError):
+                    client._call("editMessageText", {"chat_id": 1, "text": "one"})
+
+            with patch("urllib.request.urlopen") as blocked_request:
+                with self.assertRaises(TelegramError) as caught:
+                    client._call("sendRichMessage", {"chat_id": 1, "text": "two"})
+            blocked_request.assert_not_called()
+            self.assertEqual(caught.exception.retry_after, 61)
+
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = b'{"ok": true, "result": []}'
+            with patch("urllib.request.urlopen", return_value=response) as polling_request:
+                self.assertEqual(client.get_updates(None, 1), [])
+            polling_request.assert_called_once()
+
+    def test_markdown_fallback_does_not_retry_rate_limit_immediately(self) -> None:
+        client = TelegramClient("test")
+        calls: list[str] = []
+
+        def fake_call(method: str, _payload: object = None) -> object:
+            calls.append(method)
+            raise TelegramError("rate limited", retry_after=30)
+
+        client._call = fake_call  # type: ignore[method-assign]
+        with self.assertRaises(TelegramError):
+            client.send_markdown(1, "**hello**")
+        self.assertEqual(calls, ["sendMessage"])
+
+    def test_markdown_edit_fallback_does_not_retry_rate_limit_immediately(self) -> None:
+        client = TelegramClient("test")
+        calls: list[str] = []
+
+        def fake_edit(*_args: object, **_kwargs: object) -> None:
+            calls.append("edit")
+            raise TelegramError("rate limited", retry_after=30)
+
+        client.edit_message = fake_edit  # type: ignore[method-assign]
+        with self.assertRaises(TelegramError):
+            client.edit_markdown(1, 2, "**hello**")
+        self.assertEqual(calls, ["edit"])
 
     def test_split_message_prefers_newline(self) -> None:
         chunks = split_message("a" * 6 + "\n" + "b" * 6, limit=10)
