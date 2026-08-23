@@ -457,6 +457,7 @@ class GatewayEventTests(unittest.TestCase):
             session = app.sessions.create_headless("pi", project, 1)
             view = app._register_turn(session, "turn-waiting")
             view.published = True
+            view.live = True
             view.dirty = False
             view.last_edit = -10.0
             published: list[str] = []
@@ -483,6 +484,7 @@ class GatewayEventTests(unittest.TestCase):
             session = app.sessions.create_headless("pi", project, 1)
             view = app._register_turn(session, "turn-dirty")
             view.published = True
+            view.live = True
             view.dirty = True
             view.last_edit = -10.0
             published: list[str] = []
@@ -513,6 +515,7 @@ class GatewayEventTests(unittest.TestCase):
             view.parts.append("complete answer")
             view.message_id = 88
             view.published = True
+            view.live = True
             view.last_edit = -10.0
             app.sessions.set_in_flight(session.session_id, session.chat_id, view.turn_id)
 
@@ -544,6 +547,89 @@ class GatewayEventTests(unittest.TestCase):
             self.assertIn("完成", final_updates[0])
             self.assertNotIn((session.session_id, view.turn_id), app._turns)
             self.assertEqual(app.sessions.stale_in_flight(), [])
+
+    def test_switching_away_backgrounds_running_turn(self) -> None:
+        """切走后，运行中的 turn 定格为“后台运行中”，不再周期直播。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            first = app.sessions.create_headless("pi", project, 1)
+            app.sessions.create_headless("pi", project, 1)  # 第二个成为当前，切走第一个
+            view = app._register_turn(first, "turn-a")
+            view.published = True
+            view.live = True
+            view.dirty = True
+            view.last_edit = -10.0
+            view.message_id = 88
+
+            edited: list[tuple[int, str]] = []
+            app.telegram.edit_rich_markdown = (  # type: ignore[method-assign]
+                lambda chat_id, message_id, markdown, reply_markup=None: edited.append(
+                    (message_id, markdown)
+                )
+            )
+            published: list[str] = []
+            app._publish_running_turn = (  # type: ignore[method-assign]
+                lambda _view, rendered: published.append(rendered)
+            )
+
+            class StopAfterOneIteration:
+                calls = 0
+
+                def wait(self, _timeout: float) -> bool:
+                    self.calls += 1
+                    return self.calls > 1
+
+            app.stop_event = StopAfterOneIteration()  # type: ignore[assignment]
+            app._status_loop()
+
+            self.assertEqual(len(edited), 1)
+            self.assertEqual(edited[0][0], 88)
+            self.assertIn("后台运行中", edited[0][1])
+            self.assertEqual(published, [])
+            self.assertFalse(view.live)
+
+    def test_switching_back_pins_running_turn_to_fresh_card(self) -> None:
+        """切回运行中的 session 时，把进度重新钉到一条新卡片，旧卡片记入 stale。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_headless("pi", project, 1)
+            view = app._register_turn(session, "turn-a")
+            view.published = True
+            view.live = False  # 之前被冻结
+            view.message_id = 88  # 旧卡片
+            view.dirty = True
+            view.last_edit = -10.0
+
+            sent: list[str] = []
+            app.telegram.send_rich_markdown = (  # type: ignore[method-assign]
+                lambda chat_id, markdown, reply_markup=None: sent.append(markdown) or 99
+            )
+            edited: list[tuple[int, str]] = []
+            app.telegram.edit_rich_markdown = (  # type: ignore[method-assign]
+                lambda chat_id, message_id, markdown, reply_markup=None: edited.append(
+                    (message_id, markdown)
+                )
+            )
+
+            class StopAfterOneIteration:
+                calls = 0
+
+                def wait(self, _timeout: float) -> bool:
+                    self.calls += 1
+                    return self.calls > 1
+
+            app.stop_event = StopAfterOneIteration()  # type: ignore[assignment]
+            app._status_loop()
+
+            self.assertEqual(len(sent), 1)
+            self.assertTrue(view.live)
+            self.assertEqual(view.message_id, 99)
+            self.assertEqual(view.stale_message_ids, [88])
+            self.assertEqual(len(edited), 1)
+            self.assertEqual(edited[0][0], 88)
+            self.assertIn("后台运行中", edited[0][1])
 
     def test_completed_turn_keeps_full_rich_markdown_table(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

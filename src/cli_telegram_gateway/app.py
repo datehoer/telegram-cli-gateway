@@ -120,6 +120,8 @@ class TurnView:
     publish_failures: int = 0
     next_publish_at: float = 0.0
     resumable: bool = False
+    live: bool = False
+    stale_message_ids: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1210,7 +1212,7 @@ class GatewayApp:
         except CodexBackendError:
             LOGGER.exception("could not decline unsupported Codex request")
 
-    def _render_turn(self, view: TurnView, now: float) -> tuple[str, str]:
+    def _render_turn(self, view: TurnView, now: float, background: bool = False) -> tuple[str, str]:
         elapsed = max(0, int(now - view.started_at))
         label = {
             "running": "运行中",
@@ -1218,12 +1220,14 @@ class GatewayApp:
             "failed": "失败",
             "interrupted": "已中断",
         }.get(view.status, view.status)
+        if background and view.status == "running":
+            label = "后台运行中"
         header = f"[{view.session.session_id}] · {label} {elapsed}秒"
         if view.steered:
             header += f" · 已追加 {view.steered} 次"
         answer = "".join(view.parts).strip()
         sections = [header]
-        if view.status == "running":
+        if view.status == "running" and not background:
             if answer:
                 sections.append(("…" if len(answer) > 27000 else "") + answer[-27000:])
             if view.command:
@@ -1232,6 +1236,8 @@ class GatewayApp:
             if view.command_output:
                 output = view.command_output[-500:].replace("```", "` ` `")
                 sections.append(f"命令输出：\n```text\n{output}\n```")
+        elif view.status == "running" and background and answer:
+            sections.append(("…" if len(answer) > 27000 else "") + answer[-27000:])
         elif answer:
             sections.append(answer)
         elif view.status == "completed":
@@ -1245,6 +1251,79 @@ class GatewayApp:
             error = view.error.replace("```", "` ` `")
             sections.append(f"错误：\n```text\n{error}\n```")
         return "\n\n".join(sections), answer
+
+    def _pin_turn(self, view: TurnView, now: float) -> None:
+        """把当前 session 的运行进度钉到一条新的底部消息上并开始直播。
+
+        旧卡片（若存在）降级为“后台运行中”，记入 stale_message_ids，待任务
+        终态时一并收尾。每次切回该 session 都会重新把进度钉到最新一条消息。
+        """
+        with self._state_lock:
+            old_id = view.message_id if view.message_id and view.message_id > 0 else None
+            if old_id is not None:
+                view.stale_message_ids.append(old_id)
+            view.message_id = None
+            view.dirty = True
+        rendered, _ = self._render_turn(view, now)
+        self._publish_running_turn(view, rendered)
+        with self._state_lock:
+            view.live = True
+        if old_id is not None:
+            stamp, _ = self._render_turn(view, now, background=True)
+            try:
+                if view.rich_mode:
+                    self.telegram.edit_rich_markdown(view.session.chat_id, old_id, stamp)
+                else:
+                    self.telegram.edit_markdown(view.session.chat_id, old_id, stamp)
+            except TelegramError as exc:
+                if exc.retry_after is not None:
+                    raise
+                LOGGER.warning(
+                    "could not stamp old progress card %s for %s: %s",
+                    old_id,
+                    view.session.session_id,
+                    exc,
+                )
+
+    def _background_turn(self, view: TurnView, now: float) -> None:
+        """切换走时把当前卡片定格为“后台运行中”，停止周期刷新。"""
+        rendered, _ = self._render_turn(view, now, background=True)
+        if view.message_id is not None and view.message_id > 0:
+            try:
+                if view.rich_mode:
+                    self.telegram.edit_rich_markdown(
+                        view.session.chat_id, view.message_id, rendered
+                    )
+                else:
+                    self.telegram.edit_markdown(
+                        view.session.chat_id, view.message_id, rendered
+                    )
+            except TelegramError as exc:
+                if exc.retry_after is not None:
+                    raise
+                view.rich_mode = False
+                self.telegram.edit_markdown(view.session.chat_id, view.message_id, rendered)
+        with self._state_lock:
+            view.live = False
+
+    def _resolve_stale(self, view: TurnView) -> None:
+        """任务结束后把历史里残留的旧进度卡片收尾成一句短状态。"""
+        with self._state_lock:
+            stale_ids = list(view.stale_message_ids)
+            view.stale_message_ids.clear()
+        if not stale_ids:
+            return
+        if view.status == "completed":
+            stamp = "✅ 此任务已完成，结果已更新到最新一条进度消息。"
+        elif view.status == "failed":
+            stamp = "⚠️ 此任务失败，详情见最新一条进度消息。"
+        else:
+            stamp = "⏹ 此任务已中断。"
+        for message_id in stale_ids:
+            try:
+                self.telegram.edit_message(view.session.chat_id, message_id, stamp)
+            except TelegramError:
+                LOGGER.warning("could not resolve stale progress card %s", message_id)
 
     def _publish_running_turn(self, view: TurnView, rendered: str) -> None:
         # Stream by editing one persistent message in place. Telegram Rich Message
@@ -1437,25 +1516,45 @@ class GatewayApp:
             with self._state_lock:
                 views = list(self._turns.values())
             for view in views:
+                action: str | None = None
+                published_status: str | None = None
+                rendered: str | None = None
                 with self._state_lock:
                     if now < view.next_publish_at:
                         continue
-                    # Coalesce meaningful progress; elapsed time alone does not
-                    # justify another Telegram edit and can trigger flood control.
-                    should_update = (
-                        not view.published
-                        or view.status != "running"
-                        or (
-                            view.dirty
-                            and now - view.last_edit >= self.config.stream_update_interval
+                    if view.status == "running":
+                        current = self.sessions.current(view.session.chat_id)
+                        is_current = bool(
+                            current and current.session_id == view.session.session_id
                         )
-                    )
-                    if not should_update:
-                        continue
-                    published_status = view.status
-                    rendered, _answer = self._render_turn(view, now)
+                        if is_current and not view.live:
+                            action = "pin"
+                        elif not is_current and view.live:
+                            action = "background"
+                        elif not is_current:
+                            # 后台冻结中：不周期刷新，等终态或切回前台。
+                            continue
+                    if action is None:
+                        # Coalesce meaningful progress; elapsed time alone does not
+                        # justify another Telegram edit and can trigger flood control.
+                        should_update = (
+                            not view.published
+                            or view.status != "running"
+                            or (
+                                view.dirty
+                                and now - view.last_edit >= self.config.stream_update_interval
+                            )
+                        )
+                        if not should_update:
+                            continue
+                        published_status = view.status
+                        rendered, _answer = self._render_turn(view, now)
                 try:
-                    if published_status == "running":
+                    if action == "pin":
+                        self._pin_turn(view, now)
+                    elif action == "background":
+                        self._background_turn(view, now)
+                    elif published_status == "running":
                         self._publish_running_turn(view, rendered)
                     else:
                         self._publish_final_turn(
@@ -1474,15 +1573,21 @@ class GatewayApp:
                     view.last_edit = now
                     view.publish_failures = 0
                     view.next_publish_at = 0.0
-                    if view.status != published_status:
+                    if action is None and view.status != published_status:
                         # A terminal event arrived while Telegram was publishing the
                         # running snapshot. Keep the view so the next pass replaces
                         # that stale message with the terminal status.
                         view.dirty = True
                         continue
                     view.dirty = False
-                    if published_status != "running":
+                    if action is None and published_status != "running":
                         self._turns.pop((view.session.session_id, view.turn_id), None)
+                if (
+                    action is None
+                    and published_status is not None
+                    and published_status != "running"
+                ):
+                    self._resolve_stale(view)
 
     @staticmethod
     def _schedule_publish_retry(view: TurnView, error: TelegramError, now: float) -> float:
