@@ -1071,6 +1071,12 @@ class GatewayApp:
                                 view.steered += 1
                                 view.dirty = True
                         self._send(chat_id, f"已追加到 {session.label} 当前任务。")
+                        with self._state_lock:
+                            # The acknowledgement is newer than the existing progress
+                            # card. Re-pin the live card so subsequent edits remain
+                            # visible at the bottom of the chat.
+                            if view and view.status == "running":
+                                view.live = False
                         return
                     except CodexBackendError as exc:
                         LOGGER.warning("Codex steer failed; queued instead: %s", exc)

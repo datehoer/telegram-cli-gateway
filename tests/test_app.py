@@ -1175,17 +1175,23 @@ class GatewayEventTests(unittest.TestCase):
                 "codex", project, 1, "codex-app-server", "thread-1"
             )
             app._codex_active_turns["thread-1"] = "turn-1"
-            app._register_turn(session, "turn-1")
+            view = app._register_turn(session, "turn-1")
+            view.live = True
             steered: list[tuple[str, str, str]] = []
             app.codex.steer_turn = (  # type: ignore[method-assign]
                 lambda thread, turn, text, _attachments=(): steered.append(
                     (thread, turn, text)
                 ) or turn
             )
-            app._send = lambda *_args: None  # type: ignore[method-assign]
+            sent: list[str] = []
+            app._send = lambda _chat, text: sent.append(text)  # type: ignore[method-assign]
             app._send_to_session(1, session, "change direction")
             self.assertEqual(steered, [("thread-1", "turn-1", "change direction")])
             self.assertNotIn(session.session_id, app._queues)
+            self.assertEqual(sent, [f"已追加到 {session.label} 当前任务。"])
+            self.assertEqual(view.steered, 1)
+            self.assertTrue(view.dirty)
+            self.assertFalse(view.live)
 
     def test_busy_headless_input_is_queued_and_drained(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
