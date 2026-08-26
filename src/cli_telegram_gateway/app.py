@@ -59,6 +59,7 @@ HELP_TEXT = """远程 CLI 网关
 /back               回到上一个会话
 /sessions           查看会话列表
 /tasks              查看当前任务与等待队列
+/tgstats            查看 Telegram 写入与限流统计
 /where              查看当前会话和目录
 /interrupt          中断当前任务
 /resume [会话]      继续上次被中断的任务
@@ -83,6 +84,7 @@ BOT_COMMANDS = (
     ("back", "返回上一个会话"),
     ("sessions", "列出会话"),
     ("tasks", "查看任务队列"),
+    ("tgstats", "查看 Telegram API 统计"),
     ("where", "显示当前会话"),
     ("interrupt", "中断当前任务"),
     ("resume", "继续上次被中断的任务"),
@@ -134,7 +136,9 @@ class PendingInput:
 class GatewayApp:
     def __init__(self, config: Config):
         self.config = config
-        self.telegram = TelegramClient(config.bot_token)
+        self.telegram = TelegramClient(
+            config.bot_token, config.runtime_dir / "telegram-metrics.json"
+        )
         self.sessions = SessionManager(config)
         self.codex = CodexAppServer(
             config.cli_commands["codex"],
@@ -165,6 +169,53 @@ class GatewayApp:
             self.telegram.send_message(chat_id, text)
         except TelegramError:
             LOGGER.exception("could not send Telegram message to chat %s", chat_id)
+
+    def _telegram_stats_text(self) -> str:
+        snapshot = self.telegram.metrics_snapshot()
+        today = snapshot["today"]
+        recent = snapshot["last_7_days"]
+        methods = today.get("methods", {})
+        ranked_methods = sorted(
+            (
+                (
+                    method,
+                    sum(int(count) for count in counts.values()),
+                )
+                for method, counts in methods.items()
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )[:5]
+        lines = [
+            f"Telegram 写入统计（UTC {snapshot['utc_day']}）",
+            (
+                "今日成功写入："
+                f"新消息 {today['new_messages']} · "
+                f"编辑 {today['message_edits']} · "
+                f"其他 {today['other_writes']}"
+            ),
+            (
+                f"今日请求：成功 {today['successful_requests']} · "
+                f"失败 {today['failed_requests']} · "
+                f"429 {today['rate_limited']} · "
+                f"本地延后 {today['local_deferrals']}"
+            ),
+            (
+                "近 7 天成功写入："
+                f"新消息 {recent['new_messages']} · "
+                f"编辑 {recent['message_edits']} · "
+                f"其他 {recent['other_writes']} · "
+                f"429 {recent['rate_limited']}"
+            ),
+            f"当前 flood wait：{snapshot['flood_wait_seconds']} 秒",
+        ]
+        if ranked_methods:
+            lines.append(
+                "今日方法：" + " · ".join(
+                    f"{method} {count}" for method, count in ranked_methods
+                )
+            )
+        lines.append("仅统计 gateway 的实际写调用，不代表 Telegram 官方每日额度。")
+        return "\n".join(lines)
 
     def _current_or_reply(self, chat_id: int) -> CliSession | None:
         session = self.sessions.current(chat_id)
@@ -282,6 +333,9 @@ class GatewayApp:
             return
         if command == "tasks":
             self._send_tasks(chat_id)
+            return
+        if command == "tgstats":
+            self._send(chat_id, self._telegram_stats_text())
             return
         if command == "where":
             session = self._current_or_reply(chat_id)

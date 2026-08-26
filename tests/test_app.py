@@ -58,8 +58,10 @@ class GatewayEventTests(unittest.TestCase):
         command_names = {name for name, _description in BOT_COMMANDS}
         self.assertNotIn("file", command_names)
         self.assertNotIn("photo", command_names)
+        self.assertIn("tgstats", command_names)
         self.assertNotIn("/file", HELP_TEXT)
         self.assertNotIn("/photo", HELP_TEXT)
+        self.assertIn("/tgstats", HELP_TEXT)
 
         with tempfile.TemporaryDirectory() as temporary:
             app = self.make_app(Path(temporary))
@@ -74,6 +76,53 @@ class GatewayEventTests(unittest.TestCase):
                 }})
 
             self.assertEqual(sent, ["未知命令。使用 /help 查看可用命令。"] * 2)
+
+    def test_tgstats_command_formats_daily_and_recent_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            app.telegram.metrics_snapshot = lambda: {  # type: ignore[method-assign]
+                "utc_day": "2026-08-26",
+                "today": {
+                    "successful_requests": 12,
+                    "failed_requests": 2,
+                    "rate_limited": 1,
+                    "local_deferrals": 3,
+                    "new_messages": 4,
+                    "message_edits": 6,
+                    "other_writes": 2,
+                    "methods": {
+                        "editMessageText": {
+                            "success": 6,
+                            "failed": 1,
+                            "rate_limited": 1,
+                            "local_deferred": 2,
+                        }
+                    },
+                },
+                "last_7_days": {
+                    "new_messages": 20,
+                    "message_edits": 30,
+                    "other_writes": 5,
+                    "rate_limited": 2,
+                },
+                "flood_wait_seconds": 7,
+            }
+            sent: list[str] = []
+            app._send = lambda _chat_id, text: sent.append(text)  # type: ignore[method-assign]
+
+            app.handle_update({"message": {
+                "from": {"id": 1},
+                "chat": {"id": 1, "type": "private"},
+                "text": "/tgstats",
+            }})
+
+            self.assertEqual(len(sent), 1)
+            self.assertIn("UTC 2026-08-26", sent[0])
+            self.assertIn("新消息 4 · 编辑 6 · 其他 2", sent[0])
+            self.assertIn("429 1 · 本地延后 3", sent[0])
+            self.assertIn("近 7 天", sent[0])
+            self.assertIn("flood wait：7 秒", sent[0])
+            self.assertIn("editMessageText 10", sent[0])
 
     def test_run_continues_when_command_refresh_is_rate_limited(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

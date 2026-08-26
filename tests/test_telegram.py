@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from cli_telegram_gateway.telegram import TelegramClient, TelegramError, split_message
@@ -29,6 +31,10 @@ class TelegramTests(unittest.TestCase):
                 with self.assertRaises(TelegramError) as caught:
                     client._call("sendMessage", {"chat_id": 1, "text": "hello"})
         self.assertEqual(caught.exception.retry_after, 8)
+        today = client.metrics_snapshot()["today"]
+        self.assertEqual(today["network_requests"], 1)
+        self.assertEqual(today["failed_requests"], 1)
+        self.assertEqual(today["rate_limited"], 1)
 
     def test_retry_after_defers_other_writes_but_not_update_polling(self) -> None:
         client = TelegramClient("test")
@@ -61,6 +67,36 @@ class TelegramTests(unittest.TestCase):
             with patch("urllib.request.urlopen", return_value=response) as polling_request:
                 self.assertEqual(client.get_updates(None, 1), [])
             polling_request.assert_called_once()
+        today = client.metrics_snapshot()["today"]
+        self.assertEqual(today["network_requests"], 1)
+        self.assertEqual(today["rate_limited"], 1)
+        self.assertEqual(today["local_deferrals"], 1)
+
+    def test_successful_write_call_is_counted(self) -> None:
+        client = TelegramClient("test")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true, "result": {"message_id": 7}}'
+        with patch("urllib.request.urlopen", return_value=response):
+            client._call("sendMessage", {"chat_id": 1, "text": "hello"})
+        today = client.metrics_snapshot()["today"]
+        self.assertEqual(today["network_requests"], 1)
+        self.assertEqual(today["successful_requests"], 1)
+        self.assertEqual(today["new_messages"], 1)
+
+    def test_successful_file_upload_is_counted(self) -> None:
+        client = TelegramClient("test")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true, "result": {"message_id": 7}}'
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "photo.jpg"
+            path.write_bytes(b"image")
+            with patch("urllib.request.urlopen", return_value=response):
+                client.send_local_file(1, path, as_photo=True)
+        today = client.metrics_snapshot()["today"]
+        self.assertEqual(today["new_messages"], 1)
+        self.assertEqual(today["methods"]["sendPhoto"]["success"], 1)
 
     def test_markdown_fallback_does_not_retry_rate_limit_immediately(self) -> None:
         client = TelegramClient("test")

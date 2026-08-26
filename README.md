@@ -19,6 +19,7 @@
 - 使用原生 Rich Message 原地编辑流式更新回答、当前命令和运行秒数（不用 Draft：Draft 一旦被中断无法由网关收尾，会留下永久“加载中”气泡）
 - 多会话并发时只直播“当前” session：切到谁就在底部发一条每 10 秒原地刷新的进度卡片；切走的那条定格为“后台运行中”，任务跑完后照样把结果更新到它的卡片；稍后切回空闲 session 时会把最后一条成功结果复制到聊天底部，`/clear` 后则显示简短的新对话提示；来回切换时残留的旧卡片会在任务结束时收尾为一句短状态
 - Telegram 限流或临时失败时按 `retry_after` 或封顶指数退避重试消息更新
+- `/tgstats` 查看今日和最近 7 天的 Telegram 新消息、编辑、失败、429 与本地延后次数；按 UTC 聚合，只保留最近 14 天，不记录消息内容或 chat_id
 - 使用原生 Rich Markdown 渲染表格、标题、列表、任务列表、链接、引用、公式和代码块
 - Rich Messages 不可用时自动回退到安全 HTML/纯文本
 - 接收 Telegram 文件和图片并交给当前 CLI
@@ -79,6 +80,7 @@ ENABLED_CLIS=claude,codex,grok,pi
 /use grok
 /sessions
 /tasks
+/tgstats
 /rename codex-a8d1 主项目
 /back
 /interrupt
