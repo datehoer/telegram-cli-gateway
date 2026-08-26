@@ -17,7 +17,7 @@
 - Codex 运行中收到新消息时使用原生 `turn/steer` 追加到当前任务；其他 CLI 先按会话 FIFO 排队并在完成后自动继续
 - 任务被网关重启/关机连累中断后：网关重启时提示“回复 /resume 继续，或 /cancel 放弃”，/resume 通过 CLI 原生 resume 续跑同一会话（改网关代码后重启自己这类场景可配合 `AUTO_RESUME=true` 自动续跑）；用户主动 /interrupt 的任务不会进入恢复候选
 - 使用原生 Rich Message 原地编辑流式更新回答、当前命令和运行秒数（不用 Draft：Draft 一旦被中断无法由网关收尾，会留下永久“加载中”气泡）
-- 多会话并发时只直播“当前” session：切到谁就在底部发一条每 5 秒原地刷新的进度卡片；切走的那条定格为“后台运行中”，任务跑完后照样把结果更新到它的卡片；稍后切回空闲 session 时会把最后一条成功结果复制到聊天底部，`/clear` 后则显示简短的新对话提示；来回切换时残留的旧卡片会在任务结束时收尾为一句短状态
+- 多会话并发时只直播“当前” session：切到谁就在底部发一条每 10 秒原地刷新的进度卡片；切走的那条定格为“后台运行中”，任务跑完后照样把结果更新到它的卡片；稍后切回空闲 session 时会把最后一条成功结果复制到聊天底部，`/clear` 后则显示简短的新对话提示；来回切换时残留的旧卡片会在任务结束时收尾为一句短状态
 - Telegram 限流或临时失败时按 `retry_after` 或封顶指数退避重试消息更新
 - 使用原生 Rich Markdown 渲染表格、标题、列表、任务列表、链接、引用、公式和代码块
 - Rich Messages 不可用时自动回退到安全 HTML/纯文本
@@ -58,7 +58,7 @@ chmod 600 .env
 TELEGRAM_ALLOW_GROUPS=false
 DEFAULT_WORKDIR=/srv/projects
 ALLOWED_WORKDIRS=/srv/projects
-STREAM_UPDATE_INTERVAL=5
+STREAM_UPDATE_INTERVAL=10
 TELEGRAM_MAX_FILE_BYTES=20971520
 AUTO_RESUME=false
 ENABLED_CLIS=claude,codex,grok,pi
@@ -93,7 +93,7 @@ ENABLED_CLIS=claude,codex,grok,pi
 
 项目使用 `uv` 管理本地 `.venv`，`scripts/run.sh` 会优先通过 `/home/openclaw/.local/bin/uv` 启动并在找不到 uv 时回退到系统 Python。
 
-私聊中的运行状态先发送一条 Rich Message，任务运行期间每 5 秒原地编辑更新（回答、当前命令、运行秒数），任务完成后把同一条消息编辑为最终答案并附产物按钮；编辑失败时回退到安全 HTML 消息。不使用临时 Draft，因为被中断的 Draft 无法由网关收尾，会留下无法消除的“加载中”气泡。
+私聊中的运行状态先发送一条 Rich Message，任务运行期间每 10 秒原地编辑更新（回答、当前命令、运行秒数），任务完成后把同一条消息编辑为最终答案并附产物按钮；编辑失败时回退到安全 HTML 消息。不使用临时 Draft，因为被中断的 Draft 无法由网关收尾，会留下无法消除的“加载中”气泡。
 
 ## systemd 用户服务
 

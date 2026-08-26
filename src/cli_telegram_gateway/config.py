@@ -86,7 +86,7 @@ class Config:
     output_max_bytes: int
     tmux_socket_name: str
     enabled_clis: tuple[str, ...] = ("claude", "codex", "grok", "pi")
-    stream_update_interval: float = 5.0
+    stream_update_interval: float = 10.0
     telegram_max_file_bytes: int = 20 * 1024 * 1024
     auto_send_artifacts: str = "images"
     auto_resume: bool = False
@@ -184,7 +184,7 @@ class Config:
             output_max_bytes=_positive_int(values, "OUTPUT_MAX_BYTES", 65536),
             tmux_socket_name=socket_name,
             enabled_clis=enabled_clis,
-            stream_update_interval=_positive_float(values, "STREAM_UPDATE_INTERVAL", 5.0),
+            stream_update_interval=_positive_float(values, "STREAM_UPDATE_INTERVAL", 10.0),
             telegram_max_file_bytes=_positive_int(
                 values, "TELEGRAM_MAX_FILE_BYTES", 20 * 1024 * 1024
             ),

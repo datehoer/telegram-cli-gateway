@@ -49,12 +49,14 @@ class ConfigTests(unittest.TestCase):
                 "CLI_GROK",
                 "CLI_PI",
                 "ENABLED_CLIS",
+                "STREAM_UPDATE_INTERVAL",
             }
             clean_environment = {key: value for key, value in os.environ.items() if key not in keys}
             with patch.dict(os.environ, clean_environment, clear=True):
                 config = Config.load(project)
             self.assertEqual(config.allowed_user_ids, frozenset({100, 200}))
             self.assertEqual(config.enabled_clis, ("codex", "claude"))
+            self.assertEqual(config.stream_update_interval, 10.0)
             self.assertEqual(config.resolve_workdir(str(child)), child.resolve())
             with self.assertRaises(ConfigError):
                 config.resolve_workdir("/etc")
