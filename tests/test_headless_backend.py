@@ -64,6 +64,61 @@ class HeadlessParserTests(unittest.TestCase):
         self.assertEqual(text, [("delta", "hello")])
         self.assertEqual(tool, [("command", "pwd")])
 
+    def test_grok_result_returns_errors_list_detail(self) -> None:
+        events = self.backend._parse_anthropic_event(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": [
+                    "API error (status 402 Payment Required): "
+                    "Grok Build usage balance exhausted"
+                ],
+            },
+            {},
+            False,
+        )
+
+        self.assertEqual(
+            events,
+            [
+                (
+                    "error",
+                    "API error (status 402 Payment Required): "
+                    "Grok Build usage balance exhausted",
+                )
+            ],
+        )
+
+    def test_anthropic_result_prefers_direct_error_detail(self) -> None:
+        events = self.backend._parse_anthropic_event(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error": "authentication failed",
+                "errors": ["less specific"],
+            },
+            {},
+            False,
+        )
+
+        self.assertEqual(events, [("error", "authentication failed")])
+
+    def test_anthropic_result_preserves_structured_error_detail(self) -> None:
+        events = self.backend._parse_anthropic_event(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error": {"status": 429, "message": "rate limited"},
+            },
+            {},
+            False,
+        )
+
+        self.assertEqual(events, [("error", '{"status":429,"message":"rate limited"}')])
+
     def test_pi_stream_events(self) -> None:
         self.assertEqual(
             self.backend._parse_pi_event(

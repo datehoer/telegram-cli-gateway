@@ -358,13 +358,32 @@ class HeadlessBackend:
             return output
         if value_type == "result":
             if value.get("is_error"):
-                output.append(("error", str(value.get("result") or value.get("error") or "CLI task failed")))
+                output.append(("error", self._anthropic_error_detail(value)))
             else:
                 result = value.get("result")
                 if not emitted_text and isinstance(result, str) and result:
                     output.append(("delta", result))
                 output.append(("completed", None))
         return output
+
+    @staticmethod
+    def _anthropic_error_detail(value: dict[str, Any]) -> str:
+        for key in ("result", "error"):
+            detail = value.get(key)
+            if isinstance(detail, str) and detail.strip():
+                return detail
+            if detail:
+                return HeadlessBackend._stringify(detail)
+
+        # Grok's Messages-compatible terminal result carries execution errors
+        # in errors[] rather than result/error.
+        errors = value.get("errors")
+        if isinstance(errors, list):
+            details = [item.strip() for item in errors if isinstance(item, str) and item.strip()]
+            if details:
+                return "\n".join(details)
+
+        return "CLI task failed"
 
     def _parse_pi_event(
         self, value: dict[str, Any], emitted_text: bool = False
