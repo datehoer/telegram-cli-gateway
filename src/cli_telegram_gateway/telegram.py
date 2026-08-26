@@ -154,6 +154,20 @@ class TelegramClient:
                     first_message_id = message_id
         return first_message_id
 
+    def copy_message(
+        self, chat_id: int, from_chat_id: int, message_id: int
+    ) -> int | None:
+        result = self._call(
+            "copyMessage",
+            {
+                "chat_id": chat_id,
+                "from_chat_id": from_chat_id,
+                "message_id": message_id,
+            },
+        )
+        copied_id = result.get("message_id") if isinstance(result, dict) else None
+        return copied_id if isinstance(copied_id, int) and copied_id > 0 else None
+
     def send_markdown(
         self,
         chat_id: int,

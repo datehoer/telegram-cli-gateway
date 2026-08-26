@@ -547,6 +547,8 @@ class GatewayEventTests(unittest.TestCase):
             self.assertIn("完成", final_updates[0])
             self.assertNotIn((session.session_id, view.turn_id), app._turns)
             self.assertEqual(app.sessions.stale_in_flight(), [])
+            saved = app.sessions.get(session.session_id)
+            self.assertEqual(saved.last_completed_message_id, 88)  # type: ignore[union-attr]
 
     def test_switching_away_backgrounds_running_turn(self) -> None:
         """切走后，运行中的 turn 定格为“后台运行中”，不再周期直播。"""
@@ -926,6 +928,7 @@ class GatewayEventTests(unittest.TestCase):
             project = Path(temporary)
             app = self.make_app(project)
             session = app.sessions.create_headless("pi", project, 1)
+            app.sessions.set_last_completed_message(session.session_id, 88)
             old_external = session.external_id
             sent: list[str] = []
             app._send = lambda _chat, text: sent.append(text)  # type: ignore[method-assign]
@@ -938,6 +941,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertIsNotNone(refreshed)
             self.assertNotEqual(refreshed.external_id, old_external)  # type: ignore[union-attr]
             self.assertEqual(refreshed.turn_count, 0)  # type: ignore[union-attr]
+            self.assertIsNone(refreshed.last_completed_message_id)  # type: ignore[union-attr]
             self.assertIn("已开新对话", sent[0])
 
     def test_clear_codex_starts_and_archives_thread(self) -> None:
@@ -947,6 +951,7 @@ class GatewayEventTests(unittest.TestCase):
             session = app.sessions.create_virtual(
                 "codex", project, 1, "codex-app-server", "thread-old"
             )
+            app.sessions.set_last_completed_message(session.session_id, 88)
             started: list[str] = []
             archived: list[str] = []
             app.codex.start_thread = (  # type: ignore[method-assign]
@@ -966,6 +971,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(archived, ["thread-old"])
             refreshed = app.sessions.get(session.session_id)
             self.assertEqual(refreshed.external_id, "thread-new")  # type: ignore[union-attr]
+            self.assertIsNone(refreshed.last_completed_message_id)  # type: ignore[union-attr]
             self.assertIn("旧线程已归档", sent[0])
 
     def test_clear_rejects_busy_session(self) -> None:
@@ -995,6 +1001,8 @@ class GatewayEventTests(unittest.TestCase):
             app.sessions.create_headless("pi", project, 1)
             answered: list[tuple[str, str]] = []
             edited: list[tuple[int, int, str, dict[str, Any]]] = []
+            sent: list[str] = []
+            app._send = lambda _chat, text: sent.append(text)  # type: ignore[method-assign]
             app.telegram.answer_callback_query = (  # type: ignore[method-assign]
                 lambda query_id, text="": answered.append((query_id, text))
             )
@@ -1020,6 +1028,73 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(answered, [("query-1", f"已切换到 {first.session_id}")])
             self.assertIn(f"▶ {first.session_id}", edited[0][2])
             self.assertTrue(edited[0][3]["inline_keyboard"])
+            self.assertEqual(sent, [f"[{first.session_id}] · 有什么可以帮你？"])
+
+    def test_switching_to_completed_session_copies_last_result_to_bottom(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            first = app.sessions.create_headless("claude", project, 1)
+            app.sessions.set_last_completed_message(first.session_id, 88)
+            app.sessions.create_headless("pi", project, 1)
+            copied: list[tuple[int, int, int]] = []
+            app.telegram.copy_message = (  # type: ignore[method-assign]
+                lambda chat_id, from_chat_id, message_id: copied.append(
+                    (chat_id, from_chat_id, message_id)
+                ) or 99
+            )
+            app.telegram.answer_callback_query = lambda *_args: None  # type: ignore[method-assign]
+            app.telegram.edit_message = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+            app._send = lambda *_args: self.fail("completed result should be copied")  # type: ignore[method-assign]
+
+            app.handle_update(
+                {
+                    "callback_query": {
+                        "id": "query-copy",
+                        "from": {"id": 1},
+                        "data": f"use:{first.session_id}",
+                        "message": {
+                            "message_id": 42,
+                            "chat": {"id": 1, "type": "private"},
+                        },
+                    }
+                }
+            )
+
+            self.assertEqual(copied, [(1, 1, 88)])
+            refreshed = app.sessions.get(first.session_id)
+            self.assertEqual(refreshed.last_completed_message_id, 99)  # type: ignore[union-attr]
+            self.assertEqual(app.sessions.session_for_message(1, 99).session_id, first.session_id)  # type: ignore[union-attr]
+
+    def test_switching_during_terminal_publish_moves_result_to_fresh_card(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            first = app.sessions.create_headless("claude", project, 1)
+            app.sessions.create_headless("pi", project, 1)
+            view = app._register_turn(first, "turn-complete")
+            view.status = "completed"
+            view.message_id = 88
+            app.telegram.answer_callback_query = lambda *_args: None  # type: ignore[method-assign]
+            app.telegram.edit_message = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+            app.handle_update(
+                {
+                    "callback_query": {
+                        "id": "query-terminal",
+                        "from": {"id": 1},
+                        "data": f"use:{first.session_id}",
+                        "message": {
+                            "message_id": 42,
+                            "chat": {"id": 1, "type": "private"},
+                        },
+                    }
+                }
+            )
+
+            self.assertIsNone(view.message_id)
+            self.assertEqual(view.stale_message_ids, [88])
+            self.assertTrue(view.dirty)
 
     def test_reply_to_old_result_routes_and_switches_to_its_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

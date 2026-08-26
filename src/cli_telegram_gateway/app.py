@@ -255,8 +255,11 @@ class GatewayApp:
                 return
             session = self.sessions.resolve(chat_id, target)
             if session and session.cli in self.config.enabled_clis:
+                previous = self.sessions.current(chat_id)
                 self.sessions.switch(chat_id, session.session_id)
                 self._send(chat_id, f"已切换到 {session.session_id}\n目录：{session.cwd}")
+                if not previous or previous.session_id != session.session_id:
+                    self._surface_switched_session(session)
             elif target in self.config.enabled_clis:
                 current = self.sessions.current(chat_id)
                 self._new_session(chat_id, target, current.cwd if current else None)
@@ -271,6 +274,8 @@ class GatewayApp:
                 if session
                 else "没有可返回的活动会话。",
             )
+            if session:
+                self._surface_switched_session(session)
             return
         if command == "sessions":
             self._send_sessions(chat_id, include_archived=raw_args.strip().lower() == "all")
@@ -540,6 +545,50 @@ class GatewayApp:
             text += f" · 排队 {queued}"
         return text
 
+    def _surface_switched_session(self, session: CliSession) -> None:
+        """切回 session 时把它当前最有用的状态放到聊天底部。"""
+        with self._state_lock:
+            pending_views = [
+                view
+                for (session_id, _turn_id), view in self._turns.items()
+                if session_id == session.session_id
+            ]
+            if any(view.status == "running" for view in pending_views):
+                # 运行态由 status pump 重新钉住，避免先复制上一轮结果。
+                return
+            for view in pending_views:
+                # CLI 已结束但终态尚未发布：强制下一轮在底部发新卡片。
+                if view.message_id is not None and view.message_id > 0:
+                    view.stale_message_ids.append(view.message_id)
+                view.message_id = None
+                view.dirty = True
+        if pending_views or self._session_is_busy(session):
+            return
+
+        source_message_id = session.last_completed_message_id
+        if source_message_id is not None:
+            try:
+                copied_id = self.telegram.copy_message(
+                    session.chat_id, session.chat_id, source_message_id
+                )
+            except TelegramError as exc:
+                LOGGER.warning(
+                    "could not surface last completed message for %s: %s",
+                    session.session_id,
+                    exc,
+                )
+            else:
+                if copied_id is not None:
+                    self.sessions.bind_message(
+                        session.chat_id, copied_id, session.session_id
+                    )
+                    self.sessions.set_last_completed_message(
+                        session.session_id, copied_id
+                    )
+                    return
+
+        self._send(session.chat_id, f"[{session.session_id}] · 有什么可以帮你？")
+
     def _sessions_view(
         self, chat_id: int, include_archived: bool = False
     ) -> tuple[str, dict[str, Any]]:
@@ -784,8 +833,11 @@ class GatewayApp:
 
             refresh = True
             include_archived = False
+            switched = False
             if action == "use":
+                previous = self.sessions.current(chat_id)
                 self.sessions.switch(chat_id, session.session_id)
+                switched = not previous or previous.session_id != session.session_id
                 notice = f"已切换到 {session.label}"
             elif action == "interrupt":
                 interrupted = self._interrupt_session(session)
@@ -835,6 +887,8 @@ class GatewayApp:
             if refresh and isinstance(message_id, int):
                 text, markup = self._sessions_view(chat_id, include_archived=include_archived)
                 self.telegram.edit_message(chat_id, message_id, text, reply_markup=markup)
+            if switched:
+                self._surface_switched_session(session)
         except TelegramError:
             LOGGER.exception("could not update session keyboard for chat %s", chat_id)
         except (CodexBackendError, SessionError) as exc:
@@ -918,10 +972,12 @@ class GatewayApp:
             except CodexBackendError:
                 LOGGER.warning("could not archive old Codex thread %s", old_thread)
             self.sessions.update_backend(session.session_id, "codex-app-server", thread_id)
+            self.sessions.set_last_completed_message(session.session_id, None)
             self._send(chat_id, f"{session.label} 已开新对话（旧线程已归档）。")
             return
         if session.backend == "headless-json":
             self.sessions.rotate_external_id(session.session_id)
+            self.sessions.set_last_completed_message(session.session_id, None)
             self._send(chat_id, f"{session.label} 已开新对话，上下文已清空。")
             return
         self._send(chat_id, f"{session.label} 不支持 /clear。")
@@ -1579,6 +1635,17 @@ class GatewayApp:
                         # that stale message with the terminal status.
                         view.dirty = True
                         continue
+                    if (
+                        action is None
+                        and published_status == "completed"
+                        and view.message_id is not None
+                        and view.message_id > 0
+                    ):
+                        # Save the pointer before removing the view so a concurrent
+                        # session switch cannot briefly copy the previous result.
+                        self.sessions.set_last_completed_message(
+                            view.session.session_id, view.message_id
+                        )
                     view.dirty = False
                     if action is None and published_status != "running":
                         self._turns.pop((view.session.session_id, view.turn_id), None)

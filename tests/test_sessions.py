@@ -67,6 +67,51 @@ class SessionStateTests(unittest.TestCase):
             self.assertIsNone(cleared.model)  # type: ignore[union-attr]
             self.assertIsNone(cleared.effort)  # type: ignore[union-attr]
 
+    def test_last_completed_message_pointer_persists_and_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.set_last_completed_message(session.session_id, 88)
+
+            reloaded = self.make_manager(project)
+            restored = reloaded.get(session.session_id)
+            self.assertEqual(restored.last_completed_message_id, 88)  # type: ignore[union-attr]
+
+            reloaded.set_last_completed_message(session.session_id, None)
+            cleared = self.make_manager(project).get(session.session_id)
+            self.assertIsNone(cleared.last_completed_message_id)  # type: ignore[union-attr]
+
+    def test_legacy_idle_session_uses_latest_bound_message_as_initial_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.bind_message(1, 88, session.session_id)
+            manager.bind_message(1, 99, session.session_id)
+            manager._state["sessions"][session.session_id].pop(  # type: ignore[attr-defined]
+                "last_completed_message_id"
+            )
+            manager._save_state()  # type: ignore[attr-defined]
+
+            restored = self.make_manager(project).get(session.session_id)
+            self.assertEqual(restored.last_completed_message_id, 99)  # type: ignore[union-attr]
+
+    def test_legacy_in_flight_session_does_not_infer_completed_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.bind_message(1, 88, session.session_id)
+            manager.set_in_flight(session.session_id, 1, "turn-running")
+            manager._state["sessions"][session.session_id].pop(  # type: ignore[attr-defined]
+                "last_completed_message_id"
+            )
+            manager._save_state()  # type: ignore[attr-defined]
+
+            restored = self.make_manager(project).get(session.session_id)
+            self.assertIsNone(restored.last_completed_message_id)  # type: ignore[union-attr]
+
 
 class TmuxIntegrationTests(unittest.TestCase):
     def test_create_send_read_and_stop(self) -> None:

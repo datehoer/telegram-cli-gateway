@@ -108,6 +108,22 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(client.send_message(1, "hello"), 1)
         self.assertEqual(calls, ["sendMessage"])
 
+    def test_copy_message_returns_new_message_id(self) -> None:
+        client = TelegramClient("test")
+        calls: list[tuple[str, object]] = []
+
+        def fake_call(method: str, payload: object = None) -> object:
+            calls.append((method, payload))
+            return {"message_id": 99}
+
+        client._call = fake_call  # type: ignore[method-assign]
+        self.assertEqual(client.copy_message(1, 1, 88), 99)
+        self.assertEqual(calls[0][0], "copyMessage")
+        self.assertEqual(
+            calls[0][1],
+            {"chat_id": 1, "from_chat_id": 1, "message_id": 88},
+        )
+
     def test_session_keyboard_is_sent_as_reply_markup(self) -> None:
         client = TelegramClient("test")
         payloads: list[object] = []

@@ -62,6 +62,7 @@ class CliSession:
     archived: bool = False
     model: str | None = None
     effort: str | None = None
+    last_completed_message_id: int | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "CliSession":
@@ -71,6 +72,7 @@ class CliSession:
         normalized.setdefault("archived", False)
         normalized.setdefault("model", None)
         normalized.setdefault("effort", None)
+        normalized.setdefault("last_completed_message_id", None)
         return cls(**normalized)
 
     @property
@@ -116,6 +118,29 @@ class SessionManager:
         data.setdefault("message_routes", {})
         data.setdefault("artifacts", {})
         data.setdefault("in_flight", {})
+        # One-time compatibility for sessions created before the result pointer
+        # existed. Only idle legacy sessions are inferred; all new writes carry
+        # the field explicitly and therefore never repeat this heuristic.
+        for session_id, raw_session in data["sessions"].items():
+            if (
+                not isinstance(raw_session, dict)
+                or "last_completed_message_id" in raw_session
+            ):
+                continue
+            latest_message_id: int | None = None
+            if session_id not in data["in_flight"]:
+                chat_id = str(raw_session.get("chat_id", ""))
+                for route, routed_session_id in data["message_routes"].items():
+                    route_chat_id, separator, route_message_id = str(route).rpartition(":")
+                    if (
+                        routed_session_id == session_id
+                        and separator
+                        and route_chat_id == chat_id
+                        and route_message_id.isdigit()
+                    ):
+                        candidate = int(route_message_id)
+                        latest_message_id = max(latest_message_id or candidate, candidate)
+            raw_session["last_completed_message_id"] = latest_message_id
         return data
 
     def _save_state(self) -> None:
@@ -418,6 +443,21 @@ class SessionManager:
                 for key in list(routes)[: len(routes) - 2000]:
                     routes.pop(key, None)
             self._save_state()
+
+    def set_last_completed_message(
+        self, session_id: str, message_id: int | None
+    ) -> CliSession:
+        """Persist only Telegram's pointer to the last successful result."""
+        with self._lock:
+            session = self._session_from_state(session_id)
+            if not session:
+                raise SessionError(f"session not found: {session_id}")
+            session.last_completed_message_id = (
+                message_id if isinstance(message_id, int) and message_id > 0 else None
+            )
+            self._state["sessions"][session_id] = asdict(session)
+            self._save_state()
+            return session
 
     def session_for_message(self, chat_id: int, message_id: int) -> CliSession | None:
         with self._lock:
