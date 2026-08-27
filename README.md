@@ -53,6 +53,21 @@ chmod 600 .env
 ./scripts/run.sh --check
 ```
 
+需要多个 Telegram Bot 入口时，直接增加任意非空的
+`TELEGRAM_BOT_TOKEN_<名称>`，无需额外开关：
+
+```dotenv
+TELEGRAM_BOT_TOKEN=主入口_token
+TELEGRAM_BOT_TOKEN_2=第二入口_token
+TELEGRAM_BOT_TOKEN_RESEARCH=研究入口_token
+```
+
+所有 Bot 共享同一套 CLI session。每个 Bot 对话的当前 session 与返回历史独立；
+一个 Bot 切换 session 不会影响另一个。任务结果始终返回发起任务的 Bot，其他 Bot
+可用 `/use <会话ID>` 主动读取该 session 的最新运行快照或本次网关运行期间缓存的
+最近结果。运行中从另一 Bot 追加输入不会改变原任务的回复入口。`<名称>` 会作为
+持久状态键使用，配置后不要随意改名。
+
 常用配置：
 
 ```dotenv

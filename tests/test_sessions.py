@@ -48,6 +48,38 @@ class SessionStateTests(unittest.TestCase):
             self.assertEqual(reloaded.list_for_chat(1), [])
             self.assertEqual(len(reloaded.list_for_chat(1, include_archived=True)), 1)
 
+    def test_bot_entrances_share_sessions_but_isolate_navigation_and_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            first = manager.create_headless("pi", project, 1)
+            second = manager.create_headless("pi", project, 1)
+
+            manager.switch(1, first.session_id, "worker")
+            self.assertEqual(manager.current(1).session_id, second.session_id)  # type: ignore[union-attr]
+            self.assertEqual(manager.current(1, "worker").session_id, first.session_id)  # type: ignore[union-attr]
+
+            manager.bind_message(1, 99, second.session_id)
+            manager.bind_message(1, 99, first.session_id, "worker")
+            self.assertEqual(manager.session_for_message(1, 99).session_id, second.session_id)  # type: ignore[union-attr]
+            self.assertEqual(manager.session_for_message(1, 99, "worker").session_id, first.session_id)  # type: ignore[union-attr]
+
+            manager.set_telegram_offset(10)
+            manager.set_telegram_offset(20, "worker")
+            self.assertEqual(manager.get_telegram_offset(), 10)
+            self.assertEqual(manager.get_telegram_offset("worker"), 20)
+
+    def test_in_flight_turn_remembers_origin_bot_for_restart_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.set_in_flight(session.session_id, 1, "turn-1", "worker")
+            self.assertEqual(
+                manager.stale_in_flight_routes(),
+                [(session.session_id, 1, "turn-1", "worker")],
+            )
+
     def test_model_and_effort_persist_and_clear(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

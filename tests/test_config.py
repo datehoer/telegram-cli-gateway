@@ -90,6 +90,56 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     Config.load(project)
 
+    def test_numbered_or_named_bot_tokens_are_discovered_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            allowed = project / "projects"
+            allowed.mkdir()
+            (project / ".env").write_text(
+                "\n".join(
+                    [
+                        "TELEGRAM_BOT_TOKEN=primary:test",
+                        "TELEGRAM_BOT_TOKEN_2=worker:test",
+                        "TELEGRAM_BOT_TOKEN_RESEARCH=research:test",
+                        "TELEGRAM_ALLOWED_USERS=100",
+                        f"DEFAULT_WORKDIR={allowed}",
+                        f"ALLOWED_WORKDIRS={allowed}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            clean_environment = {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("TELEGRAM_BOT_TOKEN")
+            }
+            with patch.dict(os.environ, clean_environment, clear=True):
+                config = Config.load(project)
+            self.assertEqual(
+                config.telegram_bots,
+                (
+                    ("default", "primary:test"),
+                    ("2", "worker:test"),
+                    ("research", "research:test"),
+                ),
+            )
+
+    def test_duplicate_bot_token_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            allowed = project / "projects"
+            allowed.mkdir()
+            values = {
+                "TELEGRAM_BOT_TOKEN": "same:test",
+                "TELEGRAM_BOT_TOKEN_2": "same:test",
+                "TELEGRAM_ALLOWED_USERS": "100",
+                "DEFAULT_WORKDIR": str(allowed),
+                "ALLOWED_WORKDIRS": str(allowed),
+            }
+            with patch.dict(os.environ, values, clear=True):
+                with self.assertRaisesRegex(ConfigError, "more than once"):
+                    Config.load(project)
+
     def test_enabled_clis_must_be_known_and_nonempty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

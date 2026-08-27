@@ -14,7 +14,7 @@ from .config import Config, ConfigError
 def check_config(config: Config) -> int:
     problems: list[str] = []
     print(f"project: {config.project_dir}")
-    print(f"telegram token: configured ({len(config.bot_token)} characters)")
+    print(f"telegram bots: configured ({len(config.telegram_bots)})")
     print(f"allowed users: {len(config.allowed_user_ids)}")
     print(f"allowed roots: {', '.join(str(path) for path in config.allowed_roots)}")
     print(f"default workdir: {config.default_workdir}")

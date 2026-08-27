@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +91,12 @@ class Config:
     telegram_max_file_bytes: int = 20 * 1024 * 1024
     auto_send_artifacts: str = "images"
     auto_resume: bool = False
+    bot_tokens: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def telegram_bots(self) -> tuple[tuple[str, str], ...]:
+        """Configured Bot API entrances, keyed without exposing their tokens."""
+        return self.bot_tokens or (("default", self.bot_token),)
 
     @property
     def runtime_dir(self) -> Path:
@@ -111,8 +118,24 @@ class Config:
         values = {**file_values, **os.environ}
 
         token = values.get("TELEGRAM_BOT_TOKEN", "").strip()
+        extra_tokens = [
+            (match.group(1).lower(), value.strip())
+            for key, value in values.items()
+            if (match := re.fullmatch(r"TELEGRAM_BOT_TOKEN_([A-Za-z0-9_]+)", key))
+            and value.strip()
+        ]
+        extra_tokens.sort(key=lambda item: item[0])
         if not token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is missing")
+        configured_tokens = [("default", token), *extra_tokens]
+        bot_keys = [bot_key for bot_key, _configured_token in configured_tokens]
+        if len(bot_keys) != len(set(bot_keys)):
+            raise ConfigError("Telegram Bot token names must be unique")
+        raw_tokens = [configured_token for _bot_key, configured_token in configured_tokens]
+        if len(raw_tokens) != len(set(raw_tokens)):
+            raise ConfigError("the same Telegram Bot token is configured more than once")
+        # Preserve the legacy field for callers that construct Config directly.
+        token = configured_tokens[0][1]
 
         raw_users = values.get("TELEGRAM_ALLOWED_USERS", "")
         try:
@@ -190,4 +213,5 @@ class Config:
             ),
             auto_send_artifacts=_auto_send_mode(values, "AUTO_SEND_ARTIFACTS", "images"),
             auto_resume=_boolean(values, "AUTO_RESUME", False),
+            bot_tokens=tuple(configured_tokens),
         )

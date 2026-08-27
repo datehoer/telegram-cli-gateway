@@ -36,6 +36,7 @@ class GatewayEventTests(unittest.TestCase):
         project: Path,
         auto_resume: bool = False,
         enabled_clis: tuple[str, ...] = ("claude", "codex", "grok", "pi"),
+        bot_tokens: tuple[tuple[str, str], ...] = (),
     ) -> GatewayApp:
         config = Config(
             project_dir=project,
@@ -51,8 +52,65 @@ class GatewayEventTests(unittest.TestCase):
             tmux_socket_name="tcg-app-test",
             enabled_clis=enabled_clis,
             auto_resume=auto_resume,
+            bot_tokens=bot_tokens,
         )
         return GatewayApp(config)
+
+    def test_turn_output_stays_with_the_bot_that_started_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                bot_tokens=(("default", "primary:test"), ("worker", "worker:test")),
+            )
+            session = app.sessions.create_headless("pi", project, 1)
+            app.sessions.switch(1, session.session_id, "worker")
+            sent_by_primary: list[str] = []
+            sent_by_worker: list[str] = []
+            app._telegrams["default"].send_rich_markdown = (  # type: ignore[method-assign]
+                lambda _chat_id, text, reply_markup=None: sent_by_primary.append(text) or 10
+            )
+            app._telegrams["worker"].send_rich_markdown = (  # type: ignore[method-assign]
+                lambda _chat_id, text, reply_markup=None: sent_by_worker.append(text) or 20
+            )
+
+            view = app._register_turn(session, "turn-worker", "worker")
+            view.parts.append("worker result")
+            view.status = "completed"
+            rendered, _answer = app._render_turn(view, view.started_at + 1)
+            app._publish_final_turn(view, rendered, with_artifacts=False)
+
+            self.assertEqual(sent_by_primary, [])
+            self.assertEqual(len(sent_by_worker), 1)
+            self.assertEqual(view.bot_key, "worker")
+            self.assertEqual(
+                app.sessions.session_for_message(1, 20, "worker").session_id,  # type: ignore[union-attr]
+                session.session_id,
+            )
+
+    def test_other_bot_can_request_running_session_snapshot_without_taking_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                bot_tokens=(("default", "primary:test"), ("worker", "worker:test")),
+            )
+            session = app.sessions.create_headless("pi", project, 1)
+            app.sessions.switch(1, session.session_id, "worker")
+            view = app._register_turn(session, "turn-primary", "default")
+            view.parts.append("current progress")
+            sent_by_worker: list[str] = []
+            app._telegrams["worker"].send_rich_markdown = (  # type: ignore[method-assign]
+                lambda _chat_id, text, reply_markup=None: sent_by_worker.append(text) or 30
+            )
+
+            with app._bot_scope("worker"):
+                app._surface_switched_session(session)
+
+            self.assertEqual(len(sent_by_worker), 1)
+            self.assertIn("current progress", sent_by_worker[0])
+            self.assertEqual(view.bot_key, "default")
+            self.assertEqual(view.message_id, None)
 
     def test_local_file_commands_are_not_exposed_or_handled(self) -> None:
         command_names = {name for name, _description in BOT_COMMANDS}
@@ -1192,6 +1250,50 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(view.steered, 1)
             self.assertTrue(view.dirty)
             self.assertFalse(view.live)
+
+    def test_busy_codex_queues_input_from_another_bot_with_its_reply_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                bot_tokens=(("default", "primary:test"), ("worker", "worker:test")),
+            )
+            session = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-1"
+            )
+            app._codex_active_turns["thread-1"] = "turn-primary"
+            app._register_turn(session, "turn-primary", "default")
+            steered: list[str] = []
+            app.codex.steer_turn = (  # type: ignore[method-assign]
+                lambda *_args: steered.append("called") or "turn-primary"
+            )
+            sent_by_worker: list[str] = []
+            app._telegrams["worker"].send_message = (  # type: ignore[method-assign]
+                lambda _chat_id, text: sent_by_worker.append(text) or 1
+            )
+
+            with app._bot_scope("worker"):
+                app._send_to_session(1, session, "next task")
+
+            self.assertEqual(steered, [])
+            queued = app._queues[session.session_id]
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0].bot_key, "worker")
+            self.assertEqual(
+                sent_by_worker,
+                [f"{session.label} 正在运行；已加入队列（第 1 条）。"],
+            )
+
+            started_from: list[tuple[str, str]] = []
+            app._start_session_turn = (  # type: ignore[method-assign]
+                lambda _chat, _session, text, _attachments=(): started_from.append(
+                    (app._active_bot_key(), text)
+                )
+            )
+            app._start_next_queued(session)
+
+            self.assertEqual(started_from, [("worker", "next task")])
+            self.assertNotIn(session.session_id, app._queues)
 
     def test_busy_headless_input_is_queued_and_drained(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

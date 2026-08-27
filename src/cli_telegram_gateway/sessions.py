@@ -63,6 +63,7 @@ class CliSession:
     model: str | None = None
     effort: str | None = None
     last_completed_message_id: int | None = None
+    last_completed_message_ids: dict[str, int] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "CliSession":
@@ -73,6 +74,7 @@ class CliSession:
         normalized.setdefault("model", None)
         normalized.setdefault("effort", None)
         normalized.setdefault("last_completed_message_id", None)
+        normalized.setdefault("last_completed_message_ids", None)
         return cls(**normalized)
 
     @property
@@ -98,6 +100,7 @@ class SessionManager:
             "sessions": {},
             "chats": {},
             "telegram_offset": None,
+            "telegram_offsets": {},
             "message_routes": {},
             "artifacts": {},
             "in_flight": {},
@@ -115,6 +118,7 @@ class SessionManager:
         data.setdefault("sessions", {})
         data.setdefault("chats", {})
         data.setdefault("telegram_offset", None)
+        data.setdefault("telegram_offsets", {})
         data.setdefault("message_routes", {})
         data.setdefault("artifacts", {})
         data.setdefault("in_flight", {})
@@ -186,7 +190,18 @@ class SessionManager:
         result = self._tmux("has-session", "-t", session.tmux_name, check=False)
         return result.returncode == 0
 
-    def create(self, cli: str, cwd: Path, chat_id: int) -> CliSession:
+    @staticmethod
+    def _entrance_key(chat_id: int, bot_key: str) -> str:
+        return str(chat_id) if bot_key == "default" else f"{bot_key}:{chat_id}"
+
+    @classmethod
+    def _message_key(cls, chat_id: int, message_id: int, bot_key: str) -> str:
+        entrance = cls._entrance_key(chat_id, bot_key)
+        return f"{entrance}:{message_id}"
+
+    def create(
+        self, cli: str, cwd: Path, chat_id: int, bot_key: str = "default"
+    ) -> CliSession:
         if cli not in self.config.cli_commands:
             raise SessionError(f"unknown CLI: {cli}")
 
@@ -225,7 +240,7 @@ class SessionManager:
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
             self._state["sessions"][session_id] = asdict(session)
-            self.switch(chat_id, session_id)
+            self.switch(chat_id, session_id, bot_key)
             self._save_state()
             return session
 
@@ -236,6 +251,7 @@ class SessionManager:
         chat_id: int,
         backend: str,
         external_id: str,
+        bot_key: str = "default",
     ) -> CliSession:
         if cli not in self.config.cli_commands:
             raise SessionError(f"unknown CLI: {cli}")
@@ -258,17 +274,20 @@ class SessionManager:
                 external_id=external_id,
             )
             self._state["sessions"][session_id] = asdict(session)
-            self.switch(chat_id, session_id)
+            self.switch(chat_id, session_id, bot_key)
             self._save_state()
             return session
 
-    def create_headless(self, cli: str, cwd: Path, chat_id: int) -> CliSession:
+    def create_headless(
+        self, cli: str, cwd: Path, chat_id: int, bot_key: str = "default"
+    ) -> CliSession:
         return self.create_virtual(
             cli,
             cwd,
             chat_id,
             backend="headless-json",
             external_id=str(uuid.uuid4()),
+            bot_key=bot_key,
         )
 
     def increment_turn_count(self, session_id: str) -> int:
@@ -340,9 +359,9 @@ class SessionManager:
             sessions = [item for item in sessions if self.is_alive(item)]
         return sessions
 
-    def current(self, chat_id: int) -> CliSession | None:
+    def current(self, chat_id: int, bot_key: str = "default") -> CliSession | None:
         with self._lock:
-            chat = self._state["chats"].get(str(chat_id), {})
+            chat = self._state["chats"].get(self._entrance_key(chat_id, bot_key), {})
             session_id = chat.get("current")
             return self._session_from_state(session_id) if session_id else None
 
@@ -366,14 +385,17 @@ class SessionManager:
         cli_matches = [session for session in sessions if session.cli == target]
         return cli_matches[0] if cli_matches else None
 
-    def switch(self, chat_id: int, session_id: str) -> CliSession:
+    def switch(
+        self, chat_id: int, session_id: str, bot_key: str = "default"
+    ) -> CliSession:
         with self._lock:
             session = self._session_from_state(session_id)
             if not session or session.chat_id != chat_id:
                 raise SessionError(f"session not found: {session_id}")
             if session.archived:
                 raise SessionError(f"session is archived: {session_id}")
-            chat = self._state["chats"].setdefault(str(chat_id), {"current": None, "history": []})
+            entrance = self._entrance_key(chat_id, bot_key)
+            chat = self._state["chats"].setdefault(entrance, {"current": None, "history": []})
             previous = chat.get("current")
             if previous and previous != session_id:
                 history = chat.setdefault("history", [])
@@ -435,17 +457,19 @@ class SessionManager:
             self._save_state()
             return session
 
-    def bind_message(self, chat_id: int, message_id: int, session_id: str) -> None:
+    def bind_message(
+        self, chat_id: int, message_id: int, session_id: str, bot_key: str = "default"
+    ) -> None:
         with self._lock:
             routes = self._state.setdefault("message_routes", {})
-            routes[f"{chat_id}:{message_id}"] = session_id
+            routes[self._message_key(chat_id, message_id, bot_key)] = session_id
             if len(routes) > 2000:
                 for key in list(routes)[: len(routes) - 2000]:
                     routes.pop(key, None)
             self._save_state()
 
     def set_last_completed_message(
-        self, session_id: str, message_id: int | None
+        self, session_id: str, message_id: int | None, bot_key: str = "default"
     ) -> CliSession:
         """Persist only Telegram's pointer to the last successful result."""
         with self._lock:
@@ -454,20 +478,58 @@ class SessionManager:
                 raise SessionError(f"session not found: {session_id}")
             session.last_completed_message_id = (
                 message_id if isinstance(message_id, int) and message_id > 0 else None
-            )
+            ) if bot_key == "default" else session.last_completed_message_id
+            pointers = dict(session.last_completed_message_ids or {})
+            if isinstance(message_id, int) and message_id > 0:
+                pointers[bot_key] = message_id
+            else:
+                pointers.pop(bot_key, None)
+            session.last_completed_message_ids = pointers or None
             self._state["sessions"][session_id] = asdict(session)
             self._save_state()
             return session
 
-    def session_for_message(self, chat_id: int, message_id: int) -> CliSession | None:
+    def get_last_completed_message(
+        self, session_id: str, bot_key: str = "default"
+    ) -> int | None:
         with self._lock:
-            session_id = self._state.get("message_routes", {}).get(f"{chat_id}:{message_id}")
+            session = self._session_from_state(session_id)
+            if not session:
+                return None
+            pointers = session.last_completed_message_ids or {}
+            if bot_key in pointers:
+                return pointers[bot_key]
+            return session.last_completed_message_id if bot_key == "default" else None
+
+    def clear_last_completed_messages(self, session_id: str) -> CliSession:
+        with self._lock:
+            session = self._session_from_state(session_id)
+            if not session:
+                raise SessionError(f"session not found: {session_id}")
+            session.last_completed_message_id = None
+            session.last_completed_message_ids = None
+            self._state["sessions"][session_id] = asdict(session)
+            self._save_state()
+            return session
+
+    def session_for_message(
+        self, chat_id: int, message_id: int, bot_key: str = "default"
+    ) -> CliSession | None:
+        with self._lock:
+            route = self._message_key(chat_id, message_id, bot_key)
+            session_id = self._state.get("message_routes", {}).get(route)
             session = self._session_from_state(session_id) if session_id else None
             if not session or session.chat_id != chat_id or session.archived:
                 return None
             return session
 
-    def register_artifact(self, chat_id: int, session_id: str, path: Path) -> str:
+    def register_artifact(
+        self,
+        chat_id: int,
+        session_id: str,
+        path: Path,
+        bot_key: str = "default",
+    ) -> str:
         with self._lock:
             token = secrets.token_hex(6)
             artifacts = self._state.setdefault("artifacts", {})
@@ -475,6 +537,7 @@ class SessionManager:
                 "chat_id": chat_id,
                 "session_id": session_id,
                 "path": str(path),
+                "bot_key": bot_key,
             }
             if len(artifacts) > 500:
                 for key in list(artifacts)[: len(artifacts) - 500]:
@@ -482,12 +545,19 @@ class SessionManager:
             self._save_state()
             return token
 
-    def set_in_flight(self, session_id: str, chat_id: int, turn_id: str) -> None:
+    def set_in_flight(
+        self,
+        session_id: str,
+        chat_id: int,
+        turn_id: str,
+        bot_key: str = "default",
+    ) -> None:
         """记录一个正在执行的任务；网关重启后用它报告中断，而不是留下"运行中"假象。"""
         with self._lock:
             self._state["in_flight"][session_id] = {
                 "chat_id": chat_id,
                 "turn_id": turn_id,
+                "bot_key": bot_key,
             }
             self._save_state()
 
@@ -517,10 +587,27 @@ class SessionManager:
                 if isinstance(value, dict) and "turn_id" in value
             ]
 
-    def resolve_artifact(self, chat_id: int, token: str) -> tuple[CliSession, Path] | None:
+    def stale_in_flight_routes(self) -> list[tuple[str, int, str, str]]:
+        with self._lock:
+            return [
+                (
+                    session_id,
+                    int(value["chat_id"]),
+                    str(value["turn_id"]),
+                    str(value.get("bot_key", "default")),
+                )
+                for session_id, value in self._state["in_flight"].items()
+                if isinstance(value, dict) and "turn_id" in value
+            ]
+
+    def resolve_artifact(
+        self, chat_id: int, token: str, bot_key: str = "default"
+    ) -> tuple[CliSession, Path] | None:
         with self._lock:
             raw = self._state.get("artifacts", {}).get(token)
             if not isinstance(raw, dict) or int(raw.get("chat_id", -1)) != chat_id:
+                return None
+            if str(raw.get("bot_key", "default")) != bot_key:
                 return None
             session = self._session_from_state(str(raw.get("session_id", "")))
             path = raw.get("path")
@@ -528,9 +615,10 @@ class SessionManager:
                 return None
             return session, Path(path)
 
-    def back(self, chat_id: int) -> CliSession | None:
+    def back(self, chat_id: int, bot_key: str = "default") -> CliSession | None:
         with self._lock:
-            chat = self._state["chats"].setdefault(str(chat_id), {"current": None, "history": []})
+            entrance = self._entrance_key(chat_id, bot_key)
+            chat = self._state["chats"].setdefault(entrance, {"current": None, "history": []})
             history = chat.setdefault("history", [])
             while history:
                 candidate = history.pop()
@@ -616,12 +704,17 @@ class SessionManager:
             self._save_state()
         return clean_terminal_output(raw)
 
-    def get_telegram_offset(self) -> int | None:
+    def get_telegram_offset(self, bot_key: str = "default") -> int | None:
         with self._lock:
-            value = self._state.get("telegram_offset")
+            offsets = self._state.setdefault("telegram_offsets", {})
+            value = offsets.get(bot_key)
+            if value is None and bot_key == "default":
+                value = self._state.get("telegram_offset")
             return int(value) if value is not None else None
 
-    def set_telegram_offset(self, offset: int) -> None:
+    def set_telegram_offset(self, offset: int, bot_key: str = "default") -> None:
         with self._lock:
-            self._state["telegram_offset"] = offset
+            self._state.setdefault("telegram_offsets", {})[bot_key] = offset
+            if bot_key == "default":
+                self._state["telegram_offset"] = offset
             self._save_state()

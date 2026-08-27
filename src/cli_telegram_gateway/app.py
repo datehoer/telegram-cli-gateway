@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,7 @@ BOT_COMMANDS = (
 class TurnView:
     session: CliSession
     turn_id: str
+    bot_key: str = "default"
     started_at: float = field(default_factory=time.monotonic)
     parts: list[str] = field(default_factory=list)
     command: str = ""
@@ -131,14 +133,23 @@ class PendingInput:
     chat_id: int
     text: str
     attachments: tuple[Attachment, ...] = ()
+    bot_key: str = "default"
 
 
 class GatewayApp:
     def __init__(self, config: Config):
         self.config = config
-        self.telegram = TelegramClient(
-            config.bot_token, config.runtime_dir / "telegram-metrics.json"
-        )
+        self._telegrams: dict[str, TelegramClient] = {}
+        for bot_key, token in config.telegram_bots:
+            metrics_name = (
+                "telegram-metrics.json"
+                if bot_key == "default"
+                else f"telegram-metrics-{bot_key}.json"
+            )
+            self._telegrams[bot_key] = TelegramClient(
+                token, config.runtime_dir / metrics_name
+            )
+        self._default_telegram = next(iter(self._telegrams.values()))
         self.sessions = SessionManager(config)
         self.codex = CodexAppServer(
             config.cli_commands["codex"],
@@ -149,11 +160,49 @@ class GatewayApp:
         self.stop_event = threading.Event()
         self._lock_handle = None
         self._state_lock = threading.RLock()
+        self._dispatch_lock = threading.Lock()
+        self._bot_local = threading.local()
         self._codex_active_turns: dict[str, str] = {}
         self._turns: dict[tuple[str, str], TurnView] = {}
         self._queues: dict[str, deque[PendingInput]] = {}
         self._session_states: dict[str, str] = {}
         self._interrupted_sessions: set[str] = set()
+        self._last_completed_results: dict[str, str] = {}
+
+    def _active_bot_key(self) -> str:
+        bot_key = getattr(self._bot_local, "bot_key", "default")
+        return bot_key if bot_key in self._telegrams else "default"
+
+    @contextmanager
+    def _bot_scope(self, bot_key: str):
+        previous = getattr(self._bot_local, "bot_key", None)
+        self._bot_local.bot_key = bot_key
+        try:
+            yield
+        finally:
+            if previous is None:
+                self._bot_local.__dict__.pop("bot_key", None)
+            else:
+                self._bot_local.bot_key = previous
+
+    def _telegram(self, bot_key: str | None = None) -> TelegramClient:
+        return self._telegrams[bot_key or self._active_bot_key()]
+
+    @property
+    def telegram(self) -> TelegramClient:
+        """Current entrance client; retained for focused tests and helpers."""
+        return self._telegram()
+
+    def _current_session(self, chat_id: int, bot_key: str | None = None) -> CliSession | None:
+        return self.sessions.current(chat_id, bot_key or self._active_bot_key())
+
+    def _switch_session(
+        self, chat_id: int, session_id: str, bot_key: str | None = None
+    ) -> CliSession:
+        return self.sessions.switch(chat_id, session_id, bot_key or self._active_bot_key())
+
+    def _back_session(self, chat_id: int) -> CliSession | None:
+        return self.sessions.back(chat_id, self._active_bot_key())
 
     def _acquire_singleton_lock(self) -> None:
         lock_path = self.config.runtime_dir / "gateway.lock"
@@ -164,14 +213,14 @@ class GatewayApp:
         except BlockingIOError as exc:
             raise RuntimeError("another telegram-cli-gateway process is already running") from exc
 
-    def _send(self, chat_id: int, text: str) -> None:
+    def _send(self, chat_id: int, text: str, bot_key: str | None = None) -> None:
         try:
-            self.telegram.send_message(chat_id, text)
+            self._telegram(bot_key).send_message(chat_id, text)
         except TelegramError:
             LOGGER.exception("could not send Telegram message to chat %s", chat_id)
 
     def _telegram_stats_text(self) -> str:
-        snapshot = self.telegram.metrics_snapshot()
+        snapshot = self._telegram().metrics_snapshot()
         today = snapshot["today"]
         recent = snapshot["last_7_days"]
         methods = today.get("methods", {})
@@ -218,7 +267,7 @@ class GatewayApp:
         return "\n".join(lines)
 
     def _current_or_reply(self, chat_id: int) -> CliSession | None:
-        session = self.sessions.current(chat_id)
+        session = self._current_session(chat_id)
         if not session:
             self._send(chat_id, "当前没有活动会话。使用 /new 选择并创建一个。")
             return None
@@ -240,10 +289,17 @@ class GatewayApp:
             if cli == "codex":
                 thread_id = self.codex.start_thread(str(cwd))
                 session = self.sessions.create_virtual(
-                    cli, cwd, chat_id, backend="codex-app-server", external_id=thread_id
+                    cli,
+                    cwd,
+                    chat_id,
+                    backend="codex-app-server",
+                    external_id=thread_id,
+                    bot_key=self._active_bot_key(),
                 )
             else:
-                session = self.sessions.create_headless(cli, cwd, chat_id)
+                session = self.sessions.create_headless(
+                    cli, cwd, chat_id, self._active_bot_key()
+                )
         except (CodexBackendError, ConfigError, SessionError) as exc:
             self._send(chat_id, f"创建失败：{exc}")
             return
@@ -306,19 +362,17 @@ class GatewayApp:
                 return
             session = self.sessions.resolve(chat_id, target)
             if session and session.cli in self.config.enabled_clis:
-                previous = self.sessions.current(chat_id)
-                self.sessions.switch(chat_id, session.session_id)
+                self._switch_session(chat_id, session.session_id)
                 self._send(chat_id, f"已切换到 {session.session_id}\n目录：{session.cwd}")
-                if not previous or previous.session_id != session.session_id:
-                    self._surface_switched_session(session)
+                self._surface_switched_session(session)
             elif target in self.config.enabled_clis:
-                current = self.sessions.current(chat_id)
+                current = self._current_session(chat_id)
                 self._new_session(chat_id, target, current.cwd if current else None)
             else:
                 self._send(chat_id, f"找不到会话：{target}")
             return
         if command == "back":
-            session = self.sessions.back(chat_id)
+            session = self._back_session(chat_id)
             self._send(
                 chat_id,
                 f"已返回 {session.session_id}\n目录：{session.cwd}"
@@ -358,7 +412,7 @@ class GatewayApp:
             return
         if command == "resume":
             target = raw_args.strip()
-            session = self.sessions.resolve(chat_id, target) if target else self.sessions.current(chat_id)
+            session = self.sessions.resolve(chat_id, target) if target else self._current_session(chat_id)
             if not session:
                 self._send(chat_id, "找不到要恢复的会话。")
                 return
@@ -370,7 +424,7 @@ class GatewayApp:
             return
         if command == "cancel":
             target = raw_args.strip()
-            session = self.sessions.resolve(chat_id, target) if target else self.sessions.current(chat_id)
+            session = self.sessions.resolve(chat_id, target) if target else self._current_session(chat_id)
             if not session:
                 self._send(chat_id, "找不到会话。")
                 return
@@ -437,7 +491,7 @@ class GatewayApp:
             return
         if command == "stop":
             target = raw_args.strip()
-            session = self.sessions.resolve(chat_id, target) if target else self.sessions.current(chat_id)
+            session = self.sessions.resolve(chat_id, target) if target else self._current_session(chat_id)
             if not session:
                 self._send(chat_id, "找不到要停止的会话。")
                 return
@@ -454,7 +508,7 @@ class GatewayApp:
             args = self._parse_args(chat_id, raw_args)
             if args is None:
                 return
-            current = self.sessions.current(chat_id)
+            current = self._current_session(chat_id)
             if not args or not current:
                 self._send(chat_id, "用法：/rename [会话ID] <新名称>")
                 return
@@ -470,7 +524,7 @@ class GatewayApp:
             return
         if command == "archive":
             target = raw_args.strip()
-            session = self.sessions.resolve(chat_id, target) if target else self.sessions.current(chat_id)
+            session = self.sessions.resolve(chat_id, target) if target else self._current_session(chat_id)
             if not session:
                 self._send(chat_id, "找不到要归档的会话。")
                 return
@@ -494,7 +548,7 @@ class GatewayApp:
 
     def _session_for_management(self, chat_id: int, target: str) -> CliSession | None:
         if not target:
-            return self.sessions.current(chat_id)
+            return self._current_session(chat_id)
         session = self.sessions.get(target)
         if session and session.chat_id == chat_id:
             return session
@@ -601,28 +655,67 @@ class GatewayApp:
 
     def _surface_switched_session(self, session: CliSession) -> None:
         """切回 session 时把它当前最有用的状态放到聊天底部。"""
+        bot_key = self._active_bot_key()
         with self._state_lock:
             pending_views = [
                 view
                 for (session_id, _turn_id), view in self._turns.items()
                 if session_id == session.session_id
             ]
-            if any(view.status == "running" for view in pending_views):
-                # 运行态由 status pump 重新钉住，避免先复制上一轮结果。
+            source_view = next(
+                (
+                    view
+                    for view in pending_views
+                    if view.status == "running" or view.bot_key != bot_key
+                ),
+                None,
+            )
+            if source_view and source_view.status == "running" and source_view.bot_key == bot_key:
+                # 发起入口的运行态由 status pump 重新钉住。
                 return
+            if source_view and source_view.bot_key != bot_key:
+                rendered, _answer = self._render_turn(source_view, time.monotonic())
+            else:
+                rendered = None
             for view in pending_views:
+                if view.bot_key != bot_key:
+                    continue
                 # CLI 已结束但终态尚未发布：强制下一轮在底部发新卡片。
                 if view.message_id is not None and view.message_id > 0:
                     view.stale_message_ids.append(view.message_id)
                 view.message_id = None
                 view.dirty = True
+        if rendered is not None:
+            try:
+                message_id = self._telegram(bot_key).send_rich_markdown(
+                    session.chat_id, rendered
+                )
+                if message_id is not None:
+                    self.sessions.bind_message(
+                        session.chat_id, message_id, session.session_id, bot_key
+                    )
+                    if source_view and source_view.status == "completed":
+                        self.sessions.set_last_completed_message(
+                            session.session_id, message_id, bot_key
+                        )
+                        self._last_completed_results[session.session_id] = rendered
+            except TelegramError as exc:
+                LOGGER.warning(
+                    "could not surface running state for %s on bot %s: %s",
+                    session.session_id,
+                    bot_key,
+                    exc,
+                )
+            return
         if pending_views or self._session_is_busy(session):
             return
 
-        source_message_id = session.last_completed_message_id
+        source_message_id = self.sessions.get_last_completed_message(
+            session.session_id, bot_key
+        )
         if source_message_id is not None:
             try:
-                copied_id = self.telegram.copy_message(
+                copied_id = self._telegram(bot_key).copy_message(
                     session.chat_id, session.chat_id, source_message_id
                 )
             except TelegramError as exc:
@@ -634,10 +727,33 @@ class GatewayApp:
             else:
                 if copied_id is not None:
                     self.sessions.bind_message(
-                        session.chat_id, copied_id, session.session_id
+                        session.chat_id, copied_id, session.session_id, bot_key
                     )
                     self.sessions.set_last_completed_message(
-                        session.session_id, copied_id
+                        session.session_id, copied_id, bot_key
+                    )
+                    return
+
+        cached_result = self._last_completed_results.get(session.session_id)
+        if cached_result:
+            try:
+                copied_id = self._telegram(bot_key).send_rich_markdown(
+                    session.chat_id, cached_result
+                )
+            except TelegramError as exc:
+                LOGGER.warning(
+                    "could not surface cached result for %s on bot %s: %s",
+                    session.session_id,
+                    bot_key,
+                    exc,
+                )
+            else:
+                if copied_id is not None:
+                    self.sessions.bind_message(
+                        session.chat_id, copied_id, session.session_id, bot_key
+                    )
+                    self.sessions.set_last_completed_message(
+                        session.session_id, copied_id, bot_key
                     )
                     return
 
@@ -646,7 +762,7 @@ class GatewayApp:
     def _sessions_view(
         self, chat_id: int, include_archived: bool = False
     ) -> tuple[str, dict[str, Any]]:
-        current = self.sessions.current(chat_id)
+        current = self._current_session(chat_id)
         sessions = self.sessions.list_for_chat(chat_id, include_archived=include_archived)
         lines = ["会话列表（点击按钮切换）："]
         buttons: list[list[dict[str, str]]] = []
@@ -793,7 +909,9 @@ class GatewayApp:
             return
 
         if action in {"file", "photo"}:
-            resolved = self.sessions.resolve_artifact(chat_id, target)
+            resolved = self.sessions.resolve_artifact(
+                chat_id, target, self._active_bot_key()
+            )
             if not resolved:
                 self.telegram.answer_callback_query(query_id, "文件已失效")
                 return
@@ -889,9 +1007,8 @@ class GatewayApp:
             include_archived = False
             switched = False
             if action == "use":
-                previous = self.sessions.current(chat_id)
-                self.sessions.switch(chat_id, session.session_id)
-                switched = not previous or previous.session_id != session.session_id
+                self._switch_session(chat_id, session.session_id)
+                switched = True
                 notice = f"已切换到 {session.label}"
             elif action == "interrupt":
                 interrupted = self._interrupt_session(session)
@@ -922,6 +1039,7 @@ class GatewayApp:
                     self._queues.pop(session.session_id, None)
                 self._session_states.pop(session.session_id, None)
                 self._interrupted_sessions.discard(session.session_id)
+                self._last_completed_results.pop(session.session_id, None)
                 self.sessions.stop(session)
                 notice = "已删除"
                 refresh = False
@@ -1026,12 +1144,14 @@ class GatewayApp:
             except CodexBackendError:
                 LOGGER.warning("could not archive old Codex thread %s", old_thread)
             self.sessions.update_backend(session.session_id, "codex-app-server", thread_id)
-            self.sessions.set_last_completed_message(session.session_id, None)
+            self.sessions.clear_last_completed_messages(session.session_id)
+            self._last_completed_results.pop(session.session_id, None)
             self._send(chat_id, f"{session.label} 已开新对话（旧线程已归档）。")
             return
         if session.backend == "headless-json":
             self.sessions.rotate_external_id(session.session_id)
-            self.sessions.set_last_completed_message(session.session_id, None)
+            self.sessions.clear_last_completed_messages(session.session_id)
+            self._last_completed_results.pop(session.session_id, None)
             self._send(chat_id, f"{session.label} 已开新对话，上下文已清空。")
             return
         self._send(chat_id, f"{session.label} 不支持 /clear。")
@@ -1051,6 +1171,7 @@ class GatewayApp:
         text: str,
         attachments: tuple[Attachment, ...] = (),
     ) -> None:
+        bot_key = self._active_bot_key()
         if session.cli not in self.config.enabled_clis:
             self._send(chat_id, f"此 Bot 未启用 {session.cli}，不能继续该会话。")
             return
@@ -1058,7 +1179,15 @@ class GatewayApp:
             if session.backend == "codex-app-server" and session.external_id:
                 with self._state_lock:
                     active_turn = self._codex_active_turns.get(session.external_id)
-                if active_turn and active_turn != "starting":
+                    active_view = (
+                        self._turns.get((session.session_id, active_turn))
+                        if active_turn and active_turn != "starting"
+                        else None
+                    )
+                # Steering keeps the active turn's immutable reply route. A message
+                # from another Bot must therefore become its own queued turn, or its
+                # answer would appear only in the Bot that started the active turn.
+                if active_view and active_view.bot_key == bot_key:
                     try:
                         returned = self.codex.steer_turn(
                             session.external_id, active_turn, text, attachments
@@ -1080,7 +1209,12 @@ class GatewayApp:
                         return
                     except CodexBackendError as exc:
                         LOGGER.warning("Codex steer failed; queued instead: %s", exc)
-            position = self._enqueue(session, PendingInput(chat_id, text, attachments))
+            position = self._enqueue(
+                session,
+                PendingInput(
+                    chat_id, text, attachments, bot_key=bot_key
+                ),
+            )
             if position is None:
                 self._send(
                     chat_id,
@@ -1106,9 +1240,10 @@ class GatewayApp:
             if queue_for_session is not None and not queue_for_session:
                 self._queues.pop(session.session_id, None)
         if pending:
-            self._start_session_turn(
-                pending.chat_id, session, pending.text, pending.attachments
-            )
+            with self._bot_scope(pending.bot_key):
+                self._start_session_turn(
+                    pending.chat_id, session, pending.text, pending.attachments
+                )
 
     def _start_session_turn(
         self,
@@ -1116,12 +1251,18 @@ class GatewayApp:
         session: CliSession,
         text: str,
         attachments: tuple[Attachment, ...] = (),
+        bot_key: str | None = None,
     ) -> None:
+        bot_key = bot_key or self._active_bot_key()
         if session.cli not in self.config.enabled_clis:
-            self._send(chat_id, f"此 Bot 未启用 {session.cli}，不能启动任务。")
+            self._send(
+                chat_id,
+                f"此 Bot 未启用 {session.cli}，不能启动任务。",
+                bot_key,
+            )
             return
         try:
-            self.telegram.send_action(chat_id)
+            self._telegram(bot_key).send_action(chat_id)
         except TelegramError:
             pass
         try:
@@ -1142,23 +1283,37 @@ class GatewayApp:
                     raise
                 with self._state_lock:
                     self._codex_active_turns[session.external_id] = turn_id
-                self._register_turn(session, turn_id)
+                self._register_turn(session, turn_id, bot_key)
             elif session.backend == "headless-json":
                 turn_id = self.headless.start_turn(session, text, attachments)
                 self.sessions.increment_turn_count(session.session_id)
-                self._register_turn(session, turn_id)
+                self._register_turn(session, turn_id, bot_key)
             else:
                 raise SessionError("旧 TUI 会话尚未迁移，请重启网关后重试")
-            self.sessions.set_in_flight(session.session_id, session.chat_id, turn_id)
+            self.sessions.set_in_flight(
+                session.session_id, session.chat_id, turn_id, bot_key
+            )
             self._interrupted_sessions.discard(session.session_id)
             self._set_session_state(session.session_id, STATE_WORKING)
         except (CodexBackendError, HeadlessBackendError, SessionError) as exc:
-            self._send(chat_id, f"发送失败：{exc}")
+            self._send(chat_id, f"发送失败：{exc}", bot_key)
 
-    def _register_turn(self, session: CliSession, turn_id: str) -> TurnView:
+    def _register_turn(
+        self, session: CliSession, turn_id: str, bot_key: str | None = None
+    ) -> TurnView:
         key = (session.session_id, turn_id)
         with self._state_lock:
-            return self._turns.setdefault(key, TurnView(session=session, turn_id=turn_id))
+            view = self._turns.setdefault(
+                key,
+                TurnView(
+                    session=session,
+                    turn_id=turn_id,
+                    bot_key=bot_key or self._active_bot_key(),
+                ),
+            )
+            if bot_key is not None:
+                view.bot_key = bot_key
+            return view
 
     def _update_turn(self, session: CliSession, turn_id: str, kind: str, data: Any = None) -> None:
         view = self._register_turn(session, turn_id)
@@ -1218,22 +1373,24 @@ class GatewayApp:
         默认只发提示，由用户用 /resume 或 /cancel 决定；AUTO_RESUME=true
         时直接自动恢复（复用 headless 的 resume 模式续跑同一会话）。
         """
-        for session_id, chat_id, turn_id in self.sessions.stale_in_flight():
+        for session_id, chat_id, turn_id, bot_key in self.sessions.stale_in_flight_routes():
             session = self.sessions.get(session_id)
             label = session.label if session else session_id
             if self.config.auto_resume and session:
-                self._send(
-                    chat_id,
-                    f"任务中断（网关重启）：{label} 已自动恢复，正在继续上次未完成的工作。"
-                    "如已产生副作用，请 /interrupt 停止。",
-                )
-                self._start_session_turn(chat_id, session, RESUME_PROMPT)
+                with self._bot_scope(bot_key):
+                    self._send(
+                        chat_id,
+                        f"任务中断（网关重启）：{label} 已自动恢复，正在继续上次未完成的工作。"
+                        "如已产生副作用，请 /interrupt 停止。",
+                    )
+                    self._start_session_turn(chat_id, session, RESUME_PROMPT)
             else:
-                self._send(
-                    chat_id,
-                    f"⚠️ 上次任务被中断：{label}（{session_id}）。"
-                    "回复 /resume 继续，或 /cancel 放弃。",
-                )
+                with self._bot_scope(bot_key):
+                    self._send(
+                        chat_id,
+                        f"⚠️ 上次任务被中断：{label}（{session_id}）。"
+                        "回复 /resume 继续，或 /cancel 放弃。",
+                    )
 
     def _on_headless_event(self, session_id: str, turn_id: str, kind: str, data: Any) -> None:
         session = self.sessions.get(session_id)
@@ -1388,9 +1545,13 @@ class GatewayApp:
             stamp, _ = self._render_turn(view, now, background=True)
             try:
                 if view.rich_mode:
-                    self.telegram.edit_rich_markdown(view.session.chat_id, old_id, stamp)
+                    self._telegram(view.bot_key).edit_rich_markdown(
+                        view.session.chat_id, old_id, stamp
+                    )
                 else:
-                    self.telegram.edit_markdown(view.session.chat_id, old_id, stamp)
+                    self._telegram(view.bot_key).edit_markdown(
+                        view.session.chat_id, old_id, stamp
+                    )
             except TelegramError as exc:
                 if exc.retry_after is not None:
                     raise
@@ -1407,18 +1568,20 @@ class GatewayApp:
         if view.message_id is not None and view.message_id > 0:
             try:
                 if view.rich_mode:
-                    self.telegram.edit_rich_markdown(
+                    self._telegram(view.bot_key).edit_rich_markdown(
                         view.session.chat_id, view.message_id, rendered
                     )
                 else:
-                    self.telegram.edit_markdown(
+                    self._telegram(view.bot_key).edit_markdown(
                         view.session.chat_id, view.message_id, rendered
                     )
             except TelegramError as exc:
                 if exc.retry_after is not None:
                     raise
                 view.rich_mode = False
-                self.telegram.edit_markdown(view.session.chat_id, view.message_id, rendered)
+                self._telegram(view.bot_key).edit_markdown(
+                    view.session.chat_id, view.message_id, rendered
+                )
         with self._state_lock:
             view.live = False
 
@@ -1437,7 +1600,9 @@ class GatewayApp:
             stamp = "⏹ 此任务已中断。"
         for message_id in stale_ids:
             try:
-                self.telegram.edit_message(view.session.chat_id, message_id, stamp)
+                self._telegram(view.bot_key).edit_message(
+                    view.session.chat_id, message_id, stamp
+                )
             except TelegramError:
                 LOGGER.warning("could not resolve stale progress card %s", message_id)
 
@@ -1448,16 +1613,19 @@ class GatewayApp:
         if view.rich_mode:
             try:
                 if view.message_id is None:
-                    message_id = self.telegram.send_rich_markdown(
+                    message_id = self._telegram(view.bot_key).send_rich_markdown(
                         view.session.chat_id, rendered
                     )
                     view.message_id = message_id if message_id is not None else 0
                     if message_id is not None:
                         self.sessions.bind_message(
-                            view.session.chat_id, message_id, view.session.session_id
+                            view.session.chat_id,
+                            message_id,
+                            view.session.session_id,
+                            view.bot_key,
                         )
                 elif view.message_id > 0:
-                    self.telegram.edit_rich_markdown(
+                    self._telegram(view.bot_key).edit_rich_markdown(
                         view.session.chat_id, view.message_id, rendered
                     )
                 view.published = True
@@ -1472,14 +1640,21 @@ class GatewayApp:
                     exc,
                 )
         if view.message_id is None:
-            message_id = self.telegram.send_markdown(view.session.chat_id, rendered)
+            message_id = self._telegram(view.bot_key).send_markdown(
+                view.session.chat_id, rendered
+            )
             view.message_id = message_id if message_id is not None else 0
             if message_id is not None:
                 self.sessions.bind_message(
-                    view.session.chat_id, message_id, view.session.session_id
+                    view.session.chat_id,
+                    message_id,
+                    view.session.session_id,
+                    view.bot_key,
                 )
         elif view.message_id > 0:
-            self.telegram.edit_markdown(view.session.chat_id, view.message_id, rendered)
+            self._telegram(view.bot_key).edit_markdown(
+                view.session.chat_id, view.message_id, rendered
+            )
         view.published = True
 
     def _publish_final_turn(
@@ -1493,20 +1668,23 @@ class GatewayApp:
             markup = None
         try:
             if view.message_id is not None and view.message_id > 0:
-                self.telegram.edit_rich_markdown(
+                self._telegram(view.bot_key).edit_rich_markdown(
                     view.session.chat_id,
                     view.message_id,
                     rendered,
                     reply_markup=markup,
                 )
             else:
-                message_id = self.telegram.send_rich_markdown(
+                message_id = self._telegram(view.bot_key).send_rich_markdown(
                     view.session.chat_id, rendered, reply_markup=markup
                 )
                 view.message_id = message_id if message_id is not None else 0
             if view.message_id and view.message_id > 0:
                 self.sessions.bind_message(
-                    view.session.chat_id, view.message_id, view.session.session_id
+                    view.session.chat_id,
+                    view.message_id,
+                    view.session.session_id,
+                    view.bot_key,
                 )
             view.published = True
             if with_artifacts:
@@ -1521,17 +1699,20 @@ class GatewayApp:
                 exc,
             )
         if view.message_id is not None and view.message_id > 0:
-            self.telegram.edit_markdown(
+            self._telegram(view.bot_key).edit_markdown(
                 view.session.chat_id, view.message_id, rendered, reply_markup=markup
             )
         else:
-            message_id = self.telegram.send_markdown(
+            message_id = self._telegram(view.bot_key).send_markdown(
                 view.session.chat_id, rendered, reply_markup=markup
             )
             view.message_id = message_id if message_id is not None else 0
         if view.message_id and view.message_id > 0:
             self.sessions.bind_message(
-                view.session.chat_id, view.message_id, view.session.session_id
+                view.session.chat_id,
+                view.message_id,
+                view.session.session_id,
+                view.bot_key,
             )
         view.published = True
         if with_artifacts:
@@ -1568,7 +1749,9 @@ class GatewayApp:
             else:
                 continue  # 图片超 sendPhoto 上限且未开启 all：保留按钮
             try:
-                self.telegram.send_local_file(view.session.chat_id, path, as_photo=as_photo)
+                self._telegram(view.bot_key).send_local_file(
+                    view.session.chat_id, path, as_photo=as_photo
+                )
             except (TelegramError, OSError) as exc:
                 LOGGER.warning("自动发送%s失败 %s: %s", label, path, exc)
                 continue
@@ -1615,7 +1798,10 @@ class GatewayApp:
         rows: list[list[dict[str, str]]] = []
         for path in view.artifacts:
             token = self.sessions.register_artifact(
-                view.session.chat_id, view.session.session_id, path
+                view.session.chat_id,
+                view.session.session_id,
+                path,
+                view.bot_key,
             )
             mime_type = mimetypes.guess_type(path.name)[0] or ""
             action = "photo" if mime_type.startswith("image/") else "file"
@@ -1639,7 +1825,9 @@ class GatewayApp:
                     if now < view.next_publish_at:
                         continue
                     if view.status == "running":
-                        current = self.sessions.current(view.session.chat_id)
+                        current = self.sessions.current(
+                            view.session.chat_id, view.bot_key
+                        )
                         is_current = bool(
                             current and current.session_id == view.session.session_id
                         )
@@ -1704,8 +1892,10 @@ class GatewayApp:
                         # Save the pointer before removing the view so a concurrent
                         # session switch cannot briefly copy the previous result.
                         self.sessions.set_last_completed_message(
-                            view.session.session_id, view.message_id
+                            view.session.session_id, view.message_id, view.bot_key
                         )
+                        if rendered is not None:
+                            self._last_completed_results[view.session.session_id] = rendered
                     view.dirty = False
                     if action is None and published_status != "running":
                         self._turns.pop((view.session.session_id, view.turn_id), None)
@@ -1889,10 +2079,12 @@ class GatewayApp:
         replied = message.get("reply_to_message")
         replied_id = replied.get("message_id") if isinstance(replied, dict) else None
         if isinstance(replied_id, int):
-            routed_session = self.sessions.session_for_message(chat_id, replied_id)
+            routed_session = self.sessions.session_for_message(
+                chat_id, replied_id, self._active_bot_key()
+            )
             if routed_session and self.sessions.is_alive(routed_session):
                 try:
-                    self.sessions.switch(chat_id, routed_session.session_id)
+                    self._switch_session(chat_id, routed_session.session_id)
                 except SessionError:
                     routed_session = None
             else:
@@ -1955,6 +2147,33 @@ class GatewayApp:
         self.codex.begin_shutdown()
         self.stop_event.set()
 
+    def _dispatch_update(self, bot_key: str, update: dict[str, Any]) -> None:
+        # Keep the pre-multi-bot single-dispatch ordering while each Bot long-polls
+        # independently. Backend streams still run on their existing worker threads.
+        with self._dispatch_lock:
+            with self._bot_scope(bot_key):
+                self.handle_update(update)
+
+    def _poll_bot(self, bot_key: str) -> None:
+        telegram = self._telegram(bot_key)
+        offset = self.sessions.get_telegram_offset(bot_key)
+        while not self.stop_event.is_set():
+            try:
+                updates = telegram.get_updates(offset, self.config.poll_timeout)
+                for update in self._coalesce_updates(updates):
+                    update_id = update.get("update_id")
+                    if isinstance(update_id, int):
+                        offset = update_id + 1
+                        self.sessions.set_telegram_offset(offset, bot_key)
+                    self._dispatch_update(bot_key, update)
+            except TelegramError as exc:
+                LOGGER.error("Telegram bot %s: %s", bot_key, exc)
+                delay = max(1.0, exc.retry_after or 3.0)
+                self.stop_event.wait(delay)
+            except Exception:
+                LOGGER.exception("unexpected error in Telegram bot %s update loop", bot_key)
+                self.stop_event.wait(3)
+
     def run(self) -> None:
         self._acquire_singleton_lock()
         signal.signal(signal.SIGTERM, self.stop)
@@ -1964,32 +2183,38 @@ class GatewayApp:
         self._prepare_sessions()
         self._recover_interrupted_turns()
         try:
-            try:
-                self.telegram.set_commands(BOT_COMMANDS)
-            except TelegramError as exc:
-                # Command metadata is optional; Telegram flood control must not
-                # prevent the gateway from starting and receiving updates.
-                LOGGER.warning("could not refresh Telegram commands: %s", exc)
+            for bot_key, telegram in self._telegrams.items():
+                try:
+                    telegram.set_commands(BOT_COMMANDS)
+                except TelegramError as exc:
+                    # Command metadata is optional; Telegram flood control must not
+                    # prevent the gateway from starting and receiving updates.
+                    LOGGER.warning(
+                        "could not refresh Telegram commands for bot %s: %s",
+                        bot_key,
+                        exc,
+                    )
             status_thread = threading.Thread(target=self._status_loop, name="status-pump", daemon=True)
             status_thread.start()
-            LOGGER.info("gateway started; allowed users=%d", len(self.config.allowed_user_ids))
-            offset = self.sessions.get_telegram_offset()
-            while not self.stop_event.is_set():
-                try:
-                    updates = self.telegram.get_updates(offset, self.config.poll_timeout)
-                    for update in self._coalesce_updates(updates):
-                        update_id = update.get("update_id")
-                        if isinstance(update_id, int):
-                            offset = update_id + 1
-                            self.sessions.set_telegram_offset(offset)
-                        self.handle_update(update)
-                except TelegramError as exc:
-                    LOGGER.error("%s", exc)
-                    delay = max(1.0, exc.retry_after or 3.0)
-                    self.stop_event.wait(delay)
-                except Exception:
-                    LOGGER.exception("unexpected error in update loop")
-                    self.stop_event.wait(3)
+            poll_threads = [
+                threading.Thread(
+                    target=self._poll_bot,
+                    args=(bot_key,),
+                    name=f"telegram-poll-{bot_key}",
+                    daemon=True,
+                )
+                for bot_key in self._telegrams
+            ]
+            for thread in poll_threads:
+                thread.start()
+            LOGGER.info(
+                "gateway started; bots=%d allowed users=%d",
+                len(self._telegrams),
+                len(self.config.allowed_user_ids),
+            )
+            self.stop_event.wait()
+            for thread in poll_threads:
+                thread.join(timeout=3)
             status_thread.join(timeout=3)
         finally:
             self.headless.close()
