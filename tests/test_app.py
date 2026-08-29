@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ from cli_telegram_gateway.app import (
     PendingInput,
 )
 from cli_telegram_gateway.config import Config
+from cli_telegram_gateway.codex_backend import CodexBackendError
 from cli_telegram_gateway.telegram import TelegramError
 
 
@@ -1029,6 +1031,101 @@ class GatewayEventTests(unittest.TestCase):
             }})
             self.assertEqual(compacted, ["thread-1"])
             self.assertIn("已触发", sent[0])
+
+    def test_compact_codex_background_turn_is_not_published_by_default_bot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                bot_tokens=(("default", "primary:test"), ("3", "third:test")),
+            )
+            session = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-30", "3"
+            )
+            sent_by: list[tuple[str, str]] = []
+            for bot_key in ("default", "3"):
+                app._telegrams[bot_key].send_message = (  # type: ignore[method-assign]
+                    lambda _chat_id, text, bot_key=bot_key: sent_by.append(
+                        (bot_key, text)
+                    ) or 1
+                )
+
+            def compact_thread(thread_id: str) -> None:
+                def notify_from_reader_thread() -> None:
+                    app._on_codex_notification(
+                        "turn/started",
+                        {"threadId": thread_id, "turn": {"id": "compact-turn"}},
+                    )
+                    app._on_codex_notification(
+                        "item/started",
+                        {
+                            "threadId": thread_id,
+                            "turnId": "compact-turn",
+                            "item": {"type": "contextCompaction"},
+                        },
+                    )
+                    app._on_codex_notification(
+                        "turn/completed",
+                        {
+                            "threadId": thread_id,
+                            "turn": {"id": "compact-turn", "status": "completed"},
+                        },
+                    )
+
+                reader = threading.Thread(target=notify_from_reader_thread)
+                reader.start()
+                reader.join()
+
+            app.codex.compact_thread = compact_thread  # type: ignore[method-assign]
+
+            with app._bot_scope("3"):
+                app.handle_update({"message": {
+                    "from": {"id": 1},
+                    "chat": {"id": 1, "type": "private"},
+                    "text": "/compact",
+                }})
+
+            self.assertEqual(
+                sent_by,
+                [("3", f"已触发 {session.label} 的上下文压缩。")],
+            )
+            self.assertNotIn((session.session_id, "compact-turn"), app._turns)
+            self.assertNotIn("thread-30", app._codex_active_turns)
+            self.assertEqual(app._pending_codex_compactions, {})
+            self.assertEqual(app._codex_compaction_turns, {})
+
+    def test_compact_codex_failure_clears_pending_internal_turn_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                bot_tokens=(("default", "primary:test"), ("3", "third:test")),
+            )
+            app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-30", "3"
+            )
+            app.codex.compact_thread = (  # type: ignore[method-assign]
+                lambda _thread_id: (_ for _ in ()).throw(
+                    CodexBackendError("compact failed")
+                )
+            )
+            sent_by: list[tuple[str, str]] = []
+            for bot_key in ("default", "3"):
+                app._telegrams[bot_key].send_message = (  # type: ignore[method-assign]
+                    lambda _chat_id, text, bot_key=bot_key: sent_by.append(
+                        (bot_key, text)
+                    ) or 1
+                )
+
+            with app._bot_scope("3"):
+                app.handle_update({"message": {
+                    "from": {"id": 1},
+                    "chat": {"id": 1, "type": "private"},
+                    "text": "/compact",
+                }})
+
+            self.assertEqual(sent_by, [("3", "压缩失败：compact failed")])
+            self.assertEqual(app._pending_codex_compactions, {})
 
     def test_clear_headless_rotates_external_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

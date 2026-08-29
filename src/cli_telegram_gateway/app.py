@@ -163,6 +163,8 @@ class GatewayApp:
         self._dispatch_lock = threading.Lock()
         self._bot_local = threading.local()
         self._codex_active_turns: dict[str, str] = {}
+        self._pending_codex_compactions: dict[str, str] = {}
+        self._codex_compaction_turns: dict[tuple[str, str], str] = {}
         self._turns: dict[tuple[str, str], TurnView] = {}
         self._queues: dict[str, deque[PendingInput]] = {}
         self._session_states: dict[str, str] = {}
@@ -1100,7 +1102,19 @@ class GatewayApp:
             self._send(chat_id, f"{session.label} 正在运行，请先 /interrupt 再压缩。")
             return
         if session.backend == "codex-app-server" and session.external_id:
-            self.codex.compact_thread(session.external_id)
+            thread_id = session.external_id
+            with self._state_lock:
+                # Manual compaction emits an internal turn on the app-server reader
+                # thread, which has no Telegram Bot thread-local scope. Remember the
+                # command origin before the request so that turn is not mistaken for
+                # a normal answer routed through the default Bot.
+                self._pending_codex_compactions[thread_id] = self._active_bot_key()
+            try:
+                self.codex.compact_thread(thread_id)
+            except Exception:
+                with self._state_lock:
+                    self._pending_codex_compactions.pop(thread_id, None)
+                raise
             self._send(chat_id, f"已触发 {session.label} 的上下文压缩。")
             return
         if session.cli == "pi":
@@ -1412,13 +1426,37 @@ class GatewayApp:
             if isinstance(turn_id, str):
                 with self._state_lock:
                     self._codex_active_turns[thread_id] = turn_id
-                self._register_turn(session, turn_id)
+                    bot_key = self._pending_codex_compactions.pop(thread_id, None)
+                    if bot_key is not None:
+                        self._codex_compaction_turns[(session.session_id, turn_id)] = bot_key
+                if bot_key is None:
+                    self._register_turn(session, turn_id)
             return
         turn_id = params.get("turnId")
         if not isinstance(turn_id, str):
             turn = params.get("turn")
             turn_id = turn.get("id") if isinstance(turn, dict) else None
         if not isinstance(turn_id, str):
+            return
+        compaction_key = (session.session_id, turn_id)
+        with self._state_lock:
+            is_compaction_turn = compaction_key in self._codex_compaction_turns
+        if is_compaction_turn:
+            # `/compact` already has its own command acknowledgement. Its internal
+            # turn has no assistant answer and must never enter the Telegram status
+            # publisher, otherwise a background reader thread routes a blank card
+            # through the default Bot.
+            if method == "turn/completed":
+                with self._state_lock:
+                    if self._codex_active_turns.get(thread_id) == turn_id:
+                        self._codex_active_turns.pop(thread_id, None)
+                    self._codex_compaction_turns.pop(compaction_key, None)
+                threading.Thread(
+                    target=self._start_next_queued,
+                    args=(session,),
+                    name=f"queue-{session.session_id}",
+                    daemon=True,
+                ).start()
             return
         if method == "item/agentMessage/delta":
             self._update_turn(session, turn_id, "delta", params.get("delta"))
