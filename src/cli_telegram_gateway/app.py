@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -202,6 +202,24 @@ class GatewayApp:
     def _current_session(self, chat_id: int, bot_key: str | None = None) -> CliSession | None:
         return self.sessions.current(chat_id, bot_key or self._active_bot_key())
 
+    def _effective_model(self, session: CliSession) -> str | None:
+        return session.model or self.config.default_model_for(session.cli)
+
+    def _effective_effort(self, session: CliSession) -> str | None:
+        return session.effort or self.config.default_effort_for(session.cli)
+
+    def _model_display(self, session: CliSession) -> str:
+        if session.model:
+            return session.model
+        configured = self.config.default_model_for(session.cli)
+        return f"{configured}（网关默认）" if configured else "CLI 默认"
+
+    def _effort_display(self, session: CliSession) -> str:
+        if session.effort:
+            return session.effort
+        configured = self.config.default_effort_for(session.cli)
+        return f"{configured}（网关默认）" if configured else "CLI 默认"
+
     def _switch_session(
         self, chat_id: int, session_id: str, bot_key: str | None = None
     ) -> CliSession:
@@ -293,7 +311,9 @@ class GatewayApp:
         try:
             cwd = self.config.resolve_workdir(requested_cwd)
             if cli == "codex":
-                thread_id = self.codex.start_thread(str(cwd))
+                thread_id = self.codex.start_thread(
+                    str(cwd), model=self.config.default_model_for(cli)
+                )
                 session = self.sessions.create_virtual(
                     cli,
                     cwd,
@@ -311,7 +331,9 @@ class GatewayApp:
             return
         self._send(
             chat_id,
-            f"已创建并切换到 {session.session_id}\nCLI：{session.cli}\n目录：{session.cwd}\n权限：免审批",
+            f"已创建并切换到 {session.session_id}\nCLI：{session.cli}\n目录：{session.cwd}"
+            f"\n模型：{self._model_display(session)}\n推理力度：{self._effort_display(session)}"
+            "\n权限：免审批",
         )
 
     def _send_new_session_picker(self, chat_id: int) -> None:
@@ -428,7 +450,9 @@ class GatewayApp:
             if session:
                 self._send(
                     chat_id,
-                    f"当前：{session.session_id}\nCLI：{session.cli}\n目录：{session.cwd}\n权限：免审批",
+                    f"当前：{session.session_id}\nCLI：{session.cli}\n目录：{session.cwd}"
+                    f"\n模型：{self._model_display(session)}"
+                    f"\n推理力度：{self._effort_display(session)}\n权限：免审批",
                 )
             return
         if command == "interrupt":
@@ -510,9 +534,10 @@ class GatewayApp:
                 else:
                     value = arg
                 self.sessions.set_model(session.session_id, value)
+                refreshed = self.sessions.get(session.session_id) or session
                 self._send(
                     chat_id,
-                    f"{session.label} 模型已设为 {value or '默认'}（下次任务生效）。",
+                    f"{session.label} 模型已设为 {self._model_display(refreshed)}（下次任务生效）。",
                 )
             else:
                 self._send_model_picker(chat_id, session)
@@ -528,9 +553,10 @@ class GatewayApp:
                 else:
                     value = arg.lower()
                 self.sessions.set_effort(session.session_id, value)
+                refreshed = self.sessions.get(session.session_id) or session
                 self._send(
                     chat_id,
-                    f"{session.label} 推理力度已设为 {value or '默认'}（下次任务生效）。",
+                    f"{session.label} 推理力度已设为 {self._effort_display(refreshed)}（下次任务生效）。",
                 )
             else:
                 self._send_effort_picker(chat_id, session)
@@ -855,9 +881,9 @@ class GatewayApp:
 
     def _model_view(self, session: CliSession) -> tuple[str, dict[str, Any]]:
         models = list_models(session.cli, self.config.cli_commands[session.cli])
-        current = session.model
+        current = self._effective_model(session)
         lines = [
-            f"{session.label} · 当前模型：{current or '默认'}",
+            f"{session.label} · 当前模型：{self._model_display(session)}",
             "点击切换（下次任务生效）：",
         ]
         buttons: list[list[dict[str, str]]] = []
@@ -867,16 +893,17 @@ class GatewayApp:
                 "text": f"{marker}{model}"[:64],
                 "callback_data": f"model:{session.session_id}:{index}",
             }])
-        buttons.append([{"text": "恢复默认", "callback_data": f"modelclear:{session.session_id}"}])
+        reset_label = "恢复网关默认" if self.config.default_model_for(session.cli) else "恢复默认"
+        buttons.append([{"text": reset_label, "callback_data": f"modelclear:{session.session_id}"}])
         if not models:
             lines.append("该 CLI 无法列出模型，请直接 /model <名称>。")
         return "\n".join(lines), {"inline_keyboard": buttons}
 
     def _effort_view(self, session: CliSession) -> tuple[str, dict[str, Any]]:
         efforts = list_efforts(session.cli)
-        current = session.effort
+        current = self._effective_effort(session)
         lines = [
-            f"{session.label} · 当前推理力度：{current or '默认'}",
+            f"{session.label} · 当前推理力度：{self._effort_display(session)}",
             "点击切换（下次任务生效）：",
         ]
         buttons: list[list[dict[str, str]]] = []
@@ -886,7 +913,8 @@ class GatewayApp:
                 "text": f"{marker}{effort}",
                 "callback_data": f"effort:{session.session_id}:{index}",
             }])
-        buttons.append([{"text": "恢复默认", "callback_data": f"effortclear:{session.session_id}"}])
+        reset_label = "恢复网关默认" if self.config.default_effort_for(session.cli) else "恢复默认"
+        buttons.append([{"text": reset_label, "callback_data": f"effortclear:{session.session_id}"}])
         if not efforts:
             lines.append("该 CLI 不支持手动设置推理力度。")
         return "\n".join(lines), {"inline_keyboard": buttons}
@@ -1006,10 +1034,16 @@ class GatewayApp:
                 return
             if action == "modelclear":
                 self.sessions.set_model(session_id, None)
-                notice = "已恢复默认模型"
+                default_model = self.config.default_model_for(session.cli)
+                notice = f"已恢复网关默认模型 {default_model}" if default_model else "已恢复默认模型"
             elif action == "effortclear":
                 self.sessions.set_effort(session_id, None)
-                notice = "已恢复默认推理力度"
+                default_effort = self.config.default_effort_for(session.cli)
+                notice = (
+                    f"已恢复网关默认推理力度 {default_effort}"
+                    if default_effort
+                    else "已恢复默认推理力度"
+                )
             elif action == "model":
                 models = list_models(session.cli, self.config.cli_commands[session.cli])
                 if 0 <= index < len(models):
@@ -1229,7 +1263,9 @@ class GatewayApp:
                 failed: list[str] = []
                 for session in codex_sessions:
                     try:
-                        self.codex.resume_thread(session.external_id or "", model=session.model)
+                        self.codex.resume_thread(
+                            session.external_id or "", model=self._effective_model(session)
+                        )
                     except CodexBackendError:
                         LOGGER.exception(
                             "could not resume Codex thread after reload: %s",
@@ -1314,7 +1350,9 @@ class GatewayApp:
         if session.backend == "codex-app-server" and session.external_id:
             old_thread = session.external_id
             try:
-                thread_id = self.codex.start_thread(session.cwd, model=session.model)
+                thread_id = self.codex.start_thread(
+                    session.cwd, model=self._effective_model(session)
+                )
             except CodexBackendError:
                 # 新建失败则保留原线程，不破坏会话
                 self._send(chat_id, "新建 Codex 线程失败，未清空。")
@@ -1485,8 +1523,8 @@ class GatewayApp:
                         session.external_id,
                         text,
                         attachments,
-                        model=session.model,
-                        effort=session.effort,
+                        model=self._effective_model(session),
+                        effort=self._effective_effort(session),
                     )
                 except Exception:
                     with self._state_lock:
@@ -1496,7 +1534,12 @@ class GatewayApp:
                     self._codex_active_turns[session.external_id] = turn_id
                 self._register_turn(session, turn_id, bot_key)
             elif session.backend == "headless-json":
-                turn_id = self.headless.start_turn(session, text, attachments)
+                effective_session = replace(
+                    session,
+                    model=self._effective_model(session),
+                    effort=self._effective_effort(session),
+                )
+                turn_id = self.headless.start_turn(effective_session, text, attachments)
                 self.sessions.increment_turn_count(session.session_id)
                 self._register_turn(session, turn_id, bot_key)
             else:
@@ -2211,12 +2254,16 @@ class GatewayApp:
             if session.cli == "codex":
                 if session.backend == "codex-app-server" and session.external_id:
                     try:
-                        self.codex.resume_thread(session.external_id, model=session.model)
+                        self.codex.resume_thread(
+                            session.external_id, model=self._effective_model(session)
+                        )
                         continue
                     except CodexBackendError:
                         LOGGER.exception("could not resume Codex thread for %s", session.session_id)
                 try:
-                    thread_id = self.codex.start_thread(session.cwd, model=session.model)
+                    thread_id = self.codex.start_thread(
+                        session.cwd, model=self._effective_model(session)
+                    )
                     self.sessions.update_backend(session.session_id, "codex-app-server", thread_id)
                     self._send(session.chat_id, f"[{session.session_id}] 已迁移到 Codex app-server。")
                 except (CodexBackendError, SessionError):

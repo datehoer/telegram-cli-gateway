@@ -79,11 +79,15 @@ STREAM_UPDATE_INTERVAL=10
 TELEGRAM_MAX_FILE_BYTES=20971520
 AUTO_RESUME=false
 ENABLED_CLIS=claude,codex,grok,pi
+DEFAULT_CODEX_MODEL=gpt-6-astra
+DEFAULT_CODEX_EFFORT=high
 ```
 
 `AUTO_RESUME=true` 时，网关重启后会自动续跑上次被意外中断的任务（用户主动 /interrupt 的除外）；默认 `false`，收到提示后用 `/resume` 手动恢复、用 `/cancel` 放弃。
 
 `ENABLED_CLIS` 可把一个网关实例限制为指定 CLI；例如 `ENABLED_CLIS=codex`。未启用的 CLI 不能创建或切换会话，Codex 未启用时也不会启动其 app-server。
+
+`DEFAULT_<CLI>_MODEL` 和 `DEFAULT_<CLI>_EFFORT` 设置该 CLI 的新会话默认值；已有会话只要没有用 `/model` 或 `/effort` 显式覆盖，也会继承它。`/model default`、`/effort default` 可恢复继承。上面的 Codex 配置使用官方模型标识 `gpt-6-astra` 和 `high` 推理力度，不会改动机器上其他 Codex CLI 的全局配置。
 
 附件保存在 `.runtime/uploads/`，目录权限为 `0700`、文件权限为 `0600`。默认最大 20 MiB。
 

@@ -30,6 +30,13 @@ def check_config(config: Config) -> int:
         executable = shutil.which(command[0]) if not Path(command[0]).is_absolute() else command[0]
         exists = bool(executable and Path(executable).exists())
         print(f"{cli}: {executable if exists else 'MISSING'}")
+        model = config.default_model_for(cli)
+        effort = config.default_effort_for(cli)
+        if model or effort:
+            print(
+                f"{cli} defaults: model={model or 'CLI default'}, "
+                f"effort={effort or 'CLI default'}"
+            )
         if not exists:
             problems.append(f"{cli} executable is missing")
 

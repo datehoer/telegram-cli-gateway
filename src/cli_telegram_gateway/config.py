@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -92,6 +92,8 @@ class Config:
     auto_send_artifacts: str = "images"
     auto_resume: bool = False
     bot_tokens: tuple[tuple[str, str], ...] = ()
+    cli_default_models: dict[str, str] = field(default_factory=dict)
+    cli_default_efforts: dict[str, str] = field(default_factory=dict)
 
     @property
     def telegram_bots(self) -> tuple[tuple[str, str], ...]:
@@ -101,6 +103,12 @@ class Config:
     @property
     def runtime_dir(self) -> Path:
         return self.project_dir / ".runtime"
+
+    def default_model_for(self, cli: str) -> str | None:
+        return self.cli_default_models.get(cli)
+
+    def default_effort_for(self, cli: str) -> str | None:
+        return self.cli_default_efforts.get(cli)
 
     def resolve_workdir(self, requested: str | None) -> Path:
         candidate = Path(requested).expanduser() if requested else self.default_workdir
@@ -176,6 +184,17 @@ class Config:
                 raise ConfigError(f"CLI_{cli_name.upper()} is empty")
             commands[cli_name] = command
 
+        default_models = {
+            cli_name: raw_value
+            for cli_name in known_clis
+            if (raw_value := values.get(f"DEFAULT_{cli_name.upper()}_MODEL", "").strip())
+        }
+        default_efforts = {
+            cli_name: raw_value.lower()
+            for cli_name in known_clis
+            if (raw_value := values.get(f"DEFAULT_{cli_name.upper()}_EFFORT", "").strip())
+        }
+
         raw_enabled_clis = values.get("ENABLED_CLIS", ",".join(known_clis))
         enabled_clis = tuple(
             dict.fromkeys(
@@ -214,4 +233,6 @@ class Config:
             auto_send_artifacts=_auto_send_mode(values, "AUTO_SEND_ARTIFACTS", "images"),
             auto_resume=_boolean(values, "AUTO_RESUME", False),
             bot_tokens=tuple(configured_tokens),
+            cli_default_models=default_models,
+            cli_default_efforts=default_efforts,
         )

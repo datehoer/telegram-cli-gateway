@@ -40,6 +40,8 @@ class GatewayEventTests(unittest.TestCase):
         auto_resume: bool = False,
         enabled_clis: tuple[str, ...] = ("claude", "codex", "grok", "pi"),
         bot_tokens: tuple[tuple[str, str], ...] = (),
+        cli_default_models: dict[str, str] | None = None,
+        cli_default_efforts: dict[str, str] | None = None,
     ) -> GatewayApp:
         config = Config(
             project_dir=project,
@@ -56,6 +58,8 @@ class GatewayEventTests(unittest.TestCase):
             enabled_clis=enabled_clis,
             auto_resume=auto_resume,
             bot_tokens=bot_tokens,
+            cli_default_models=cli_default_models or {},
+            cli_default_efforts=cli_default_efforts or {},
         )
         return GatewayApp(config)
 
@@ -261,6 +265,29 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(answered, [("new-pi", "正在创建 pi")])
             self.assertEqual(edited, [(1, 42, "已选择 pi，正在创建…")])
 
+    def test_new_codex_session_uses_gateway_default_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                cli_default_models={"codex": "gpt-6-astra"},
+                cli_default_efforts={"codex": "high"},
+            )
+            started: list[tuple[str, str | None]] = []
+            app.codex.start_thread = (  # type: ignore[method-assign]
+                lambda cwd, ephemeral=False, model=None: (
+                    started.append((cwd, model)) or "thread-default"
+                )
+            )
+            sent: list[str] = []
+            app._send = lambda _chat_id, text: sent.append(text)  # type: ignore[method-assign]
+
+            app._new_session(1, "codex", None)
+
+            self.assertEqual(started, [(str(project), "gpt-6-astra")])
+            self.assertIn("模型：gpt-6-astra（网关默认）", sent[0])
+            self.assertIn("推理力度：high（网关默认）", sent[0])
+
     def test_new_callback_rejects_disabled_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -333,7 +360,9 @@ class GatewayEventTests(unittest.TestCase):
     def test_reload_current_codex_restarts_shared_backend_and_resumes_all_threads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
-            app = self.make_app(project)
+            app = self.make_app(
+                project, cli_default_models={"codex": "gpt-6-astra"}
+            )
             first = app.sessions.create_virtual(
                 "codex", project, 1, "codex-app-server", "thread-1"
             )
@@ -353,7 +382,10 @@ class GatewayEventTests(unittest.TestCase):
             result = app._reload_cli_backends(1, first.session_id)
 
             self.assertEqual(lifecycle, ["close", "start"])
-            self.assertEqual(resumed, [("thread-1", None), ("thread-2", "gpt-test")])
+            self.assertEqual(
+                resumed,
+                [("thread-1", "gpt-6-astra"), ("thread-2", "gpt-test")],
+            )
             self.assertEqual(result, "Codex 后端已重启，已恢复 2 个会话。")
             self.assertEqual(app.sessions.get(first.session_id).external_id, "thread-1")  # type: ignore[union-attr]
 
@@ -1893,7 +1925,7 @@ class GatewayEventTests(unittest.TestCase):
                 self.assertIn(f"model:{session.session_id}:0", callbacks)
                 self.assertIn(f"model:{session.session_id}:1", callbacks)
                 self.assertIn(f"modelclear:{session.session_id}", callbacks)
-                self.assertIn("当前模型：默认", sent[0][0])
+                self.assertIn("当前模型：CLI 默认", sent[0][0])
             finally:
                 app_module.list_models = original
 
@@ -1996,6 +2028,66 @@ class GatewayEventTests(unittest.TestCase):
             app._start_session_turn(1, app.sessions.get(session.session_id), "go")  # type: ignore[arg-type]
             self.assertEqual(captured["model"], "gpt-5.5")
             self.assertEqual(captured["effort"], "low")
+
+    def test_codex_session_inherits_gateway_model_and_effort_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                cli_default_models={"codex": "gpt-6-astra"},
+                cli_default_efforts={"codex": "high"},
+            )
+            session = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-1"
+            )
+            captured: dict[str, object] = {}
+
+            def fake_start_turn(
+                thread_id: str,
+                text: str,
+                attachments: tuple[Any, ...] = (),
+                model: str | None = None,
+                effort: str | None = None,
+            ) -> str:
+                captured["model"] = model
+                captured["effort"] = effort
+                return "turn-defaults"
+
+            app.codex.start_turn = fake_start_turn  # type: ignore[method-assign]
+            app._send = lambda *_args: None  # type: ignore[method-assign]
+            app._start_session_turn(1, session, "go")
+
+            self.assertEqual(captured, {"model": "gpt-6-astra", "effort": "high"})
+            self.assertIsNone(app.sessions.get(session.session_id).model)  # type: ignore[union-attr]
+            self.assertIn("gpt-6-astra（网关默认）", app._model_view(session)[0])
+            self.assertIn("high（网关默认）", app._effort_view(session)[0])
+
+    def test_headless_session_inherits_gateway_defaults_without_persisting_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                cli_default_models={"pi": "pi-default"},
+                cli_default_efforts={"pi": "high"},
+            )
+            session = app.sessions.create_headless("pi", project, 1)
+            captured: dict[str, object] = {}
+
+            def fake_start_turn(
+                effective_session: Any, _text: str, _attachments: tuple[Any, ...] = ()
+            ) -> str:
+                captured["model"] = effective_session.model
+                captured["effort"] = effective_session.effort
+                return "turn-defaults"
+
+            app.headless.start_turn = fake_start_turn  # type: ignore[method-assign]
+            app._send = lambda *_args: None  # type: ignore[method-assign]
+            app._start_session_turn(1, session, "go")
+
+            self.assertEqual(captured, {"model": "pi-default", "effort": "high"})
+            persisted = app.sessions.get(session.session_id)
+            self.assertIsNone(persisted.model)  # type: ignore[union-attr]
+            self.assertIsNone(persisted.effort)  # type: ignore[union-attr]
 
 
 

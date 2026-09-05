@@ -34,6 +34,8 @@ class ConfigTests(unittest.TestCase):
                         "CLI_CODEX=/bin/sh",
                         "CLI_GROK=/bin/sh",
                         "CLI_PI=/bin/sh",
+                        "DEFAULT_CODEX_MODEL=gpt-6-astra",
+                        "DEFAULT_CODEX_EFFORT=HIGH",
                         "ENABLED_CLIS=codex, claude codex",
                     ]
                 ),
@@ -48,6 +50,8 @@ class ConfigTests(unittest.TestCase):
                 "CLI_CODEX",
                 "CLI_GROK",
                 "CLI_PI",
+                "DEFAULT_CODEX_MODEL",
+                "DEFAULT_CODEX_EFFORT",
                 "ENABLED_CLIS",
                 "STREAM_UPDATE_INTERVAL",
             }
@@ -57,6 +61,9 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.allowed_user_ids, frozenset({100, 200}))
             self.assertEqual(config.enabled_clis, ("codex", "claude"))
             self.assertEqual(config.stream_update_interval, 10.0)
+            self.assertEqual(config.default_model_for("codex"), "gpt-6-astra")
+            self.assertEqual(config.default_effort_for("codex"), "high")
+            self.assertIsNone(config.default_model_for("claude"))
             self.assertEqual(config.resolve_workdir(str(child)), child.resolve())
             with self.assertRaises(ConfigError):
                 config.resolve_workdir("/etc")
