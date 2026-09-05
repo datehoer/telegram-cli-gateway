@@ -8,6 +8,7 @@
 
 - Telegram 用户 ID 白名单，默认只接受私聊
 - `/new`、`/use`、`/back`、`/sessions`、`/tasks`、`/where`、`/interrupt`、`/resume`、`/cancel`
+- `/reload` 可点选重载当前会话或全部 CLI；Codex 会重启共享 app-server 并恢复全部原生 thread，Claude/Grok/Pi 的下一轮任务天然使用当前安装版本
 - `/tasks` 提供中断当前、清空等待和中断并清空按钮；每个会话最多排队 20 条输入
 - `/sessions` 返回 Telegram 按钮，可切换、中断、归档、恢复和确认删除会话；每个会话显示状态徽章（🟡 运行中 / 🟢 空闲 / ⚫ 上次失败 / 🔴 已中断待恢复 / ⏳ 排队 N）
 - `/rename` 设置易读会话名称；`/sessions all` 查看已归档会话
@@ -101,12 +102,17 @@ ENABLED_CLIS=claude,codex,grok,pi
 /interrupt
 /resume
 /cancel
+/reload
+/reload current
+/reload all
 /model
 /model sonnet
 /effort high
 ```
 
 普通文字直接发给当前会话。发送文件或图片时，caption 会作为提示；没有 caption 时使用“请查看并处理这个附件”。
+
+`/reload` 只重启已配置 CLI 的运行后端，不会重读 `.env` 或 Gateway 源码；修改配置或 Gateway 本身后仍需重启 systemd 服务。任何目标会话仍在运行时，重载会拒绝执行，不会自动中断或重放任务。
 
 项目使用 `uv` 管理本地 `.venv`，`scripts/run.sh` 会优先通过 `/home/openclaw/.local/bin/uv` 启动并在找不到 uv 时回退到系统 Python。
 

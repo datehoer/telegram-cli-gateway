@@ -161,7 +161,7 @@ class TelegramClient:
     def send_message(
         self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None
     ) -> int | None:
-        first_message_id: int | None = None
+        last_message_id: int | None = None
         chunks = split_message(text)
         for index, chunk in enumerate(chunks):
             payload: dict[str, Any] = {
@@ -175,11 +175,11 @@ class TelegramClient:
                 "sendMessage",
                 payload,
             )
-            if first_message_id is None and isinstance(result, dict):
+            if isinstance(result, dict):
                 message_id = result.get("message_id")
                 if isinstance(message_id, int):
-                    first_message_id = message_id
-        return first_message_id
+                    last_message_id = message_id
+        return last_message_id
 
     def copy_message(
         self, chat_id: int, from_chat_id: int, message_id: int
@@ -201,7 +201,7 @@ class TelegramClient:
         markdown: str,
         reply_markup: dict[str, Any] | None = None,
     ) -> int | None:
-        first_message_id: int | None = None
+        last_message_id: int | None = None
         chunks = split_markdown(markdown)
         for index, chunk in enumerate(chunks):
             html_text = markdown_to_telegram_html(chunk)
@@ -221,11 +221,11 @@ class TelegramClient:
                 payload["text"] = chunk
                 payload.pop("parse_mode", None)
                 result = self._call("sendMessage", payload)
-            if first_message_id is None and isinstance(result, dict):
+            if isinstance(result, dict):
                 message_id = result.get("message_id")
                 if isinstance(message_id, int):
-                    first_message_id = message_id
-        return first_message_id
+                    last_message_id = message_id
+        return last_message_id
 
     def send_rich_markdown(
         self,
@@ -233,7 +233,7 @@ class TelegramClient:
         markdown: str,
         reply_markup: dict[str, Any] | None = None,
     ) -> int | None:
-        first_message_id: int | None = None
+        last_message_id: int | None = None
         chunks = split_rich_markdown(markdown)
         for index, chunk in enumerate(chunks):
             payload: dict[str, Any] = {
@@ -243,11 +243,11 @@ class TelegramClient:
             if reply_markup is not None and index == len(chunks) - 1:
                 payload["reply_markup"] = reply_markup
             result = self._call("sendRichMessage", payload)
-            if first_message_id is None and isinstance(result, dict):
+            if isinstance(result, dict):
                 message_id = result.get("message_id")
                 if isinstance(message_id, int):
-                    first_message_id = message_id
-        return first_message_id
+                    last_message_id = message_id
+        return last_message_id
 
     def edit_rich_markdown(
         self,

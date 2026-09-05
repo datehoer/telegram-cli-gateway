@@ -21,6 +21,7 @@ from cli_telegram_gateway.app import (
 )
 from cli_telegram_gateway.config import Config
 from cli_telegram_gateway.codex_backend import CodexBackendError
+from cli_telegram_gateway.sessions import SessionError
 from cli_telegram_gateway.telegram import TelegramError
 
 
@@ -305,6 +306,157 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(created, [])
             self.assertEqual(answered, ["没有权限"])
+
+    def test_reload_command_without_args_shows_current_and_all_buttons(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-1"
+            )
+            sent: list[tuple[str, dict[str, Any]]] = []
+            app.telegram.send_message = (  # type: ignore[method-assign]
+                lambda _chat_id, text, reply_markup=None: sent.append((text, reply_markup))
+            )
+
+            app._handle_command(1, "reload", "")
+
+            self.assertEqual(len(sent), 1)
+            callbacks = {
+                button["callback_data"]
+                for row in sent[0][1]["inline_keyboard"]
+                for button in row
+            }
+            self.assertEqual(callbacks, {f"reload:{session.session_id}", "reload:all"})
+            self.assertIn("Codex 是共享后端", sent[0][0])
+
+    def test_reload_current_codex_restarts_shared_backend_and_resumes_all_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            first = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-1"
+            )
+            second = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-2"
+            )
+            app.sessions.set_model(second.session_id, "gpt-test")
+            app.sessions.create_headless("pi", project, 1)
+            lifecycle: list[str] = []
+            resumed: list[tuple[str, str | None]] = []
+            app.codex.close = lambda: lifecycle.append("close")  # type: ignore[method-assign]
+            app.codex.start = lambda: lifecycle.append("start")  # type: ignore[method-assign]
+            app.codex.resume_thread = (  # type: ignore[method-assign]
+                lambda thread_id, model=None: resumed.append((thread_id, model))
+            )
+
+            result = app._reload_cli_backends(1, first.session_id)
+
+            self.assertEqual(lifecycle, ["close", "start"])
+            self.assertEqual(resumed, [("thread-1", None), ("thread-2", "gpt-test")])
+            self.assertEqual(result, "Codex 后端已重启，已恢复 2 个会话。")
+            self.assertEqual(app.sessions.get(first.session_id).external_id, "thread-1")  # type: ignore[union-attr]
+
+    def test_reload_current_headless_uses_new_binary_on_next_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_headless("pi", project, 1)
+            app.codex.close = (  # type: ignore[method-assign]
+                lambda: self.fail("headless reload must not restart Codex")
+            )
+
+            result = app._reload_cli_backends(1, session.session_id)
+
+            self.assertIn("pi 按任务启动新进程", result)
+            self.assertIn("下次任务会直接使用当前安装版本", result)
+
+    def test_reload_all_restarts_resident_backend_and_covers_headless_clis(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-1"
+            )
+            lifecycle: list[str] = []
+            resumed: list[str] = []
+            app.codex.close = lambda: lifecycle.append("close")  # type: ignore[method-assign]
+            app.codex.start = lambda: lifecycle.append("start")  # type: ignore[method-assign]
+            app.codex.resume_thread = (  # type: ignore[method-assign]
+                lambda thread_id, model=None: resumed.append(thread_id)
+            )
+
+            result = app._reload_cli_backends(1, "all")
+
+            self.assertEqual(lifecycle, ["close", "start"])
+            self.assertEqual(resumed, ["thread-1"])
+            self.assertIn("Codex 后端已重启", result)
+            self.assertIn("claude、grok、pi 按任务启动新进程", result)
+
+    def test_reload_all_rejects_when_a_headless_turn_is_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            busy = app.sessions.create_headless("pi", project, 1)
+            app.headless.is_active = (  # type: ignore[method-assign]
+                lambda session_id: session_id == busy.session_id
+            )
+            app.codex.close = (  # type: ignore[method-assign]
+                lambda: self.fail("reload all must be atomic while a CLI is busy")
+            )
+
+            with self.assertRaisesRegex(SessionError, busy.label):
+                app._reload_cli_backends(1, "all")
+
+    def test_reload_current_codex_rejects_when_any_codex_thread_is_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            idle = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-idle"
+            )
+            busy = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-busy"
+            )
+            app._codex_active_turns["thread-busy"] = "turn-1"
+            app.codex.close = (  # type: ignore[method-assign]
+                lambda: self.fail("busy backend must not be restarted")
+            )
+
+            with self.assertRaisesRegex(SessionError, busy.label):
+                app._reload_cli_backends(1, idle.session_id)
+
+    def test_reload_callback_uses_session_captured_by_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            selected = app.sessions.create_headless("pi", project, 1)
+            app.sessions.create_headless("claude", project, 1)
+            targets: list[tuple[int, str]] = []
+            answers: list[tuple[str, str]] = []
+            edits: list[tuple[int, int, str]] = []
+            app._reload_cli_backends = (  # type: ignore[method-assign]
+                lambda chat_id, target: targets.append((chat_id, target)) or "重载完成"
+            )
+            app.telegram.answer_callback_query = (  # type: ignore[method-assign]
+                lambda query_id, text="": answers.append((query_id, text))
+            )
+            app.telegram.edit_message = (  # type: ignore[method-assign]
+                lambda chat_id, message_id, text, reply_markup=None: edits.append(
+                    (chat_id, message_id, text)
+                )
+            )
+
+            app.handle_update({"callback_query": {
+                "id": "reload-current",
+                "from": {"id": 1},
+                "data": f"reload:{selected.session_id}",
+                "message": {"message_id": 42, "chat": {"id": 1, "type": "private"}},
+            }})
+
+            self.assertEqual(targets, [(1, selected.session_id)])
+            self.assertEqual(answers, [("reload-current", "正在重载")])
+            self.assertEqual(edits, [(1, 42, "重载完成")])
 
     def test_codex_deltas_accumulate_and_render_as_one_completed_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1332,6 +1484,7 @@ class GatewayEventTests(unittest.TestCase):
             app._codex_active_turns["thread-1"] = "turn-1"
             view = app._register_turn(session, "turn-1")
             view.live = True
+            view.message_id = 41
             steered: list[tuple[str, str, str]] = []
             app.codex.steer_turn = (  # type: ignore[method-assign]
                 lambda thread, turn, text, _attachments=(): steered.append(
@@ -1340,13 +1493,30 @@ class GatewayEventTests(unittest.TestCase):
             )
             sent: list[str] = []
             app._send = lambda _chat, text: sent.append(text)  # type: ignore[method-assign]
+            rich_sent: list[str] = []
+            app.telegram.send_rich_markdown = (  # type: ignore[method-assign]
+                lambda _chat, markdown, reply_markup=None: rich_sent.append(markdown) or 42
+            )
+            edited: list[int] = []
+            app.telegram.edit_rich_markdown = (  # type: ignore[method-assign]
+                lambda _chat, message_id, _markdown, reply_markup=None: edited.append(
+                    message_id
+                )
+            )
             app._send_to_session(1, session, "change direction")
             self.assertEqual(steered, [("thread-1", "turn-1", "change direction")])
             self.assertNotIn(session.session_id, app._queues)
             self.assertEqual(sent, [f"已追加到 {session.label} 当前任务。"])
             self.assertEqual(view.steered, 1)
             self.assertTrue(view.dirty)
-            self.assertFalse(view.live)
+            self.assertTrue(view.live)
+            self.assertEqual(view.message_id, 42)
+            self.assertEqual(view.stale_message_ids, [41])
+            self.assertEqual(len(rich_sent), 1)
+            self.assertEqual(edited, [41])
+
+            app._publish_running_turn(view, "latest update")
+            self.assertEqual(edited, [41, 42])
 
     def test_busy_codex_queues_input_from_another_bot_with_its_reply_route(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

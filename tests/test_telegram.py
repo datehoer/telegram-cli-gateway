@@ -132,7 +132,7 @@ class TelegramTests(unittest.TestCase):
         chunks = split_message("abcdefghijk", limit=5)
         self.assertEqual(chunks, ["abcde", "fghij", "k"])
 
-    def test_send_message_returns_first_message_id(self) -> None:
+    def test_send_message_returns_latest_message_id(self) -> None:
         client = TelegramClient("test")
         calls: list[str] = []
 
@@ -141,8 +141,8 @@ class TelegramTests(unittest.TestCase):
             return {"message_id": len(calls)}
 
         client._call = fake_call  # type: ignore[method-assign]
-        self.assertEqual(client.send_message(1, "hello"), 1)
-        self.assertEqual(calls, ["sendMessage"])
+        self.assertEqual(client.send_message(1, "a" * 5000), 2)
+        self.assertEqual(calls, ["sendMessage", "sendMessage"])
 
     def test_copy_message_returns_new_message_id(self) -> None:
         client = TelegramClient("test")
@@ -186,6 +186,18 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(payloads[0]["parse_mode"], "HTML")  # type: ignore[index]
         self.assertEqual(payloads[0]["text"], "<b>hello</b> &lt;world&gt;")  # type: ignore[index]
 
+    def test_send_markdown_returns_latest_chunk_id(self) -> None:
+        client = TelegramClient("test")
+        calls: list[str] = []
+
+        def fake_call(method: str, _payload: object = None) -> object:
+            calls.append(method)
+            return {"message_id": len(calls)}
+
+        client._call = fake_call  # type: ignore[method-assign]
+        self.assertEqual(client.send_markdown(1, "a" * 5000), 2)
+        self.assertEqual(calls, ["sendMessage", "sendMessage"])
+
     def test_send_rich_markdown_passes_gfm_table_to_rich_message_api(self) -> None:
         client = TelegramClient("test")
         calls: list[tuple[str, object]] = []
@@ -199,6 +211,18 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(client.send_rich_markdown(1, table), 7)
         self.assertEqual(calls[0][0], "sendRichMessage")
         self.assertEqual(calls[0][1]["rich_message"], {"markdown": table})  # type: ignore[index]
+
+    def test_send_rich_markdown_returns_latest_chunk_id(self) -> None:
+        client = TelegramClient("test")
+        calls: list[str] = []
+
+        def fake_call(method: str, _payload: object = None) -> object:
+            calls.append(method)
+            return {"message_id": len(calls)}
+
+        client._call = fake_call  # type: ignore[method-assign]
+        self.assertEqual(client.send_rich_markdown(1, "a" * 30001), 2)
+        self.assertEqual(calls, ["sendRichMessage", "sendRichMessage"])
 
     def test_edit_rich_markdown_replaces_fallback_message_with_rich_content(self) -> None:
         client = TelegramClient("test")

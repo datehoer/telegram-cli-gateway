@@ -67,6 +67,7 @@ HELP_TEXT = """远程 CLI 网关
 /cancel [会话]      放弃上次被中断的任务
 /compact            压缩当前会话上下文（Codex、Pi）
 /clear              当前会话开新对话，清空上下文
+/reload [current|all] 重载当前会话或全部 CLI
 /stop [会话ID|cli]  停止会话
 /rename [会话] 名称  重命名会话
 /archive [会话]     归档会话
@@ -92,6 +93,7 @@ BOT_COMMANDS = (
     ("cancel", "放弃上次被中断的任务"),
     ("compact", "压缩当前会话上下文"),
     ("clear", "当前会话开新对话"),
+    ("reload", "重载 CLI 后端"),
     ("stop", "停止会话"),
     ("rename", "重命名会话"),
     ("archive", "归档会话"),
@@ -160,7 +162,9 @@ class GatewayApp:
         self.stop_event = threading.Event()
         self._lock_handle = None
         self._state_lock = threading.RLock()
+        self._publish_lock = threading.RLock()
         self._dispatch_lock = threading.Lock()
+        self._backend_reload_lock = threading.RLock()
         self._bot_local = threading.local()
         self._codex_active_turns: dict[str, str] = {}
         self._pending_codex_compactions: dict[str, str] = {}
@@ -327,6 +331,32 @@ class GatewayApp:
         except TelegramError:
             LOGGER.exception("could not send new-session picker to chat %s", chat_id)
 
+    def _send_reload_picker(self, chat_id: int) -> None:
+        current = self._current_session(chat_id)
+        buttons: list[list[dict[str, str]]] = []
+        if current and current.cli in self.config.enabled_clis:
+            buttons.append(
+                [{
+                    "text": f"当前会话（{current.cli}）",
+                    "callback_data": f"reload:{current.session_id}",
+                }]
+            )
+        buttons.append([{"text": "全部 CLI", "callback_data": "reload:all"}])
+        detail = (
+            f"当前：{current.label} · {current.cli}\n" if current else "当前没有活动会话。\n"
+        )
+        try:
+            self.telegram.send_message(
+                chat_id,
+                "选择重载范围：\n"
+                + detail
+                + "运行中的任务不会被强制中断。Codex 是共享后端，重载一个 Codex 会话会恢复全部 Codex 会话。"
+                "此操作不会重读 .env 或 Gateway 源码。",
+                reply_markup={"inline_keyboard": buttons},
+            )
+        except TelegramError:
+            LOGGER.exception("could not send reload picker to chat %s", chat_id)
+
     def _parse_args(self, chat_id: int, raw_args: str) -> list[str] | None:
         try:
             return shlex.split(raw_args)
@@ -454,6 +484,20 @@ class GatewayApp:
                 self._clear_session(chat_id, session)
             except (CodexBackendError, SessionError) as exc:
                 self._send(chat_id, f"清空失败：{exc}")
+            return
+        if command == "reload":
+            target = raw_args.strip().lower()
+            if not target:
+                self._send_reload_picker(chat_id)
+                return
+            if target not in {"current", "all"}:
+                self._send(chat_id, "用法：/reload [current|all]")
+                return
+            try:
+                result = self._reload_cli_backends(chat_id, target)
+            except (CodexBackendError, SessionError) as exc:
+                result = f"重载失败：{exc}"
+            self._send(chat_id, result)
             return
         if command == "model":
             session = self._current_or_reply(chat_id)
@@ -910,6 +954,24 @@ class GatewayApp:
             self._new_session(chat_id, target, None)
             return
 
+        if action == "reload":
+            try:
+                self.telegram.answer_callback_query(query_id, "正在重载")
+            except TelegramError:
+                LOGGER.exception("could not answer reload callback for chat %s", chat_id)
+            try:
+                result = self._reload_cli_backends(chat_id, target)
+            except (CodexBackendError, SessionError) as exc:
+                result = f"重载失败：{exc}"
+            try:
+                if isinstance(message_id, int):
+                    self.telegram.edit_message(chat_id, message_id, result)
+                else:
+                    self._send(chat_id, result)
+            except TelegramError:
+                LOGGER.exception("could not finish reload callback for chat %s", chat_id)
+            return
+
         if action in {"file", "photo"}:
             resolved = self.sessions.resolve_artifact(
                 chat_id, target, self._active_bot_key()
@@ -1092,6 +1154,110 @@ class GatewayApp:
         self.sessions.interrupt(session)
         return True
 
+    def _reload_cli_backends(self, chat_id: int, target: str) -> str:
+        """Reload resident backends without changing native session IDs.
+
+        Codex owns one app-server shared by every Codex thread, so selecting one
+        Codex session necessarily restarts that shared process and then resumes
+        every saved thread. Claude, Grok and Pi are spawned once per turn; when
+        idle there is no resident process to restart, and their next turn already
+        resolves the configured command to the currently installed executable.
+        """
+        focus: CliSession | None = None
+        if target == "all":
+            target_clis = set(self.config.enabled_clis)
+        else:
+            focus = (
+                self._current_session(chat_id)
+                if target == "current"
+                else self.sessions.get(target)
+            )
+            if (
+                not focus
+                or focus.chat_id != chat_id
+                or focus.archived
+                or focus.cli not in self.config.enabled_clis
+            ):
+                raise SessionError("会话已失效，请重新 /reload")
+            target_clis = {focus.cli}
+
+        with self._backend_reload_lock:
+            all_sessions = self.sessions.all_sessions()
+            if focus and focus.cli != "codex":
+                candidates = [focus]
+            else:
+                candidates = [
+                    session
+                    for session in all_sessions
+                    if session.cli in target_clis and not session.archived
+                ]
+            busy = [
+                session.label
+                for session in candidates
+                if self._session_is_busy(session)
+            ]
+            if "codex" in target_clis:
+                with self._state_lock:
+                    codex_operation_pending = bool(
+                        self._pending_codex_compactions or self._codex_compaction_turns
+                    )
+                if codex_operation_pending and not busy:
+                    busy.append("Codex 上下文压缩")
+            if busy:
+                shown = "、".join(busy[:5])
+                suffix = " 等" if len(busy) > 5 else ""
+                raise SessionError(f"仍有任务运行：{shown}{suffix}；请等待完成后重试")
+
+            lines: list[str] = []
+            if "codex" in target_clis:
+                self.codex.close()
+                try:
+                    self.codex.start()
+                except CodexBackendError:
+                    # initialize may fail after the process has started. Do not
+                    # leave a half-initialized app-server behind.
+                    self.codex.close()
+                    raise
+                codex_sessions = [
+                    session
+                    for session in all_sessions
+                    if session.cli == "codex"
+                    and session.backend == "codex-app-server"
+                    and session.external_id
+                ]
+                resumed: list[str] = []
+                failed: list[str] = []
+                for session in codex_sessions:
+                    try:
+                        self.codex.resume_thread(session.external_id or "", model=session.model)
+                    except CodexBackendError:
+                        LOGGER.exception(
+                            "could not resume Codex thread after reload: %s",
+                            session.session_id,
+                        )
+                        failed.append(session.label)
+                    else:
+                        resumed.append(session.label)
+                lines.append(f"Codex 后端已重启，已恢复 {len(resumed)} 个会话。")
+                if failed:
+                    lines.append(
+                        "恢复失败："
+                        + "、".join(failed[:5])
+                        + (" 等" if len(failed) > 5 else "")
+                    )
+
+            headless_clis = [
+                cli
+                for cli in self.config.enabled_clis
+                if cli in target_clis and cli != "codex"
+            ]
+            if headless_clis:
+                lines.append(
+                    "、".join(headless_clis)
+                    + " 按任务启动新进程；下次任务会直接使用当前安装版本。"
+                )
+            return "\n".join(lines) or "没有可重载的 CLI。"
+
     def _compact_session(self, chat_id: int, session: CliSession) -> None:
         """压缩当前会话上下文：Codex 用原生 thread/compact/start，Pi 用一次性 RPC。
 
@@ -1216,10 +1382,30 @@ class GatewayApp:
                         self._send(chat_id, f"已追加到 {session.label} 当前任务。")
                         with self._state_lock:
                             # The acknowledgement is newer than the existing progress
-                            # card. Re-pin the live card so subsequent edits remain
-                            # visible at the bottom of the chat.
+                            # card. Rotate the message pointer immediately so the next
+                            # stream update cannot land on the original card.
                             if view and view.status == "running":
                                 view.live = False
+                        if view:
+                            now = time.monotonic()
+                            try:
+                                pinned = self._pin_turn(view, now)
+                            except TelegramError as exc:
+                                with self._state_lock:
+                                    delay = self._schedule_publish_retry(view, exc, now)
+                                LOGGER.warning(
+                                    "could not re-pin Telegram message for %s after steering; "
+                                    "retrying in %.1fs: %s",
+                                    view.session.session_id,
+                                    delay,
+                                    exc,
+                                )
+                            else:
+                                if pinned:
+                                    with self._state_lock:
+                                        view.last_edit = now
+                                        view.publish_failures = 0
+                                        view.next_publish_at = 0.0
                         return
                     except CodexBackendError as exc:
                         LOGGER.warning("Codex steer failed; queued instead: %s", exc)
@@ -1260,6 +1446,17 @@ class GatewayApp:
                 )
 
     def _start_session_turn(
+        self,
+        chat_id: int,
+        session: CliSession,
+        text: str,
+        attachments: tuple[Attachment, ...] = (),
+        bot_key: str | None = None,
+    ) -> None:
+        with self._backend_reload_lock:
+            self._start_session_turn_locked(chat_id, session, text, attachments, bot_key)
+
+    def _start_session_turn_locked(
         self,
         chat_id: int,
         session: CliSession,
@@ -1563,42 +1760,52 @@ class GatewayApp:
             sections.append(f"错误：\n```text\n{error}\n```")
         return "\n\n".join(sections), answer
 
-    def _pin_turn(self, view: TurnView, now: float) -> None:
+    def _pin_turn(self, view: TurnView, now: float) -> bool:
         """把当前 session 的运行进度钉到一条新的底部消息上并开始直播。
 
         旧卡片（若存在）降级为“后台运行中”，记入 stale_message_ids，待任务
         终态时一并收尾。每次切回该 session 都会重新把进度钉到最新一条消息。
         """
-        with self._state_lock:
-            old_id = view.message_id if view.message_id and view.message_id > 0 else None
+        with self._publish_lock:
+            with self._state_lock:
+                current = self.sessions.current(view.session.chat_id, view.bot_key)
+                if (
+                    view.status != "running"
+                    or view.live
+                    or not current
+                    or current.session_id != view.session.session_id
+                ):
+                    return False
+                old_id = view.message_id if view.message_id and view.message_id > 0 else None
+                if old_id is not None:
+                    view.stale_message_ids.append(old_id)
+                view.message_id = None
+                view.dirty = True
+            rendered, _ = self._render_turn(view, now)
+            self._publish_running_turn(view, rendered)
+            with self._state_lock:
+                view.live = True
             if old_id is not None:
-                view.stale_message_ids.append(old_id)
-            view.message_id = None
-            view.dirty = True
-        rendered, _ = self._render_turn(view, now)
-        self._publish_running_turn(view, rendered)
-        with self._state_lock:
-            view.live = True
-        if old_id is not None:
-            stamp, _ = self._render_turn(view, now, background=True)
-            try:
-                if view.rich_mode:
-                    self._telegram(view.bot_key).edit_rich_markdown(
-                        view.session.chat_id, old_id, stamp
+                stamp, _ = self._render_turn(view, now, background=True)
+                try:
+                    if view.rich_mode:
+                        self._telegram(view.bot_key).edit_rich_markdown(
+                            view.session.chat_id, old_id, stamp
+                        )
+                    else:
+                        self._telegram(view.bot_key).edit_markdown(
+                            view.session.chat_id, old_id, stamp
+                        )
+                except TelegramError as exc:
+                    if exc.retry_after is not None:
+                        raise
+                    LOGGER.warning(
+                        "could not stamp old progress card %s for %s: %s",
+                        old_id,
+                        view.session.session_id,
+                        exc,
                     )
-                else:
-                    self._telegram(view.bot_key).edit_markdown(
-                        view.session.chat_id, old_id, stamp
-                    )
-            except TelegramError as exc:
-                if exc.retry_after is not None:
-                    raise
-                LOGGER.warning(
-                    "could not stamp old progress card %s for %s: %s",
-                    old_id,
-                    view.session.session_id,
-                    exc,
-                )
+            return True
 
     def _background_turn(self, view: TurnView, now: float) -> None:
         """切换走时把当前卡片定格为“后台运行中”，停止周期刷新。"""
@@ -1892,16 +2099,18 @@ class GatewayApp:
                         published_status = view.status
                         rendered, _answer = self._render_turn(view, now)
                 try:
-                    if action == "pin":
-                        self._pin_turn(view, now)
-                    elif action == "background":
-                        self._background_turn(view, now)
-                    elif published_status == "running":
-                        self._publish_running_turn(view, rendered)
-                    else:
-                        self._publish_final_turn(
-                            view, rendered, with_artifacts=published_status != "interrupted"
-                        )
+                    with self._publish_lock:
+                        if action == "pin":
+                            if not self._pin_turn(view, now):
+                                continue
+                        elif action == "background":
+                            self._background_turn(view, now)
+                        elif published_status == "running":
+                            self._publish_running_turn(view, rendered)
+                        else:
+                            self._publish_final_turn(
+                                view, rendered, with_artifacts=published_status != "interrupted"
+                            )
                 except TelegramError as exc:
                     delay = self._schedule_publish_retry(view, exc, now)
                     LOGGER.warning(
