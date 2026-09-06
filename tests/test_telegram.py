@@ -245,6 +245,36 @@ class TelegramTests(unittest.TestCase):
         )
         client.edit_rich_markdown(1, 9, "same content")  # 不应抛出
 
+    def test_edit_rich_markdown_edits_existing_chunks_before_sending(self) -> None:
+        client = TelegramClient("test")
+        calls: list[tuple[str, object]] = []
+
+        def fake_call(method: str, payload: object = None) -> object:
+            calls.append((method, payload))
+            return {"message_id": 20 + len(calls)}
+
+        client._call = fake_call  # type: ignore[method-assign]
+        ids = client.edit_rich_markdown(
+            1,
+            9,
+            "a" * 30001,
+            extra_message_ids=[10],
+        )
+        self.assertEqual(ids, [9, 10])
+        self.assertEqual([item[0] for item in calls], ["editMessageText", "editMessageText"])
+        self.assertEqual(calls[0][1]["message_id"], 9)  # type: ignore[index]
+        self.assertEqual(calls[1][1]["message_id"], 10)  # type: ignore[index]
+
+    def test_edit_rich_markdown_without_split_does_not_send_extra_chunks(self) -> None:
+        client = TelegramClient("test")
+        calls: list[str] = []
+        client._call = (  # type: ignore[method-assign]
+            lambda method, payload=None: calls.append(method) or {"message_id": 1}
+        )
+        ids = client.edit_rich_markdown(1, 9, "a" * 30001, allow_split=False)
+        self.assertEqual(ids, [9])
+        self.assertEqual(calls, ["editMessageText"])
+
 
 if __name__ == "__main__":
     unittest.main()

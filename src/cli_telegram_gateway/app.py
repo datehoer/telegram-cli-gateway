@@ -19,6 +19,7 @@ from typing import Any
 from .attachments import Attachment
 from .codex_backend import CodexAppServer, CodexBackendError
 from .config import Config, ConfigError
+from .formatting import split_markdown, split_rich_markdown
 from .headless_backend import HeadlessBackend, HeadlessBackendError
 from .models import list_efforts, list_models
 from .sessions import CliSession, SessionError, SessionManager
@@ -116,6 +117,7 @@ class TurnView:
     status: str = "running"
     error: str = ""
     message_id: int | None = None
+    message_ids: list[int] = field(default_factory=list)
     last_edit: float = 0.0
     dirty: bool = True
     published: bool = False
@@ -167,6 +169,8 @@ class GatewayApp:
         self._backend_reload_lock = threading.RLock()
         self._bot_local = threading.local()
         self._codex_active_turns: dict[str, str] = {}
+        self._turn_claims: set[str] = set()
+        self._drain_threads: dict[str, int] = {}
         self._pending_codex_compactions: dict[str, str] = {}
         self._codex_compaction_turns: dict[tuple[str, str], str] = {}
         self._turns: dict[tuple[str, str], TurnView] = {}
@@ -703,9 +707,14 @@ class GatewayApp:
             LOGGER.exception("could not send delete confirmation")
 
     def _session_is_busy(self, session: CliSession) -> bool:
+        with self._state_lock:
+            return self._session_is_busy_locked(session)
+
+    def _session_is_busy_locked(self, session: CliSession) -> bool:
+        if session.session_id in self._turn_claims:
+            return True
         if session.backend == "codex-app-server" and session.external_id:
-            with self._state_lock:
-                return bool(self._codex_active_turns.get(session.external_id))
+            return bool(self._codex_active_turns.get(session.external_id))
         return self.headless.is_active(session.session_id)
 
     def _set_session_state(self, session_id: str, state: str) -> None:
@@ -753,9 +762,7 @@ class GatewayApp:
                 if view.bot_key != bot_key:
                     continue
                 # CLI 已结束但终态尚未发布：强制下一轮在底部发新卡片。
-                if view.message_id is not None and view.message_id > 0:
-                    view.stale_message_ids.append(view.message_id)
-                view.message_id = None
+                self._abandon_view_cards(view)
                 view.dirty = True
         if rendered is not None:
             try:
@@ -1393,74 +1400,34 @@ class GatewayApp:
         if session.cli not in self.config.enabled_clis:
             self._send(chat_id, f"此 Bot 未启用 {session.cli}，不能继续该会话。")
             return
-        if self._session_is_busy(session):
-            if session.backend == "codex-app-server" and session.external_id:
-                with self._state_lock:
-                    active_turn = self._codex_active_turns.get(session.external_id)
-                    active_view = (
-                        self._turns.get((session.session_id, active_turn))
-                        if active_turn and active_turn != "starting"
-                        else None
-                    )
-                # Steering keeps the active turn's immutable reply route. A message
-                # from another Bot must therefore become its own queued turn, or its
-                # answer would appear only in the Bot that started the active turn.
-                if active_view and active_view.bot_key == bot_key:
-                    try:
-                        returned = self.codex.steer_turn(
-                            session.external_id, active_turn, text, attachments
-                        )
-                        if returned != active_turn:
-                            raise CodexBackendError("turn/steer returned a different turn ID")
-                        with self._state_lock:
-                            view = self._turns.get((session.session_id, active_turn))
-                            if view:
-                                view.steered += 1
-                                view.dirty = True
-                        self._send(chat_id, f"已追加到 {session.label} 当前任务。")
-                        with self._state_lock:
-                            # The acknowledgement is newer than the existing progress
-                            # card. Rotate the message pointer immediately so the next
-                            # stream update cannot land on the original card.
-                            if view and view.status == "running":
-                                view.live = False
-                        if view:
-                            now = time.monotonic()
-                            try:
-                                pinned = self._pin_turn(view, now)
-                            except TelegramError as exc:
-                                with self._state_lock:
-                                    delay = self._schedule_publish_retry(view, exc, now)
-                                LOGGER.warning(
-                                    "could not re-pin Telegram message for %s after steering; "
-                                    "retrying in %.1fs: %s",
-                                    view.session.session_id,
-                                    delay,
-                                    exc,
-                                )
-                            else:
-                                if pinned:
-                                    with self._state_lock:
-                                        view.last_edit = now
-                                        view.publish_failures = 0
-                                        view.next_publish_at = 0.0
-                        return
-                    except CodexBackendError as exc:
-                        LOGGER.warning("Codex steer failed; queued instead: %s", exc)
-            position = self._enqueue(
-                session,
-                PendingInput(
-                    chat_id, text, attachments, bot_key=bot_key
-                ),
-            )
-            if position is None:
-                self._send(
-                    chat_id,
-                    f"{session.label} 的等待队列已满（最多 {MAX_PENDING_INPUTS_PER_SESSION} 条）。",
+        if session.backend == "codex-app-server" and session.external_id:
+            with self._state_lock:
+                active_turn = self._codex_active_turns.get(session.external_id)
+                active_view = (
+                    self._turns.get((session.session_id, active_turn))
+                    if active_turn and active_turn != "starting"
+                    else None
                 )
-            else:
-                self._send(chat_id, f"{session.label} 正在运行；已加入队列（第 {position} 条）。")
-            return
+            # Steering keeps the active turn's immutable reply route. A message
+            # from another Bot must therefore become its own queued turn, or its
+            # answer would appear only in the Bot that started the active turn.
+            if active_view and active_view.bot_key == bot_key:
+                try:
+                    returned = self.codex.steer_turn(
+                        session.external_id, active_turn, text, attachments
+                    )
+                    if returned != active_turn:
+                        raise CodexBackendError("turn/steer returned a different turn ID")
+                    with self._state_lock:
+                        view = self._turns.get((session.session_id, active_turn))
+                        if view:
+                            view.steered += 1
+                            view.dirty = True
+                    if view:
+                        self._refresh_running_turn(view)
+                    return
+                except CodexBackendError as exc:
+                    LOGGER.warning("Codex steer failed; queued instead: %s", exc)
         self._start_session_turn(chat_id, session, text, attachments)
 
     def _enqueue(self, session: CliSession, pending: PendingInput) -> int | None:
@@ -1471,17 +1438,64 @@ class GatewayApp:
             queue_for_session.append(pending)
             return len(queue_for_session)
 
+    def _finish_turn(
+        self,
+        session: CliSession,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
+        """Release the session claim, or keep it and start the next queued turn.
+
+        Busy is cleared in the same lock as the queue check so a concurrent user
+        message cannot start a second overlapping turn.
+        """
+        with self._state_lock:
+            has_next = bool(self._queues.get(session.session_id))
+            if thread_id is not None:
+                current = self._codex_active_turns.get(thread_id)
+                if current == turn_id or current == "starting" or turn_id is None:
+                    if has_next:
+                        self._codex_active_turns[thread_id] = "starting"
+                    else:
+                        self._codex_active_turns.pop(thread_id, None)
+            if has_next:
+                self._turn_claims.add(session.session_id)
+            else:
+                self._turn_claims.discard(session.session_id)
+        if not has_next:
+            return
+        if session.backend == "codex-app-server":
+            threading.Thread(
+                target=self._start_next_queued,
+                args=(session,),
+                name=f"queue-{session.session_id}",
+                daemon=True,
+            ).start()
+            return
+        self._start_next_queued(session)
+
     def _start_next_queued(self, session: CliSession) -> None:
         with self._state_lock:
             queue_for_session = self._queues.get(session.session_id)
             pending = queue_for_session.popleft() if queue_for_session else None
             if queue_for_session is not None and not queue_for_session:
                 self._queues.pop(session.session_id, None)
+            if pending:
+                self._turn_claims.add(session.session_id)
+                self._drain_threads[session.session_id] = threading.get_ident()
+                if session.backend == "codex-app-server" and session.external_id:
+                    self._codex_active_turns[session.external_id] = "starting"
+            else:
+                self._turn_claims.discard(session.session_id)
         if pending:
-            with self._bot_scope(pending.bot_key):
-                self._start_session_turn(
-                    pending.chat_id, session, pending.text, pending.attachments
-                )
+            try:
+                with self._bot_scope(pending.bot_key):
+                    self._start_session_turn(
+                        pending.chat_id, session, pending.text, pending.attachments
+                    )
+            finally:
+                with self._state_lock:
+                    self._drain_threads.pop(session.session_id, None)
 
     def _start_session_turn(
         self,
@@ -1491,8 +1505,43 @@ class GatewayApp:
         attachments: tuple[Attachment, ...] = (),
         bot_key: str | None = None,
     ) -> None:
+        queued_notice: str | None = None
+        with self._state_lock:
+            draining = self._drain_threads.get(session.session_id) == threading.get_ident()
+            if not draining:
+                if self._session_is_busy_locked(session):
+                    pending = PendingInput(
+                        chat_id,
+                        text,
+                        attachments,
+                        bot_key=bot_key or self._active_bot_key(),
+                    )
+                    position = self._enqueue(session, pending)
+                    if position is None:
+                        queued_notice = (
+                            f"{session.label} 的等待队列已满（最多 {MAX_PENDING_INPUTS_PER_SESSION} 条）。"
+                        )
+                    else:
+                        queued_notice = (
+                            f"{session.label} 正在运行；已加入队列（第 {position} 条）。"
+                        )
+                else:
+                    self._turn_claims.add(session.session_id)
+                    if session.backend == "codex-app-server" and session.external_id:
+                        self._codex_active_turns[session.external_id] = "starting"
+        if queued_notice is not None:
+            self._send(chat_id, queued_notice)
+            return
         with self._backend_reload_lock:
-            self._start_session_turn_locked(chat_id, session, text, attachments, bot_key)
+            try:
+                self._start_session_turn_locked(chat_id, session, text, attachments, bot_key)
+            except Exception:
+                self._finish_turn(
+                    session,
+                    session.external_id if session.backend == "codex-app-server" else None,
+                    "starting",
+                )
+                raise
 
     def _start_session_turn_locked(
         self,
@@ -1509,6 +1558,11 @@ class GatewayApp:
                 f"此 Bot 未启用 {session.cli}，不能启动任务。",
                 bot_key,
             )
+            self._finish_turn(
+                session,
+                session.external_id if session.backend == "codex-app-server" else None,
+                "starting",
+            )
             return
         try:
             self._telegram(bot_key).send_action(chat_id)
@@ -1518,18 +1572,13 @@ class GatewayApp:
             if session.backend == "codex-app-server" and session.external_id:
                 with self._state_lock:
                     self._codex_active_turns[session.external_id] = "starting"
-                try:
-                    turn_id = self.codex.start_turn(
-                        session.external_id,
-                        text,
-                        attachments,
-                        model=self._effective_model(session),
-                        effort=self._effective_effort(session),
-                    )
-                except Exception:
-                    with self._state_lock:
-                        self._codex_active_turns.pop(session.external_id, None)
-                    raise
+                turn_id = self.codex.start_turn(
+                    session.external_id,
+                    text,
+                    attachments,
+                    model=self._effective_model(session),
+                    effort=self._effective_effort(session),
+                )
                 with self._state_lock:
                     self._codex_active_turns[session.external_id] = turn_id
                 self._register_turn(session, turn_id, bot_key)
@@ -1551,26 +1600,54 @@ class GatewayApp:
             self._set_session_state(session.session_id, STATE_WORKING)
         except (CodexBackendError, HeadlessBackendError, SessionError) as exc:
             self._send(chat_id, f"发送失败：{exc}", bot_key)
+            self._finish_turn(
+                session,
+                session.external_id if session.backend == "codex-app-server" else None,
+                "starting",
+            )
 
     def _register_turn(
         self, session: CliSession, turn_id: str, bot_key: str | None = None
     ) -> TurnView:
         key = (session.session_id, turn_id)
         with self._state_lock:
-            view = self._turns.setdefault(
-                key,
-                TurnView(
-                    session=session,
-                    turn_id=turn_id,
-                    bot_key=bot_key or self._active_bot_key(),
-                ),
+            existing = self._turns.get(key)
+            if existing is not None:
+                if bot_key is not None:
+                    existing.bot_key = bot_key
+                return existing
+            running = [
+                (old_key, view)
+                for old_key, view in self._turns.items()
+                if old_key[0] == session.session_id and view.status == "running"
+            ]
+            if running:
+                _old_key, view = min(running, key=lambda item: item[1].started_at)
+                if view.turn_id != turn_id:
+                    self._turns.pop((session.session_id, view.turn_id), None)
+                    view.turn_id = turn_id
+                    self._turns[key] = view
+                if bot_key is not None:
+                    view.bot_key = bot_key
+                return view
+            view = TurnView(
+                session=session,
+                turn_id=turn_id,
+                bot_key=bot_key or self._active_bot_key(),
             )
-            if bot_key is not None:
-                view.bot_key = bot_key
+            self._turns[key] = view
             return view
 
     def _update_turn(self, session: CliSession, turn_id: str, kind: str, data: Any = None) -> None:
-        view = self._register_turn(session, turn_id)
+        view = self._turns.get((session.session_id, turn_id))
+        if view is None:
+            with self._state_lock:
+                running = [
+                    candidate
+                    for (session_id, _candidate_turn), candidate in self._turns.items()
+                    if session_id == session.session_id and candidate.status == "running"
+                ]
+            view = running[0] if len(running) == 1 else self._register_turn(session, turn_id)
         with self._state_lock:
             if kind == "delta" and isinstance(data, str):
                 view.parts.append(data)
@@ -1585,12 +1662,16 @@ class GatewayApp:
             elif kind == "completed":
                 view.status = "completed"
                 self.sessions.clear_in_flight(session.session_id, turn_id)
+                if view.turn_id != turn_id:
+                    self.sessions.clear_in_flight(session.session_id, view.turn_id)
                 self._interrupted_sessions.discard(session.session_id)
                 self._set_session_state(session.session_id, STATE_IDLE)
             elif kind == "error":
                 view.status = "failed"
                 view.error = self._display_value(data)[:2000]
                 self.sessions.clear_in_flight(session.session_id, turn_id)
+                if view.turn_id != turn_id:
+                    self.sessions.clear_in_flight(session.session_id, view.turn_id)
                 if session.session_id in self._interrupted_sessions:
                     # 用户主动中断：不显示为失败，恢复空闲
                     self._interrupted_sessions.discard(session.session_id)
@@ -1651,7 +1732,7 @@ class GatewayApp:
         if session:
             self._update_turn(session, turn_id, kind, data)
             if kind in {"completed", "error"}:
-                self._start_next_queued(session)
+                self._finish_turn(session)
 
     def _on_codex_notification(self, method: str, params: dict[str, Any]) -> None:
         thread_id = params.get("threadId")
@@ -1688,15 +1769,8 @@ class GatewayApp:
             # through the default Bot.
             if method == "turn/completed":
                 with self._state_lock:
-                    if self._codex_active_turns.get(thread_id) == turn_id:
-                        self._codex_active_turns.pop(thread_id, None)
                     self._codex_compaction_turns.pop(compaction_key, None)
-                threading.Thread(
-                    target=self._start_next_queued,
-                    args=(session,),
-                    name=f"queue-{session.session_id}",
-                    daemon=True,
-                ).start()
+                self._finish_turn(session, thread_id, turn_id)
             return
         if method == "item/agentMessage/delta":
             self._update_turn(session, turn_id, "delta", params.get("delta"))
@@ -1716,19 +1790,12 @@ class GatewayApp:
             turn = params.get("turn")
             status = turn.get("status") if isinstance(turn, dict) else None
             error = turn.get("error") if isinstance(turn, dict) else None
-            with self._state_lock:
-                self._codex_active_turns.pop(thread_id, None)
             if status == "failed" or error:
                 detail = error.get("message") if isinstance(error, dict) else error
                 self._update_turn(session, turn_id, "error", detail or "Codex task failed")
             else:
                 self._update_turn(session, turn_id, "completed")
-            threading.Thread(
-                target=self._start_next_queued,
-                args=(session,),
-                name=f"queue-{session.session_id}",
-                daemon=True,
-            ).start()
+            self._finish_turn(session, thread_id, turn_id)
         elif method == "error":
             self._update_turn(session, turn_id, "error", params.get("message") or params.get("error"))
 
@@ -1803,6 +1870,68 @@ class GatewayApp:
             sections.append(f"错误：\n```text\n{error}\n```")
         return "\n\n".join(sections), answer
 
+    def _view_card_ids(self, view: TurnView) -> list[int]:
+        ids = [message_id for message_id in view.message_ids if message_id > 0]
+        if not ids and view.message_id is not None and view.message_id > 0:
+            ids = [view.message_id]
+        return ids
+
+    def _abandon_view_cards(self, view: TurnView) -> None:
+        for message_id in self._view_card_ids(view):
+            if message_id not in view.stale_message_ids:
+                view.stale_message_ids.append(message_id)
+        view.message_id = None
+        view.message_ids = []
+
+    def _apply_published_ids(self, view: TurnView, ids: list[int] | None) -> None:
+        if not ids:
+            return
+        published = [message_id for message_id in ids if isinstance(message_id, int) and message_id > 0]
+        if not published:
+            return
+        leftover = [message_id for message_id in view.message_ids if message_id not in published]
+        for message_id in leftover:
+            if message_id not in view.stale_message_ids:
+                view.stale_message_ids.append(message_id)
+        view.message_ids = published
+        view.message_id = published[0]
+        for message_id in published:
+            self.sessions.bind_message(
+                view.session.chat_id,
+                message_id,
+                view.session.session_id,
+                view.bot_key,
+            )
+
+    def _refresh_running_turn(self, view: TurnView) -> None:
+        if view.status != "running":
+            return
+        if view.message_id is None or view.message_id <= 0:
+            view.dirty = True
+            return
+        now = time.monotonic()
+        rendered, _ = self._render_turn(view, now)
+        try:
+            with self._publish_lock:
+                self._publish_running_turn(view, rendered)
+        except TelegramError as exc:
+            with self._state_lock:
+                delay = self._schedule_publish_retry(view, exc, now)
+            LOGGER.warning(
+                "could not refresh Telegram message for %s after steering; "
+                "retrying in %.1fs: %s",
+                view.session.session_id,
+                delay,
+                exc,
+            )
+            return
+        with self._state_lock:
+            view.last_edit = now
+            view.publish_failures = 0
+            view.next_publish_at = 0.0
+            view.dirty = False
+            view.published = True
+
     def _pin_turn(self, view: TurnView, now: float) -> bool:
         """把当前 session 的运行进度钉到一条新的底部消息上并开始直播。
 
@@ -1819,40 +1948,41 @@ class GatewayApp:
                     or current.session_id != view.session.session_id
                 ):
                     return False
-                old_id = view.message_id if view.message_id and view.message_id > 0 else None
-                if old_id is not None:
-                    view.stale_message_ids.append(old_id)
-                view.message_id = None
+                old_ids = self._view_card_ids(view)
+                self._abandon_view_cards(view)
                 view.dirty = True
             rendered, _ = self._render_turn(view, now)
             self._publish_running_turn(view, rendered)
             with self._state_lock:
                 view.live = True
-            if old_id is not None:
+            if old_ids:
                 stamp, _ = self._render_turn(view, now, background=True)
-                try:
-                    if view.rich_mode:
-                        self._telegram(view.bot_key).edit_rich_markdown(
-                            view.session.chat_id, old_id, stamp
+                stamp = self._one_card_text(stamp, view.rich_mode)
+                for old_id in old_ids:
+                    try:
+                        if view.rich_mode:
+                            self._telegram(view.bot_key).edit_rich_markdown(
+                                view.session.chat_id, old_id, stamp
+                            )
+                        else:
+                            self._telegram(view.bot_key).edit_markdown(
+                                view.session.chat_id, old_id, stamp
+                            )
+                    except TelegramError as exc:
+                        if exc.retry_after is not None:
+                            raise
+                        LOGGER.warning(
+                            "could not stamp old progress card %s for %s: %s",
+                            old_id,
+                            view.session.session_id,
+                            exc,
                         )
-                    else:
-                        self._telegram(view.bot_key).edit_markdown(
-                            view.session.chat_id, old_id, stamp
-                        )
-                except TelegramError as exc:
-                    if exc.retry_after is not None:
-                        raise
-                    LOGGER.warning(
-                        "could not stamp old progress card %s for %s: %s",
-                        old_id,
-                        view.session.session_id,
-                        exc,
-                    )
             return True
 
     def _background_turn(self, view: TurnView, now: float) -> None:
         """切换走时把当前卡片定格为“后台运行中”，停止周期刷新。"""
         rendered, _ = self._render_turn(view, now, background=True)
+        rendered = self._one_card_text(rendered, view.rich_mode)
         if view.message_id is not None and view.message_id > 0:
             try:
                 if view.rich_mode:
@@ -1894,28 +2024,103 @@ class GatewayApp:
             except TelegramError:
                 LOGGER.warning("could not resolve stale progress card %s", message_id)
 
+    @staticmethod
+    def _one_card_text(rendered: str, rich: bool) -> str:
+        chunks = split_rich_markdown(rendered) if rich else split_markdown(rendered)
+        return chunks[0] if chunks else rendered
+
+    def _send_turn_cards(
+        self,
+        view: TurnView,
+        rendered: str,
+        reply_markup: dict[str, Any] | None = None,
+        *,
+        rich: bool,
+        max_chunks: int | None = None,
+    ) -> list[int]:
+        client = self._telegram(view.bot_key)
+        send = client.send_rich_markdown if rich else client.send_markdown
+        original = (
+            TelegramClient.send_rich_markdown if rich else TelegramClient.send_markdown
+        )
+        if getattr(send, "__func__", None) is original:
+            parts = (
+                client.send_rich_markdown_parts if rich else client.send_markdown_parts
+            )
+            ids = parts(
+                view.session.chat_id,
+                rendered,
+                reply_markup=reply_markup,
+                max_chunks=max_chunks,
+            )
+            return [item for item in ids if isinstance(item, int) and item > 0]
+        try:
+            message_id = send(
+                view.session.chat_id,
+                rendered,
+                reply_markup=reply_markup,
+                max_chunks=max_chunks,
+            )
+        except TypeError:
+            try:
+                message_id = send(
+                    view.session.chat_id, rendered, reply_markup=reply_markup
+                )
+            except TypeError:
+                message_id = send(view.session.chat_id, rendered)
+        return [message_id] if isinstance(message_id, int) and message_id > 0 else []
+
+    def _edit_turn_cards(
+        self,
+        view: TurnView,
+        rendered: str,
+        reply_markup: dict[str, Any] | None = None,
+        *,
+        rich: bool,
+        allow_split: bool,
+    ) -> list[int]:
+        client = self._telegram(view.bot_key)
+        extra_ids = view.message_ids[1:]
+        edit = client.edit_rich_markdown if rich else client.edit_markdown
+        kwargs: dict[str, Any] = {}
+        if extra_ids:
+            kwargs["extra_message_ids"] = extra_ids
+        if not allow_split:
+            kwargs["allow_split"] = False
+        try:
+            ids = edit(
+                view.session.chat_id,
+                view.message_id,
+                rendered,
+                reply_markup=reply_markup,
+                **kwargs,
+            )
+        except TypeError:
+            ids = edit(
+                view.session.chat_id,
+                view.message_id,
+                rendered,
+                reply_markup=reply_markup,
+            )
+        if isinstance(ids, list):
+            return [item for item in ids if isinstance(item, int) and item > 0]
+        return []
+
     def _publish_running_turn(self, view: TurnView, rendered: str) -> None:
         # Stream by editing one persistent message in place. Telegram Rich Message
         # Drafts cannot be finalized or removed by the gateway once interrupted,
         # leaving an eternal "loading" bubble in the chat, so they are not used.
+        rendered = self._one_card_text(rendered, view.rich_mode)
         if view.rich_mode:
             try:
                 if view.message_id is None:
-                    message_id = self._telegram(view.bot_key).send_rich_markdown(
-                        view.session.chat_id, rendered
-                    )
-                    view.message_id = message_id if message_id is not None else 0
-                    if message_id is not None:
-                        self.sessions.bind_message(
-                            view.session.chat_id,
-                            message_id,
-                            view.session.session_id,
-                            view.bot_key,
-                        )
+                    ids = self._send_turn_cards(view, rendered, rich=True, max_chunks=1)
+                    if ids:
+                        self._apply_published_ids(view, ids)
+                    else:
+                        view.message_id = 0
                 elif view.message_id > 0:
-                    self._telegram(view.bot_key).edit_rich_markdown(
-                        view.session.chat_id, view.message_id, rendered
-                    )
+                    self._edit_turn_cards(view, rendered, rich=True, allow_split=False)
                 view.published = True
                 return
             except TelegramError as exc:
@@ -1927,22 +2132,15 @@ class GatewayApp:
                     view.session.session_id,
                     exc,
                 )
+                rendered = self._one_card_text(rendered, False)
         if view.message_id is None:
-            message_id = self._telegram(view.bot_key).send_markdown(
-                view.session.chat_id, rendered
-            )
-            view.message_id = message_id if message_id is not None else 0
-            if message_id is not None:
-                self.sessions.bind_message(
-                    view.session.chat_id,
-                    message_id,
-                    view.session.session_id,
-                    view.bot_key,
-                )
+            ids = self._send_turn_cards(view, rendered, rich=False, max_chunks=1)
+            if ids:
+                self._apply_published_ids(view, ids)
+            else:
+                view.message_id = 0
         elif view.message_id > 0:
-            self._telegram(view.bot_key).edit_markdown(
-                view.session.chat_id, view.message_id, rendered
-            )
+            self._edit_turn_cards(view, rendered, rich=False, allow_split=False)
         view.published = True
 
     def _publish_final_turn(
@@ -1956,24 +2154,15 @@ class GatewayApp:
             markup = None
         try:
             if view.message_id is not None and view.message_id > 0:
-                self._telegram(view.bot_key).edit_rich_markdown(
-                    view.session.chat_id,
-                    view.message_id,
-                    rendered,
-                    reply_markup=markup,
+                ids = self._edit_turn_cards(
+                    view, rendered, markup, rich=True, allow_split=True
                 )
             else:
-                message_id = self._telegram(view.bot_key).send_rich_markdown(
-                    view.session.chat_id, rendered, reply_markup=markup
-                )
-                view.message_id = message_id if message_id is not None else 0
-            if view.message_id and view.message_id > 0:
-                self.sessions.bind_message(
-                    view.session.chat_id,
-                    view.message_id,
-                    view.session.session_id,
-                    view.bot_key,
-                )
+                ids = self._send_turn_cards(view, rendered, markup, rich=True)
+            if ids:
+                self._apply_published_ids(view, ids)
+            elif view.message_id is None:
+                view.message_id = 0
             view.published = True
             if with_artifacts:
                 self._auto_send_artifacts(view)
@@ -1987,21 +2176,15 @@ class GatewayApp:
                 exc,
             )
         if view.message_id is not None and view.message_id > 0:
-            self._telegram(view.bot_key).edit_markdown(
-                view.session.chat_id, view.message_id, rendered, reply_markup=markup
+            ids = self._edit_turn_cards(
+                view, rendered, markup, rich=False, allow_split=True
             )
         else:
-            message_id = self._telegram(view.bot_key).send_markdown(
-                view.session.chat_id, rendered, reply_markup=markup
-            )
-            view.message_id = message_id if message_id is not None else 0
-        if view.message_id and view.message_id > 0:
-            self.sessions.bind_message(
-                view.session.chat_id,
-                view.message_id,
-                view.session.session_id,
-                view.bot_key,
-            )
+            ids = self._send_turn_cards(view, rendered, markup, rich=False)
+        if ids:
+            self._apply_published_ids(view, ids)
+        elif view.message_id is None:
+            view.message_id = 0
         view.published = True
         if with_artifacts:
             self._auto_send_artifacts(view)

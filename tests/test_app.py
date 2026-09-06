@@ -1529,26 +1529,118 @@ class GatewayEventTests(unittest.TestCase):
             app.telegram.send_rich_markdown = (  # type: ignore[method-assign]
                 lambda _chat, markdown, reply_markup=None: rich_sent.append(markdown) or 42
             )
-            edited: list[int] = []
+            edited: list[tuple[int, str]] = []
             app.telegram.edit_rich_markdown = (  # type: ignore[method-assign]
-                lambda _chat, message_id, _markdown, reply_markup=None: edited.append(
-                    message_id
+                lambda _chat, message_id, markdown, reply_markup=None: edited.append(
+                    (message_id, markdown)
                 )
             )
             app._send_to_session(1, session, "change direction")
             self.assertEqual(steered, [("thread-1", "turn-1", "change direction")])
             self.assertNotIn(session.session_id, app._queues)
-            self.assertEqual(sent, [f"已追加到 {session.label} 当前任务。"])
+            self.assertEqual(sent, [])
             self.assertEqual(view.steered, 1)
-            self.assertTrue(view.dirty)
             self.assertTrue(view.live)
-            self.assertEqual(view.message_id, 42)
-            self.assertEqual(view.stale_message_ids, [41])
-            self.assertEqual(len(rich_sent), 1)
-            self.assertEqual(edited, [41])
+            self.assertEqual(view.message_id, 41)
+            self.assertEqual(view.stale_message_ids, [])
+            self.assertEqual(rich_sent, [])
+            self.assertEqual(len(edited), 1)
+            self.assertEqual(edited[0][0], 41)
+            self.assertIn("已追加 1 次", edited[0][1])
 
             app._publish_running_turn(view, "latest update")
-            self.assertEqual(edited, [41, 42])
+            self.assertEqual([item[0] for item in edited], [41, 41])
+            self.assertEqual(view.message_id, 41)
+
+    def test_codex_turn_started_reuses_running_view_instead_of_second_card(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-1"
+            )
+            view = app._register_turn(session, "turn-1")
+            view.message_id = 41
+            app._codex_active_turns["thread-1"] = "turn-1"
+            app._on_codex_notification(
+                "turn/started", {"threadId": "thread-1", "turn": {"id": "turn-2"}}
+            )
+            self.assertEqual(view.turn_id, "turn-2")
+            self.assertEqual(app._turns[(session.session_id, "turn-2")], view)
+            self.assertNotIn((session.session_id, "turn-1"), app._turns)
+            app._on_codex_notification(
+                "item/agentMessage/delta",
+                {"threadId": "thread-1", "turnId": "turn-1", "delta": "hello"},
+            )
+            self.assertEqual("".join(view.parts), "hello")
+            self.assertEqual(len([item for item in app._turns if item[0] == session.session_id]), 1)
+
+    def test_start_session_turn_while_busy_enqueues_instead_of_second_codex_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-1"
+            )
+            app._codex_active_turns["thread-1"] = "turn-1"
+            app._turn_claims.add(session.session_id)
+            started: list[str] = []
+            app.codex.start_turn = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: started.append("started") or "turn-2"
+            )
+            sent: list[str] = []
+            app._send = lambda _chat, text, _bot=None: sent.append(text)  # type: ignore[method-assign]
+            app._start_session_turn(1, session, "sneak")
+            self.assertEqual(started, [])
+            self.assertEqual(len(app._queues[session.session_id]), 1)
+            self.assertIn("已加入队列", sent[0])
+
+    def test_turn_completion_keeps_busy_until_queued_start_begins(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-1"
+            )
+            app._codex_active_turns["thread-1"] = "turn-1"
+            app._turn_claims.add(session.session_id)
+            app._register_turn(session, "turn-1")
+            app._enqueue(session, PendingInput(1, "queued-next"))
+            started = threading.Event()
+            release = threading.Event()
+            turns: list[str] = []
+
+            def blocking_start(_thread, text, *_args, **_kwargs):
+                turns.append(text)
+                started.set()
+                self.assertTrue(release.wait(5))
+                return "turn-2"
+
+            app.codex.start_turn = blocking_start  # type: ignore[method-assign]
+            app._send = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+            app._on_codex_notification(
+                "turn/completed",
+                {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}},
+            )
+            self.assertTrue(started.wait(5))
+            self.assertIn(session.session_id, app._turn_claims)
+            sneak_started: list[str] = []
+            original_start = app.codex.start_turn
+
+            def tracking_start(_thread, text, *_args, **_kwargs):
+                sneak_started.append(text)
+                return "turn-3"
+
+            app.codex.start_turn = tracking_start  # type: ignore[method-assign]
+            app._send_to_session(1, session, "sneak")
+            self.assertEqual(sneak_started, [])
+            self.assertEqual(app._queues[session.session_id][0].text, "sneak")
+            app.codex.start_turn = original_start  # type: ignore[method-assign]
+            release.set()
+            deadline = time.monotonic() + 5
+            while app._codex_active_turns.get("thread-1") == "starting" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(turns, ["queued-next"])
 
     def test_busy_codex_queues_input_from_another_bot_with_its_reply_route(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

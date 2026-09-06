@@ -200,9 +200,24 @@ class TelegramClient:
         chat_id: int,
         markdown: str,
         reply_markup: dict[str, Any] | None = None,
+        max_chunks: int | None = None,
     ) -> int | None:
-        last_message_id: int | None = None
+        ids = self.send_markdown_parts(
+            chat_id, markdown, reply_markup=reply_markup, max_chunks=max_chunks
+        )
+        return ids[-1] if ids else None
+
+    def send_markdown_parts(
+        self,
+        chat_id: int,
+        markdown: str,
+        reply_markup: dict[str, Any] | None = None,
+        max_chunks: int | None = None,
+    ) -> list[int]:
         chunks = split_markdown(markdown)
+        if max_chunks is not None:
+            chunks = chunks[: max(0, max_chunks)]
+        ids: list[int] = []
         for index, chunk in enumerate(chunks):
             html_text = markdown_to_telegram_html(chunk)
             payload: dict[str, Any] = {
@@ -224,17 +239,32 @@ class TelegramClient:
             if isinstance(result, dict):
                 message_id = result.get("message_id")
                 if isinstance(message_id, int):
-                    last_message_id = message_id
-        return last_message_id
+                    ids.append(message_id)
+        return ids
 
     def send_rich_markdown(
         self,
         chat_id: int,
         markdown: str,
         reply_markup: dict[str, Any] | None = None,
+        max_chunks: int | None = None,
     ) -> int | None:
-        last_message_id: int | None = None
+        ids = self.send_rich_markdown_parts(
+            chat_id, markdown, reply_markup=reply_markup, max_chunks=max_chunks
+        )
+        return ids[-1] if ids else None
+
+    def send_rich_markdown_parts(
+        self,
+        chat_id: int,
+        markdown: str,
+        reply_markup: dict[str, Any] | None = None,
+        max_chunks: int | None = None,
+    ) -> list[int]:
         chunks = split_rich_markdown(markdown)
+        if max_chunks is not None:
+            chunks = chunks[: max(0, max_chunks)]
+        ids: list[int] = []
         for index, chunk in enumerate(chunks):
             payload: dict[str, Any] = {
                 "chat_id": chat_id,
@@ -246,8 +276,8 @@ class TelegramClient:
             if isinstance(result, dict):
                 message_id = result.get("message_id")
                 if isinstance(message_id, int):
-                    last_message_id = message_id
-        return last_message_id
+                    ids.append(message_id)
+        return ids
 
     def edit_rich_markdown(
         self,
@@ -255,27 +285,85 @@ class TelegramClient:
         message_id: int,
         markdown: str,
         reply_markup: dict[str, Any] | None = None,
-    ) -> None:
+        *,
+        extra_message_ids: list[int] | None = None,
+        allow_split: bool = True,
+    ) -> list[int]:
         chunks = split_rich_markdown(markdown)
         if not chunks:
-            return
-        payload: dict[str, Any] = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "rich_message": {"markdown": chunks[0]},
-        }
-        if reply_markup is not None and len(chunks) == 1:
-            payload["reply_markup"] = reply_markup
-        try:
-            self._call("editMessageText", payload)
-        except TelegramError as exc:
-            if "message is not modified" not in str(exc).lower():
-                raise
-        for index, chunk in enumerate(chunks[1:], start=1):
-            extra: dict[str, Any] = {"chat_id": chat_id, "rich_message": {"markdown": chunk}}
-            if reply_markup is not None and index == len(chunks) - 1:
-                extra["reply_markup"] = reply_markup
-            self._call("sendRichMessage", extra)
+            return []
+        if not allow_split:
+            chunks = chunks[:1]
+        return self._edit_or_send_chunks(
+            chat_id,
+            message_id,
+            chunks,
+            reply_markup=reply_markup,
+            extra_message_ids=extra_message_ids,
+            rich=True,
+        )
+
+    def _edit_or_send_chunks(
+        self,
+        chat_id: int,
+        message_id: int,
+        chunks: list[str],
+        reply_markup: dict[str, Any] | None,
+        extra_message_ids: list[int] | None,
+        rich: bool,
+    ) -> list[int]:
+        existing = [message_id]
+        for extra_id in extra_message_ids or []:
+            if extra_id > 0 and extra_id not in existing:
+                existing.append(extra_id)
+        used: list[int] = []
+        for index, chunk in enumerate(chunks):
+            markup = reply_markup if index == len(chunks) - 1 else None
+            if index < len(existing):
+                target = existing[index]
+                if rich:
+                    payload: dict[str, Any] = {
+                        "chat_id": chat_id,
+                        "message_id": target,
+                        "rich_message": {"markdown": chunk},
+                    }
+                    if markup is not None:
+                        payload["reply_markup"] = markup
+                    try:
+                        self._call("editMessageText", payload)
+                    except TelegramError as exc:
+                        if "message is not modified" not in str(exc).lower():
+                            raise
+                else:
+                    try:
+                        self.edit_message(
+                            chat_id,
+                            target,
+                            markdown_to_telegram_html(chunk),
+                            reply_markup=markup,
+                            parse_mode="HTML",
+                        )
+                    except TelegramError as exc:
+                        if exc.retry_after is not None:
+                            raise
+                        self.edit_message(chat_id, target, chunk, reply_markup=markup)
+                used.append(target)
+                continue
+            if rich:
+                extra: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "rich_message": {"markdown": chunk},
+                }
+                if markup is not None:
+                    extra["reply_markup"] = markup
+                result = self._call("sendRichMessage", extra)
+            else:
+                sent = self.send_markdown(chat_id, chunk, reply_markup=markup, max_chunks=1)
+                result = {"message_id": sent} if sent is not None else {}
+            new_id = result.get("message_id") if isinstance(result, dict) else None
+            if isinstance(new_id, int):
+                used.append(new_id)
+        return used
 
     def edit_message(
         self,
@@ -307,19 +395,23 @@ class TelegramClient:
         message_id: int,
         markdown: str,
         reply_markup: dict[str, Any] | None = None,
-    ) -> None:
-        try:
-            self.edit_message(
-                chat_id,
-                message_id,
-                markdown_to_telegram_html(markdown),
-                reply_markup=reply_markup,
-                parse_mode="HTML",
-            )
-        except TelegramError as exc:
-            if exc.retry_after is not None:
-                raise
-            self.edit_message(chat_id, message_id, markdown, reply_markup=reply_markup)
+        *,
+        extra_message_ids: list[int] | None = None,
+        allow_split: bool = True,
+    ) -> list[int]:
+        chunks = split_markdown(markdown)
+        if not chunks:
+            return []
+        if not allow_split:
+            chunks = chunks[:1]
+        return self._edit_or_send_chunks(
+            chat_id,
+            message_id,
+            chunks,
+            reply_markup=reply_markup,
+            extra_message_ids=extra_message_ids,
+            rich=False,
+        )
 
     def edit_message_markup(
         self,
