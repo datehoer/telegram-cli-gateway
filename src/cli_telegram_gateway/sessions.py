@@ -523,12 +523,49 @@ class SessionManager:
                 return None
             return session
 
+    def command_route_for_message(
+        self, chat_id: int, message_id: int, bot_key: str = "default"
+    ) -> str | None:
+        """返回直连命令结果卡片对应的 turn_id。
+
+        命令卡片用 ``command_routes`` 与 CLI 会话卡片分开路由：回复一张命令卡片
+        不应该把消息送进当前 CLI 会话。条目有界，并且随命令结束删除。
+        """
+        with self._lock:
+            route = self._message_key(chat_id, message_id, bot_key)
+            turn_id = self._state.get("command_routes", {}).get(route)
+            return str(turn_id) if turn_id else None
+
+    def bind_command_message(
+        self, chat_id: int, message_id: int, turn_id: str, bot_key: str = "default"
+    ) -> None:
+        with self._lock:
+            routes = self._state.setdefault("command_routes", {})
+            routes[self._message_key(chat_id, message_id, bot_key)] = turn_id
+            if len(routes) > 2000:
+                for key in list(routes)[: len(routes) - 2000]:
+                    routes.pop(key, None)
+            self._save_state()
+
+    def unbind_command_messages(
+        self, chat_id: int, bot_key: str, message_ids: list[int]
+    ) -> None:
+        with self._lock:
+            routes = self._state.get("command_routes", {})
+            if not routes:
+                return
+            for message_id in message_ids:
+                routes.pop(self._message_key(chat_id, message_id, bot_key), None)
+            self._save_state()
+
     def register_artifact(
         self,
         chat_id: int,
         session_id: str,
         path: Path,
         bot_key: str = "default",
+        *,
+        only_path: bool = False,
     ) -> str:
         with self._lock:
             token = secrets.token_hex(6)
@@ -538,6 +575,8 @@ class SessionManager:
                 "session_id": session_id,
                 "path": str(path),
                 "bot_key": bot_key,
+                # 超过发送上限的产物只能回路径，不能当文件发。
+                "only_path": bool(only_path),
             }
             if len(artifacts) > 500:
                 for key in list(artifacts)[: len(artifacts) - 500]:
@@ -602,7 +641,12 @@ class SessionManager:
 
     def resolve_artifact(
         self, chat_id: int, token: str, bot_key: str = "default"
-    ) -> tuple[CliSession, Path] | None:
+    ) -> tuple[CliSession | None, Path] | None:
+        """按 token 取回本地产物，并校验它属于这个聊天和入口。
+
+        会话可以是 None：直连命令扩展的产物挂在 turn_id 上，没有对应的 CLI
+        会话。所有权已经由 chat_id + bot_key 保证，不需要会话存在。
+        """
         with self._lock:
             raw = self._state.get("artifacts", {}).get(token)
             if not isinstance(raw, dict) or int(raw.get("chat_id", -1)) != chat_id:
@@ -611,7 +655,7 @@ class SessionManager:
                 return None
             session = self._session_from_state(str(raw.get("session_id", "")))
             path = raw.get("path")
-            if not session or not isinstance(path, str):
+            if not isinstance(path, str):
                 return None
             return session, Path(path)
 

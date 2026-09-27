@@ -83,7 +83,7 @@ class ConfigTests(unittest.TestCase):
                 "CLI_GROK": "/bin/sh",
                 "CLI_PI": "/bin/sh",
             }
-            for mode, expected in (("off", "off"), ("images", "images"), ("all", "all"), ("", "images")):
+            for mode, expected in (("off", "off"), ("images", "images"), ("all", "all"), ("", "off")):
                 values = dict(base_env)
                 if mode:
                     values["AUTO_SEND_ARTIFACTS"] = mode

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
@@ -52,8 +53,8 @@ def _positive_float(values: dict[str, str], key: str, default: float) -> float:
         value = float(values.get(key, str(default)))
     except ValueError as exc:
         raise ConfigError(f"{key} must be a number") from exc
-    if value <= 0:
-        raise ConfigError(f"{key} must be positive")
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(f"{key} must be finite and positive")
     return value
 
 
@@ -88,12 +89,23 @@ class Config:
     tmux_socket_name: str
     enabled_clis: tuple[str, ...] = ("claude", "codex", "grok", "pi")
     stream_update_interval: float = 10.0
-    telegram_max_file_bytes: int = 20 * 1024 * 1024
-    auto_send_artifacts: str = "images"
+    telegram_max_file_bytes: int = 45 * 1024 * 1024
+    auto_send_artifacts: str = "off"
     auto_resume: bool = False
     bot_tokens: tuple[tuple[str, str], ...] = ()
     cli_default_models: dict[str, str] = field(default_factory=dict)
     cli_default_efforts: dict[str, str] = field(default_factory=dict)
+    command_dir: Path | None = None
+
+    @property
+    def direct_command_roots(self) -> tuple[Path, ...]:
+        """直连命令扩展的扫描目录。缺失的目录直接跳过。"""
+        roots = [
+            root
+            for root in (self.command_dir, self.project_dir / "extensions")
+            if root is not None and root.is_dir()
+        ]
+        return tuple(dict.fromkeys(roots))
 
     @property
     def telegram_bots(self) -> tuple[tuple[str, str], ...]:
@@ -179,7 +191,10 @@ class Config:
         known_clis = ("claude", "codex", "grok", "pi")
         for cli_name in known_clis:
             raw_command = values.get(f"CLI_{cli_name.upper()}", cli_name)
-            command = tuple(shlex.split(raw_command))
+            try:
+                command = tuple(shlex.split(raw_command))
+            except ValueError as exc:
+                raise ConfigError(f"CLI_{cli_name.upper()} has invalid quoting") from exc
             if not command:
                 raise ConfigError(f"CLI_{cli_name.upper()} is empty")
             commands[cli_name] = command
@@ -209,6 +224,17 @@ class Config:
         if unknown_clis:
             raise ConfigError(f"ENABLED_CLIS contains unsupported CLI: {', '.join(unknown_clis)}")
 
+        command_dir = None
+        raw_command_dir = values.get("COMMAND_DIR", "").strip()
+        if raw_command_dir:
+            command_dir = Path(raw_command_dir).expanduser().resolve()
+            if not command_dir.is_dir():
+                raise ConfigError(f"COMMAND_DIR does not exist: {command_dir}")
+            if not any(
+                command_dir == root or command_dir.is_relative_to(root) for root in allowed_roots
+            ):
+                raise ConfigError("COMMAND_DIR must be inside ALLOWED_WORKDIRS")
+
         socket_name = values.get("TMUX_SOCKET_NAME", "telegram-cli-gateway").strip()
         if not socket_name or not all(ch.isalnum() or ch in "-_" for ch in socket_name):
             raise ConfigError("TMUX_SOCKET_NAME may contain only letters, numbers, '-' and '_'")
@@ -228,11 +254,12 @@ class Config:
             enabled_clis=enabled_clis,
             stream_update_interval=_positive_float(values, "STREAM_UPDATE_INTERVAL", 10.0),
             telegram_max_file_bytes=_positive_int(
-                values, "TELEGRAM_MAX_FILE_BYTES", 20 * 1024 * 1024
+                values, "TELEGRAM_MAX_FILE_BYTES", 45 * 1024 * 1024
             ),
-            auto_send_artifacts=_auto_send_mode(values, "AUTO_SEND_ARTIFACTS", "images"),
+            auto_send_artifacts=_auto_send_mode(values, "AUTO_SEND_ARTIFACTS", "off"),
             auto_resume=_boolean(values, "AUTO_RESUME", False),
             bot_tokens=tuple(configured_tokens),
             cli_default_models=default_models,
             cli_default_efforts=default_efforts,
+            command_dir=command_dir,
         )

@@ -98,6 +98,26 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(today["new_messages"], 1)
         self.assertEqual(today["methods"]["sendPhoto"]["success"], 1)
 
+    def test_mp4_upload_uses_send_video_with_streaming(self) -> None:
+        client = TelegramClient("test")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true, "result": {"message_id": 7}}'
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "clip.mp4"
+            path.write_bytes(b"video bytes")
+            with patch("urllib.request.urlopen", return_value=response) as upload:
+                client.send_local_file(1, path, as_video=True)
+        request = upload.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/sendVideo"))
+        self.assertIn(b'name="video"; filename="clip.mp4"', request.data)
+        self.assertIn(b"Content-Type: video/mp4", request.data)
+        self.assertIn(b'name="supports_streaming"\r\n\r\ntrue', request.data)
+        self.assertNotIn(b'name="document"', request.data)
+        today = client.metrics_snapshot()["today"]
+        self.assertEqual(today["new_messages"], 1)
+        self.assertEqual(today["methods"]["sendVideo"]["success"], 1)
+
     def test_markdown_fallback_does_not_retry_rate_limit_immediately(self) -> None:
         client = TelegramClient("test")
         calls: list[str] = []

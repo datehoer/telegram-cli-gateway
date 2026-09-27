@@ -123,3 +123,27 @@ def split_markdown(markdown: str, limit: int = 3400) -> list[str]:
 def split_rich_markdown(markdown: str, limit: int = 30000) -> list[str]:
     """Keep rich messages below Telegram's 32768-character limit."""
     return split_markdown(markdown, limit=limit)
+
+
+def harden_rich_markdown(text: str) -> str:
+    """把单换行标记成硬换行，保住插件自己排好的版式。
+
+    Telegram 的 Rich Message 渲染器把段落里的单个 \n 当作软换行，会合并成一行
+    （实测：多行帮助文本被拼成 "用法： /bili <URL> /bili login /bili whoami"）。
+    两个空格或行尾反斜杠会渲染成真正的换行。代码块内部本来就保留换行，跳过不动。
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    rendered: list[str] = []
+    in_fence = False
+    for line in lines:
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            rendered.append(line)
+            continue
+        if not in_fence and line.strip():
+            rendered.append(line.rstrip() + "  ")
+        else:
+            rendered.append(line)
+    return "\n".join(rendered)

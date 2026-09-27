@@ -10,7 +10,7 @@ x-gateway-environment: &gateway-environment
   OUTPUT_MAX_BYTES: "65536"
   STREAM_UPDATE_INTERVAL: "5"
   AUTO_RESUME: "false"
-  AUTO_SEND_ARTIFACTS: images
+  AUTO_SEND_ARTIFACTS: off
 
 x-gateway-service: &gateway-service
   restart: unless-stopped

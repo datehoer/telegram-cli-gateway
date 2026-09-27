@@ -19,6 +19,7 @@ NEW_MESSAGE_METHODS = frozenset(
         "sendRichMessage",
         "copyMessage",
         "sendPhoto",
+        "sendVideo",
         "sendDocument",
         "sendMediaGroup",
     }

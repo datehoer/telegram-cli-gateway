@@ -821,7 +821,7 @@ class GatewayEventTests(unittest.TestCase):
 
             app._publish_running_turn = publish_running  # type: ignore[method-assign]
             app._publish_final_turn = (  # type: ignore[method-assign]
-                lambda _view, rendered, with_artifacts=True: final_updates.append(rendered)
+                lambda _view, rendered, with_artifacts=True, **_kwargs: final_updates.append(rendered)
             )
 
             class StopAfterTwoIterations:
@@ -883,6 +883,115 @@ class GatewayEventTests(unittest.TestCase):
             self.assertIn("后台运行中", edited[0][1])
             self.assertEqual(published, [])
             self.assertFalse(view.live)
+
+    def test_background_completion_edits_old_card_without_dumping_chat(self) -> None:
+        """后台任务完成时只原地更新原卡片，不在当前会话底部发新消息或文件。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            image = project / "chart.png"
+            image.write_bytes(b"\x89PNG fake")
+            report = project / "report.py"
+            report.write_text("print('hi')\n", encoding="utf-8")
+            app = self.make_app(project)
+            first = app.sessions.create_headless("pi", project, 1)
+            app.sessions.create_headless("pi", project, 1)
+            view = app._register_turn(first, "turn-bg-done")
+            view.parts.append(f"Saved `{image}` and `{report}`")
+            view.status = "completed"
+            view.published = True
+            view.live = False
+            view.message_id = 88
+            view.dirty = True
+
+            edited: list[tuple[int, str, bool]] = []
+            sent: list[str] = []
+            files: list[Path] = []
+            app._edit_turn_cards = (  # type: ignore[method-assign]
+                lambda _view, rendered, _markup=None, *, rich, allow_split: edited.append(
+                    (88, rendered, allow_split)
+                )
+                or [88]
+            )
+            app._send_turn_cards = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: sent.append("sent") or [99]
+            )
+            app.telegram.send_local_file = (  # type: ignore[method-assign]
+                lambda _chat_id, path, as_photo=False: files.append(path)
+            )
+
+            class StopAfterOneIteration:
+                calls = 0
+
+                def wait(self, _timeout: float) -> bool:
+                    self.calls += 1
+                    return self.calls > 1
+
+            app.stop_event = StopAfterOneIteration()  # type: ignore[assignment]
+            app._status_loop()
+
+            self.assertEqual(sent, [])
+            self.assertEqual(files, [])
+            self.assertEqual(len(edited), 1)
+            self.assertFalse(edited[0][2])
+            self.assertIn("完成", edited[0][1])
+            self.assertNotIn((first.session_id, view.turn_id), app._turns)
+            saved = app.sessions.get(first.session_id)
+            self.assertEqual(saved.last_completed_message_id, 88)  # type: ignore[union-attr]
+
+    def test_background_completion_without_card_waits_for_switch_back(self) -> None:
+        """第一张进度卡发出前就切走：完成后不往当前聊天塞结果，切回后再发。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            first = app.sessions.create_headless("claude", project, 1)
+            app.sessions.create_headless("pi", project, 1)
+            view = app._register_turn(first, "turn-deferred")
+            view.parts.append("long python agent answer")
+            view.status = "completed"
+            view.dirty = True
+
+            sent: list[str] = []
+            app._send_turn_cards = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: sent.append("sent") or [99]
+            )
+            app._edit_turn_cards = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: self.fail("no existing card to edit")
+            )
+
+            class StopAfterOneIteration:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def wait(self, _timeout: float) -> bool:
+                    self.calls += 1
+                    return self.calls > 1
+
+            app.stop_event = StopAfterOneIteration()  # type: ignore[assignment]
+            app._status_loop()
+
+            self.assertEqual(sent, [])
+            self.assertIn((first.session_id, view.turn_id), app._turns)
+
+            app.telegram.answer_callback_query = lambda *_args: None  # type: ignore[method-assign]
+            app.telegram.edit_message = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+            app.handle_update(
+                {
+                    "callback_query": {
+                        "id": "query-back",
+                        "from": {"id": 1},
+                        "data": f"use:{first.session_id}",
+                        "message": {
+                            "message_id": 42,
+                            "chat": {"id": 1, "type": "private"},
+                        },
+                    }
+                }
+            )
+            app.stop_event = StopAfterOneIteration()  # type: ignore[assignment]
+            app._status_loop()
+
+            self.assertEqual(sent, ["sent"])
+            self.assertNotIn((first.session_id, view.turn_id), app._turns)
 
     def test_switching_back_pins_running_turn_to_fresh_card(self) -> None:
         """切回运行中的 session 时，把进度重新钉到一条新卡片，旧卡片记入 stale。"""
@@ -1879,6 +1988,33 @@ class GatewayEventTests(unittest.TestCase):
             markup = app._artifact_markup(view)
             self.assertIn("发送文件：report.csv", markup["inline_keyboard"][0][0]["text"])  # type: ignore[index]
 
+    def test_mp4_button_sends_video_even_from_an_existing_file_button(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            video = project / "reunion.MP4"
+            video.write_bytes(b"video bytes")
+            app = self.make_app(project)
+            session = app.sessions.create_headless("pi", project, 1)
+            view = app._register_turn(session, "turn-video")
+            view.artifacts = [video]
+            button = app._artifact_markup(view)["inline_keyboard"][0][0]  # type: ignore[index]
+            self.assertEqual(button["text"], "发送视频：reunion.MP4")
+            self.assertTrue(button["callback_data"].startswith("video:"))
+
+            sent: list[tuple[Path, bool]] = []
+            app.telegram.answer_callback_query = lambda *_args: None  # type: ignore[method-assign]
+            app.telegram.send_local_file = (  # type: ignore[method-assign]
+                lambda _chat_id, path, as_video=False: sent.append((path, as_video))
+            )
+            for action in ("video", "file"):
+                app.handle_update({"callback_query": {
+                    "id": f"send-{action}",
+                    "from": {"id": 1},
+                    "data": f"{action}:{button['callback_data'].split(':', 1)[1]}",
+                    "message": {"message_id": 9, "chat": {"id": 1, "type": "private"}},
+                }})
+            self.assertEqual(sent, [(video, True), (video, True)])
+
     def make_artifact_app(self, project: Path, mode: str) -> tuple[GatewayApp, list[tuple[Path, bool]]]:
         config = Config(
             project_dir=project,
@@ -1944,6 +2080,23 @@ class GatewayEventTests(unittest.TestCase):
             view.artifacts = [image, report]
             app._auto_send_artifacts(view)
             self.assertEqual(sent, [(image, True), (report, False)])
+
+    def test_auto_send_all_mode_sends_mp4_as_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            video = project / "clip.mp4"
+            video.write_bytes(b"video bytes")
+            app, _sent = self.make_artifact_app(project, "all")
+            sent: list[tuple[Path, bool]] = []
+            app.telegram.send_local_file = (  # type: ignore[method-assign]
+                lambda _chat_id, path, as_video=False: sent.append((path, as_video))
+            )
+            session = app.sessions.create_headless("pi", project, 1)
+            view = app._register_turn(session, "turn-video-auto")
+            view.artifacts = [video]
+            app._auto_send_artifacts(view)
+            self.assertEqual(sent, [(video, True)])
+            self.assertEqual(view.auto_sent, [str(video)])
 
     def test_auto_send_off_keeps_buttons_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2014,8 +2167,8 @@ class GatewayEventTests(unittest.TestCase):
                     for row in sent[0][1]["inline_keyboard"]
                     for button in row
                 }
-                self.assertIn(f"model:{session.session_id}:0", callbacks)
-                self.assertIn(f"model:{session.session_id}:1", callbacks)
+                self.assertIn(f"model:{session.session_id}:{app._model_choice_id('m1')}", callbacks)
+                self.assertIn(f"model:{session.session_id}:{app._model_choice_id('m2')}", callbacks)
                 self.assertIn(f"modelclear:{session.session_id}", callbacks)
                 self.assertIn("当前模型：CLI 默认", sent[0][0])
             finally:
@@ -2043,7 +2196,7 @@ class GatewayEventTests(unittest.TestCase):
                     "callback_query": {
                         "id": "q",
                         "from": {"id": 1},
-                        "data": f"model:{session.session_id}:1",
+                        "data": app._model_view(session)[1]["inline_keyboard"][1][0]["callback_data"],
                         "message": {"message_id": 9, "chat": {"id": 1, "type": "private"}},
                     }
                 })
@@ -2120,6 +2273,49 @@ class GatewayEventTests(unittest.TestCase):
             app._start_session_turn(1, app.sessions.get(session.session_id), "go")  # type: ignore[arg-type]
             self.assertEqual(captured["model"], "gpt-5.5")
             self.assertEqual(captured["effort"], "low")
+            view = app._turns[(session.session_id, "turn-1")]
+            app.sessions.set_model(session.session_id, "changed-later")
+            app.sessions.set_effort(session.session_id, "max")
+            app._update_turn(session, "turn-1", "delta", "answer text")
+            app._update_turn(session, "turn-1", "thinking", "private reasoning")
+            app._update_turn(session, "turn-1", "completed")
+            rendered, answer = app._render_turn(view, view.started_at + 3)
+            self.assertTrue(rendered.startswith("model: gpt-5.5 · effort: low\n"))
+            self.assertIn("完成 3秒", rendered)
+            self.assertEqual(answer, "answer text")
+            self.assertNotIn("changed-later", rendered)
+            self.assertNotIn("private reasoning", rendered)
+
+    def test_turn_header_shows_gateway_defaults_and_cli_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                cli_default_models={"pi": "pi-default", "codex": "gpt-6-astra"},
+                cli_default_efforts={"codex": "high"},
+            )
+            pi_session = app.sessions.create_headless("pi", project, 1)
+            app.headless.start_turn = lambda *_args, **_kwargs: "turn-pi"  # type: ignore[method-assign]
+            app._send = lambda *_args: None  # type: ignore[method-assign]
+            app._start_session_turn(1, pi_session, "go")
+            pi_view = app._turns[(pi_session.session_id, "turn-pi")]
+            pi_rendered, _answer = app._render_turn(pi_view, pi_view.started_at + 1)
+            self.assertTrue(
+                pi_rendered.startswith("model: pi-default (gateway default) · effort: CLI default\n")
+            )
+
+            codex_session = app.sessions.create_virtual(
+                "codex", project, 1, "codex-app-server", "thread-defaults"
+            )
+            app.codex.start_turn = lambda *_args, **_kwargs: "turn-codex"  # type: ignore[method-assign]
+            app._start_session_turn(1, codex_session, "go")
+            codex_view = app._turns[(codex_session.session_id, "turn-codex")]
+            codex_rendered, _answer = app._render_turn(codex_view, codex_view.started_at + 1)
+            self.assertTrue(
+                codex_rendered.startswith(
+                    "model: gpt-6-astra (gateway default) · effort: high (gateway default)\n"
+                )
+            )
 
     def test_codex_session_inherits_gateway_model_and_effort_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

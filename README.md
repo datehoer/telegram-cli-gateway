@@ -18,16 +18,19 @@
 - Codex 运行中收到新消息时使用原生 `turn/steer` 追加到当前任务；其他 CLI 先按会话 FIFO 排队并在完成后自动继续
 - 任务被网关重启/关机连累中断后：网关重启时提示“回复 /resume 继续，或 /cancel 放弃”，/resume 通过 CLI 原生 resume 续跑同一会话（改网关代码后重启自己这类场景可配合 `AUTO_RESUME=true` 自动续跑）；用户主动 /interrupt 的任务不会进入恢复候选
 - 使用原生 Rich Message 原地编辑流式更新回答、当前命令和运行秒数（不用 Draft：Draft 一旦被中断无法由网关收尾，会留下永久“加载中”气泡）
-- 多会话并发时只直播“当前” session：切到谁就在底部发一条每 10 秒原地刷新的进度卡片；切走的那条定格为“后台运行中”，任务跑完后照样把结果更新到它的卡片；稍后切回空闲 session 时会把最后一条成功结果复制到聊天底部，`/clear` 后则显示简短的新对话提示；来回切换时残留的旧卡片会在任务结束时收尾为一句短状态
+- 多会话并发时只直播“当前” session：切到谁就在底部发一条每 10 秒原地刷新的进度卡片；切走的那条定格为“后台运行中”，任务跑完后只原地更新它的卡片（不把长回答或文件插到当前正在看的会话底部）；稍后切回空闲 session 时会把最后一条成功结果复制到聊天底部，`/clear` 后则显示简短的新对话提示；来回切换时残留的旧卡片会在任务结束时收尾为一句短状态
 - Telegram 限流或临时失败时按 `retry_after` 或封顶指数退避重试消息更新
 - `/tgstats` 查看今日和最近 7 天的 Telegram 新消息、编辑、失败、429 与本地延后次数；按 UTC 聚合，只保留最近 14 天，不记录消息内容或 chat_id
 - 使用原生 Rich Markdown 渲染表格、标题、列表、任务列表、链接、引用、公式和代码块
 - Rich Messages 不可用时自动回退到安全 HTML/纯文本
 - 接收 Telegram 文件和图片并交给当前 CLI
-- 回答提到允许目录内真实存在的文件时，自动附加“一键发送文件/图片”按钮
-- 回答完成后自动发送产物：`AUTO_SEND_ARTIFACTS=images`（默认，只自动发≤10MB 的图片）/ `all`（图片+文件）/ `off`（仅按钮）
+- 回答提到允许目录内真实存在的文件时，自动附加“一键发送文件/图片/视频”按钮；MP4 作为可预览的视频消息发送
+- 超过 45 MiB（`TELEGRAM_MAX_FILE_BYTES`）的产物不自动发送、也不给「发送文件」按钮，只给一个
+  「路径」按钮回本机绝对路径（Bot API 上传上限 50 MB，突破需要自建 Local Bot API Server）
+- 回答完成后默认不自动发送产物，只在卡片上留「发送文件/图片/视频」按钮：`AUTO_SEND_ARTIFACTS=off`（默认）/ `images`（只自动发≤10MB 的图片）/ `all`（回答里提到的已有文件也会发出去，容易把源码一并发出）。非当前 session 的后台完成不会自动发文件
 - 会话 ID、本地状态和 CLI 上下文持久化
 - 单实例文件锁
+- 直连命令扩展：`extensions/*/manifest.json` 声明一个命令，网关直接 spawn 本地进程；不调用 AI、不进会话上下文、不烧 token。`/commands` 列出已安装的命令，`/help` 附上用法；命令支持 `@@PROGRESS` 进度行原地刷新，产物自动获得「发送文件/图片/视频」按钮。契约见 [`extensions/README.md`](extensions/README.md)
 
 语音转文字和文字转语音尚未接入。
 
@@ -76,8 +79,10 @@ TELEGRAM_ALLOW_GROUPS=false
 DEFAULT_WORKDIR=/srv/projects
 ALLOWED_WORKDIRS=/srv/projects
 STREAM_UPDATE_INTERVAL=10
-TELEGRAM_MAX_FILE_BYTES=20971520
+TELEGRAM_MAX_FILE_BYTES=47185920
 AUTO_RESUME=false
+# 可选：额外的直连命令扩展目录，必须在 ALLOWED_WORKDIRS 内
+# COMMAND_DIR=/srv/projects/my-commands
 ENABLED_CLIS=claude,codex,grok,pi
 DEFAULT_CODEX_MODEL=gpt-6-astra
 DEFAULT_CODEX_EFFORT=high
@@ -90,6 +95,43 @@ DEFAULT_CODEX_EFFORT=high
 `DEFAULT_<CLI>_MODEL` 和 `DEFAULT_<CLI>_EFFORT` 设置该 CLI 的新会话默认值；已有会话只要没有用 `/model` 或 `/effort` 显式覆盖，也会继承它。`/model default`、`/effort default` 可恢复继承。上面的 Codex 配置使用官方模型标识 `gpt-6-astra` 和 `high` 推理力度，不会改动机器上其他 Codex CLI 的全局配置。
 
 附件保存在 `.runtime/uploads/`，目录权限为 `0700`、文件权限为 `0600`。默认最大 20 MiB。
+
+发送上限 `TELEGRAM_MAX_FILE_BYTES` 默认 45 MiB：Telegram Bot API 允许 `sendDocument`/
+`sendVideo` 上传 50 MB、`sendPhoto` 10 MB。**超过上限的产物不会被自动发送，也不会提供
+「发送文件」按钮**，卡片上只给一个「路径」按钮，点开会回一条含本机绝对路径的消息。
+想发更大的文件需要自建 Local Bot API Server（上限 2 GB），那是额外的部署件，网关不代管。
+
+## 直连命令扩展
+
+把一个目录放到仓库的 `extensions/` 下（或用 `COMMAND_DIR` 指向别处），网关启动时会扫描
+`extensions/*/manifest.json`，并在 Telegram 上注册对应命令：
+
+```
+extensions/bilibili/
+├─ manifest.json      # 声明命令名、exec、cwd、超时
+└─ main.py            # 插件本体，只依赖 argv + TG_* 环境变量 + stdout
+```
+
+命中命令时网关**直接执行本地进程**，不启动任何 AI CLI、不创建会话、不消耗 token：
+
+```text
+/bili https://www.bilibili.com/video/BV1xx411c7mD 1080p
+```
+
+- 进度：插件往 stdout 写 `@@PROGRESS <文本>`，网关原地刷新同一条消息；其余输出跑完一次性发出
+- 产物：stdout 里位于 `ALLOWED_WORKDIRS` 内的真实文件会挂上「发送文件/图片/视频」按钮，
+  走既有的 `TELEGRAM_MAX_FILE_BYTES` 与 `AUTO_SEND_ARTIFACTS` 规则
+- 中断：`/interrupt` 在会话空闲时终止本聊天正在运行的命令（会杀整个进程组）
+- 排障：`/commands` 查看已加载的扩展、用法、工作目录和 manifest 路径；单个扩展不合格只跳过它自己
+
+仓库自带的扩展：
+
+| 命令 | 说明 |
+|---|---|
+| `/example` | 示例扩展，演示 argv / `@@PROGRESS` / 产物路径 |
+| `/bili` | B站下载：`/bili <URL|BV号> [画质]`，支持 Cookie 与扫码登录、分P、音频分离。用法与已踩过的坑见 [`extensions/bilibili/README.md`](extensions/bilibili/README.md) |
+
+完整字段、插件契约和安全边界见 [`extensions/README.md`](extensions/README.md)。
 
 ## 使用
 
@@ -112,6 +154,8 @@ DEFAULT_CODEX_EFFORT=high
 /model
 /model sonnet
 /effort high
+/commands
+/example hello
 ```
 
 普通文字直接发给当前会话。发送文件或图片时，caption 会作为提示；没有 caption 时使用“请查看并处理这个附件”。

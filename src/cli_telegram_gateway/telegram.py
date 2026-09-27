@@ -23,9 +23,11 @@ FLOOD_WAIT_EXEMPT_METHODS = frozenset({"getUpdates", "getFile"})
 
 
 class TelegramError(RuntimeError):
-    def __init__(self, message: str, retry_after: float | None = None) -> None:
+    def __init__(self, message: str, retry_after: float | None = None, *, fallback_allowed: bool = True) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.message_ids: list[int] = []
+        self.fallback_allowed = fallback_allowed
 
 
 def _retry_after(body: object) -> float | None:
@@ -127,15 +129,19 @@ class TelegramClient:
             raise TelegramError(
                 f"Telegram {method} failed: {detail}",
                 retry_after=self._record_flood_wait(method, raw_retry_after),
+                fallback_allowed=exc.code in {400, 404},
             ) from exc
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        except (OSError, urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             self._metrics.record(method, "failed")
             reason = getattr(exc, "reason", exc)
-            raise TelegramError(f"Telegram {method} connection failed: {reason}") from exc
-        except json.JSONDecodeError as exc:
+            raise TelegramError(f"Telegram {method} connection failed: {reason}", fallback_allowed=False) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             self._metrics.record(method, "failed")
-            raise TelegramError(f"Telegram {method} returned invalid JSON") from exc
+            raise TelegramError(f"Telegram {method} returned invalid JSON", fallback_allowed=False) from exc
 
+        if not isinstance(body, dict):
+            self._metrics.record(method, "failed")
+            raise TelegramError(f"Telegram {method} returned a non-object response", fallback_allowed=False)
         if not body.get("ok"):
             raw_retry_after = _retry_after(body)
             self._metrics.record(
@@ -144,6 +150,7 @@ class TelegramClient:
             raise TelegramError(
                 f"Telegram {method} failed: {body.get('description', 'unknown error')}",
                 retry_after=self._record_flood_wait(method, raw_retry_after),
+                fallback_allowed=body.get("error_code") in {400, 404},
             )
         self._metrics.record(method, "success")
         return body.get("result")
@@ -218,28 +225,32 @@ class TelegramClient:
         if max_chunks is not None:
             chunks = chunks[: max(0, max_chunks)]
         ids: list[int] = []
-        for index, chunk in enumerate(chunks):
-            html_text = markdown_to_telegram_html(chunk)
-            payload: dict[str, Any] = {
-                "chat_id": chat_id,
-                "text": html_text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
-            if reply_markup is not None and index == len(chunks) - 1:
-                payload["reply_markup"] = reply_markup
-            try:
-                result = self._call("sendMessage", payload)
-            except TelegramError as exc:
-                if exc.retry_after is not None:
-                    raise
-                payload["text"] = chunk
-                payload.pop("parse_mode", None)
-                result = self._call("sendMessage", payload)
-            if isinstance(result, dict):
-                message_id = result.get("message_id")
-                if isinstance(message_id, int):
-                    ids.append(message_id)
+        try:
+            for index, chunk in enumerate(chunks):
+                html_text = markdown_to_telegram_html(chunk)
+                payload: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": html_text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }
+                if reply_markup is not None and index == len(chunks) - 1:
+                    payload["reply_markup"] = reply_markup
+                try:
+                    result = self._call("sendMessage", payload)
+                except TelegramError as exc:
+                    if exc.retry_after is not None or not exc.fallback_allowed:
+                        raise
+                    payload["text"] = chunk
+                    payload.pop("parse_mode", None)
+                    result = self._call("sendMessage", payload)
+                if isinstance(result, dict):
+                    message_id = result.get("message_id")
+                    if isinstance(message_id, int):
+                        ids.append(message_id)
+        except TelegramError as exc:
+            exc.message_ids = list(ids)
+            raise
         return ids
 
     def send_rich_markdown(
@@ -265,18 +276,22 @@ class TelegramClient:
         if max_chunks is not None:
             chunks = chunks[: max(0, max_chunks)]
         ids: list[int] = []
-        for index, chunk in enumerate(chunks):
-            payload: dict[str, Any] = {
-                "chat_id": chat_id,
-                "rich_message": {"markdown": chunk},
-            }
-            if reply_markup is not None and index == len(chunks) - 1:
-                payload["reply_markup"] = reply_markup
-            result = self._call("sendRichMessage", payload)
-            if isinstance(result, dict):
-                message_id = result.get("message_id")
-                if isinstance(message_id, int):
-                    ids.append(message_id)
+        try:
+            for index, chunk in enumerate(chunks):
+                payload: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "rich_message": {"markdown": chunk},
+                }
+                if reply_markup is not None and index == len(chunks) - 1:
+                    payload["reply_markup"] = reply_markup
+                result = self._call("sendRichMessage", payload)
+                if isinstance(result, dict):
+                    message_id = result.get("message_id")
+                    if isinstance(message_id, int):
+                        ids.append(message_id)
+        except TelegramError as exc:
+            exc.message_ids = list(ids)
+            raise
         return ids
 
     def edit_rich_markdown(
@@ -317,52 +332,56 @@ class TelegramClient:
             if extra_id > 0 and extra_id not in existing:
                 existing.append(extra_id)
         used: list[int] = []
-        for index, chunk in enumerate(chunks):
-            markup = reply_markup if index == len(chunks) - 1 else None
-            if index < len(existing):
-                target = existing[index]
+        try:
+            for index, chunk in enumerate(chunks):
+                markup = reply_markup if index == len(chunks) - 1 else None
+                if index < len(existing):
+                    target = existing[index]
+                    if rich:
+                        payload: dict[str, Any] = {
+                            "chat_id": chat_id,
+                            "message_id": target,
+                            "rich_message": {"markdown": chunk},
+                        }
+                        if markup is not None:
+                            payload["reply_markup"] = markup
+                        try:
+                            self._call("editMessageText", payload)
+                        except TelegramError as exc:
+                            if "message is not modified" not in str(exc).lower():
+                                raise
+                    else:
+                        try:
+                            self.edit_message(
+                                chat_id,
+                                target,
+                                markdown_to_telegram_html(chunk),
+                                reply_markup=markup,
+                                parse_mode="HTML",
+                            )
+                        except TelegramError as exc:
+                            if exc.retry_after is not None or not exc.fallback_allowed:
+                                raise
+                            self.edit_message(chat_id, target, chunk, reply_markup=markup)
+                    used.append(target)
+                    continue
                 if rich:
-                    payload: dict[str, Any] = {
+                    extra: dict[str, Any] = {
                         "chat_id": chat_id,
-                        "message_id": target,
                         "rich_message": {"markdown": chunk},
                     }
                     if markup is not None:
-                        payload["reply_markup"] = markup
-                    try:
-                        self._call("editMessageText", payload)
-                    except TelegramError as exc:
-                        if "message is not modified" not in str(exc).lower():
-                            raise
+                        extra["reply_markup"] = markup
+                    result = self._call("sendRichMessage", extra)
                 else:
-                    try:
-                        self.edit_message(
-                            chat_id,
-                            target,
-                            markdown_to_telegram_html(chunk),
-                            reply_markup=markup,
-                            parse_mode="HTML",
-                        )
-                    except TelegramError as exc:
-                        if exc.retry_after is not None:
-                            raise
-                        self.edit_message(chat_id, target, chunk, reply_markup=markup)
-                used.append(target)
-                continue
-            if rich:
-                extra: dict[str, Any] = {
-                    "chat_id": chat_id,
-                    "rich_message": {"markdown": chunk},
-                }
-                if markup is not None:
-                    extra["reply_markup"] = markup
-                result = self._call("sendRichMessage", extra)
-            else:
-                sent = self.send_markdown(chat_id, chunk, reply_markup=markup, max_chunks=1)
-                result = {"message_id": sent} if sent is not None else {}
-            new_id = result.get("message_id") if isinstance(result, dict) else None
-            if isinstance(new_id, int):
-                used.append(new_id)
+                    sent = self.send_markdown(chat_id, chunk, reply_markup=markup, max_chunks=1)
+                    result = {"message_id": sent} if sent is not None else {}
+                new_id = result.get("message_id") if isinstance(result, dict) else None
+                if isinstance(new_id, int):
+                    used.append(new_id)
+        except TelegramError as exc:
+            exc.message_ids = list(existing + [item for item in used if item not in existing])
+            raise
         return used
 
     def edit_message(
@@ -469,22 +488,43 @@ class TelegramClient:
             raise TelegramError(f"Telegram 文件下载失败：{reason}") from exc
         return total
 
-    def send_local_file(self, chat_id: int, path: Path, as_photo: bool = False) -> None:
-        method = "sendPhoto" if as_photo else "sendDocument"
+    def send_local_file(
+        self, chat_id: int, path: Path, as_photo: bool = False, as_video: bool = False
+    ) -> None:
+        if as_photo and as_video:
+            raise ValueError("a file cannot be sent as both photo and video")
+        if as_photo:
+            method, field_name = "sendPhoto", "photo"
+        elif as_video:
+            method, field_name = "sendVideo", "video"
+        else:
+            method, field_name = "sendDocument", "document"
         self._begin_api_call(method)
-        field_name = "photo" if as_photo else "document"
+        content_type = "video/mp4" if as_video else "application/octet-stream"
         boundary = f"----telegram-cli-gateway-{uuid.uuid4().hex}"
-        file_data = path.read_bytes()
+        try:
+            file_data = path.read_bytes()
+        except OSError as exc:
+            self._metrics.record(method, "failed")
+            raise TelegramError(f"无法读取发送文件：{exc}") from exc
         parts = [
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode(),
-            (
-                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; "
-                f"filename=\"{path.name.replace(chr(34), '_')}\"\r\n"
-                "Content-Type: application/octet-stream\r\n\r\n"
-            ).encode("utf-8"),
-            file_data,
-            f"\r\n--{boundary}--\r\n".encode(),
         ]
+        if as_video:
+            parts.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"supports_streaming\"\r\n\r\ntrue\r\n".encode()
+            )
+        parts.extend(
+            [
+                (
+                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; "
+                    f"filename=\"{path.name.replace(chr(34), '_')}\"\r\n"
+                    f"Content-Type: {content_type}\r\n\r\n"
+                ).encode("utf-8"),
+                file_data,
+                f"\r\n--{boundary}--\r\n".encode(),
+            ]
+        )
         request = urllib.request.Request(
             self._base_url + method,
             data=b"".join(parts),
@@ -512,14 +552,18 @@ class TelegramClient:
             raise TelegramError(
                 f"Telegram {method} failed: {detail}",
                 retry_after=self._record_flood_wait(method, raw_retry_after),
+                fallback_allowed=exc.code in {400, 404},
             ) from exc
         except (OSError, urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             self._metrics.record(method, "failed")
             reason = getattr(exc, "reason", exc)
-            raise TelegramError(f"Telegram {method} failed: {reason}") from exc
-        except json.JSONDecodeError as exc:
+            raise TelegramError(f"Telegram {method} failed: {reason}", fallback_allowed=False) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             self._metrics.record(method, "failed")
-            raise TelegramError(f"Telegram {method} returned invalid JSON") from exc
+            raise TelegramError(f"Telegram {method} returned invalid JSON", fallback_allowed=False) from exc
+        if not isinstance(body, dict):
+            self._metrics.record(method, "failed")
+            raise TelegramError(f"Telegram {method} returned a non-object response", fallback_allowed=False)
         if not body.get("ok"):
             raw_retry_after = _retry_after(body)
             self._metrics.record(

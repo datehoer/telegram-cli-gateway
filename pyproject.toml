@@ -5,6 +5,11 @@ description = "A small Telegram gateway for switching between persistent AI CLI 
 requires-python = ">=3.11"
 dependencies = []
 
+# Optional: QR renderer for the bundled /bili extension. The gateway itself
+# stays dependency-free; only that extension needs it.
+[project.optional-dependencies]
+bilibili = ["segno>=1.6"]
+
 [project.scripts]
 telegram-cli-gateway = "cli_telegram_gateway.__main__:main"
 

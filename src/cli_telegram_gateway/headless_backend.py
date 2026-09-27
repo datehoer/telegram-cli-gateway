@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import logging
 import subprocess
 import threading
@@ -30,6 +32,7 @@ class HeadlessBackend:
         self.on_event = on_event
         self._lock = threading.RLock()
         self._active: dict[str, subprocess.Popen[str]] = {}
+        self._interrupted: set[subprocess.Popen[str]] = set()
 
     def is_active(self, session_id: str) -> bool:
         with self._lock:
@@ -61,6 +64,7 @@ class HeadlessBackend:
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
+                    start_new_session=True,
                 )
             except OSError as exc:
                 raise HeadlessBackendError(f"could not start {session.cli}: {exc}") from exc
@@ -75,7 +79,7 @@ class HeadlessBackend:
         ).start()
         return turn_id
 
-    def compact_session(self, session: CliSession) -> str:
+    def compact_session(self, session: CliSession, timeout: float = 120) -> str:
         """通过一次性 RPC 进程触发 Pi 的原生手动压缩（compact 命令），返回结果摘要。
 
         Pi 的 RPC 模式读 stdin 上的 JSON 命令并输出 JSON 事件；发完 compact 后
@@ -103,16 +107,27 @@ class HeadlessBackend:
                     cwd=session.cwd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
+                    start_new_session=True,
                 )
             except OSError as exc:
                 raise HeadlessBackendError(f"could not start {session.cli}: {exc}") from exc
+            self._active[session.session_id] = process
 
         compact_request = json.dumps({"id": "compact", "type": "compact"}, ensure_ascii=False)
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            self._terminate_process(process)
+
+        watchdog = threading.Timer(timeout, expire)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             assert process.stdin is not None and process.stdout is not None
             process.stdin.write(compact_request + "\n")
@@ -130,6 +145,8 @@ class HeadlessBackend:
                 try:
                     value = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(value, dict):
                     continue
                 value_type = value.get("type")
                 if value_type == "compaction_end":
@@ -149,17 +166,20 @@ class HeadlessBackend:
                         return f"压缩完成。摘要：{result_text}"
                     return "已触发上下文压缩。"
             return_code = process.wait(timeout=5)
+            if timed_out.is_set():
+                raise HeadlessBackendError("Pi 上下文压缩超时，已停止压缩进程")
             raise HeadlessBackendError(
                 f"{session.cli} RPC 未返回 compact 结果"
                 f"（exit {return_code}）"
             )
         finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            watchdog.cancel()
+            self._terminate_process(process)
+            watchdog.join(timeout=6)
+            with self._lock:
+                if self._active.get(session.session_id) is process:
+                    self._active.pop(session.session_id, None)
+                self._interrupted.discard(process)
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream:
                     stream.close()
@@ -259,6 +279,8 @@ class HeadlessBackend:
                     except json.JSONDecodeError:
                         LOGGER.debug("ignored non-JSON output from %s", session.cli)
                         continue
+                    if not isinstance(value, dict):
+                        continue
                     events = self._parse_event(session.cli, value, tool_json_parts, emitted_text)
                     for kind, data in events:
                         if kind == "delta" and data:
@@ -276,9 +298,13 @@ class HeadlessBackend:
             return_code = process.wait()
             stderr_thread.join(timeout=2)
             with self._lock:
+                interrupted = process in self._interrupted
+                self._interrupted.discard(process)
                 if self._active.get(session.session_id) is process:
                     self._active.pop(session.session_id, None)
-            if terminal_result:
+            if interrupted:
+                self.on_event(session.session_id, turn_id, "interrupted", return_code)
+            elif terminal_result:
                 # Structured terminal state is authoritative. In particular, Pi JSON
                 # mode can exit 0 after an assistant message with stopReason=error.
                 self.on_event(session.session_id, turn_id, *terminal_result)
@@ -295,6 +321,7 @@ class HeadlessBackend:
             self.on_event(session.session_id, turn_id, "error", str(exc))
         finally:
             with self._lock:
+                self._interrupted.discard(process)
                 if self._active.get(session.session_id) is process:
                     self._active.pop(session.session_id, None)
             for stream in (process.stdout, process.stderr):
@@ -340,6 +367,8 @@ class HeadlessBackend:
                         if command:
                             output.append(("command", command))
             elif event_type == "content_block_start":
+                # Block indices restart for every assistant message/tool call.
+                tool_json_parts.pop(index, None)
                 block = event.get("content_block")
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     name = str(block.get("name") or "tool")
@@ -471,14 +500,31 @@ class HeadlessBackend:
     def interrupt(self, session_id: str) -> bool:
         with self._lock:
             process = self._active.get(session_id)
-        if not process or process.poll() is not None:
+            if process is not None:
+                self._interrupted.add(process)
+        if process is None:
             return False
-        process.terminate()
+        self._terminate_process(process)
+        return True
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[str]) -> None:
+        # All processes created here own a fresh process group. Signal that
+        # group so tools inheriting stdout cannot keep the reader alive forever.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
-        return True
+            pass
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
 
     def close(self) -> None:
         with self._lock:

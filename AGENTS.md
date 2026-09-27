@@ -55,7 +55,14 @@ If these conditions are not met, defer the work and record the concrete trigger 
 - Protect the bot token, Telegram account, operating-system account, and runtime directory as the real security boundary.
 - Do not describe `ALLOWED_WORKDIRS` as a sandbox. It limits gateway-selected working directories and outbound files, not what bypassed CLIs can access.
 - Validate callback ownership, local paths, attachment size, and destructive targets at the gateway boundary.
+- Direct command extension manifests are trusted configuration, not user input, but their
+  `command` names must not shadow built-in commands, and their `cwd` and artifacts are still
+  subject to `ALLOWED_WORKDIRS` validation.
+- An artifact over `TELEGRAM_MAX_FILE_BYTES` is never uploaded and never offered as a send
+  button; it is reported as a local path instead. Do not add retry or chunking workarounds
+  for the Bot API upload limit; raising it requires a self-hosted Local Bot API Server.
 - Never log tokens, credentials, raw environment files, or unnecessary conversation contents.
+- For provider-policy reviews, verify current terms for the exact authentication route and usage pattern. A documented CLI flag alone does not establish permission for a gateway; distinguish billing restrictions, account enforcement, and credential sharing.
 
 ## Implementation Style
 
@@ -86,17 +93,57 @@ Features that fit this project when there is a concrete need include:
 - small, visible task queues;
 - bounded restart and delivery recovery;
 - concise health and diagnostic information;
+- locally installed direct command extensions for deterministic, non-AI operator tasks;
 - optional voice-note transcription or speech output through a narrow adapter.
 
 Features that are out of scope without a new, concrete requirement include:
 
 - a model-provider abstraction owned by the gateway;
-- a plugin marketplace or general plugin runtime;
+- a plugin marketplace or general plugin runtime, including extension hot reload, extension-owned
+  persistent state, inter-extension communication, and extension-defined Telegram UI beyond text;
 - a gateway-owned agent, memory, skill, or tool platform;
 - multi-agent orchestration, workboards, workflow engines, or cloud-worker fleets;
 - a web control plane, telemetry platform, or distributed node system;
 - automatic cross-CLI failover or replay;
 - features copied from OpenClaw only for architectural similarity.
+
+## Direct Command Extensions
+
+A direct command extension is a directory with a `manifest.json` plus an executable entry
+point. When its command is invoked, the gateway spawns that local process directly. No AI CLI
+runs, no conversation turn is created, and no model context or token is consumed.
+
+This is deliberately **not** the plugin system the Architecture Boundaries and Scope Guidance
+sections reject. The justification required by Decision Rules:
+
+1. **Workflow.** Deterministic operator tasks (download a video, fetch a status) must not burn
+   tokens, pollute CLI context, or depend on a model deciding to call a tool.
+2. **Ownership.** The gateway already owns the Telegram boundary and local process lifecycle.
+   A manifest plus one `subprocess.Popen` adds no new runtime ownership: no daemon, no IPC, no
+   plugin marketplace, no DSL, no inter-plugin communication, no plugin-owned state.
+3. **Smallest implementation.** One manifest parser, one runner, and reuse of the existing
+   artifact validation and send-button path. Standard library only.
+4. **State and failure.** Deleting the directory uninstalls the extension. Timeouts kill the
+   process group. Nothing new is persisted. A manifest that fails validation is skipped with a
+   warning and cannot break gateway startup.
+5. **Testability.** Covered by `tests/test_commands.py` and `tests/test_app_commands.py` using
+   local scripts, with no second platform to stand up.
+
+The extension contract is intentionally narrow, and these stay out of scope: plugin hot reload,
+a plugin marketplace, inter-plugin communication, plugin-owned persistent state, plugin-defined
+Telegram UI beyond text plus the existing artifact buttons, and any AI orchestration driven by a
+plugin.
+
+The bundled `extensions/bilibili` proves the contract end to end. Its constraints are
+documented there and must not be re-derived: `api.bilibili.com` rejects browser-like user
+agents with HTTP 412 while the media CDNs reject generic clients with 403, so one
+non-browser user agent is used for both; `fnval` must have every bit set (4048); and
+`playurl` requires `cid`. Keep credentials inside the extension directory, never in `.env`.
+
+Extension processes run with the gateway's operating-system permissions, exactly like the
+bypass-mode CLIs. The gateway guarantees only three things: `exec` is an argv array executed
+without a shell, `cwd` and outbound artifact paths must stay inside `ALLOWED_WORKDIRS`, and a
+run past `timeout_seconds` is terminated. There is no sandbox and none should be implied.
 
 ## Change Discipline
 

@@ -15,7 +15,9 @@ LOGGER = logging.getLogger("telegram-cli-gateway.codex")
 
 
 class CodexBackendError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, ambiguous: bool = False) -> None:
+        super().__init__(message)
+        self.ambiguous = ambiguous
 
 
 NotificationHandler = Callable[[str, dict[str, Any]], None]
@@ -30,10 +32,12 @@ class CodexAppServer:
         command: tuple[str, ...],
         on_notification: NotificationHandler,
         on_server_request: ServerRequestHandler,
+        on_disconnect: Callable[[], None] | None = None,
     ) -> None:
         self.command = command
         self.on_notification = on_notification
         self.on_server_request = on_server_request
+        self.on_disconnect = on_disconnect
         self.process: subprocess.Popen[str] | None = None
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
@@ -42,11 +46,13 @@ class CodexAppServer:
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._closing = threading.Event()
+        self._disconnected = threading.Event()
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
             return
         self._closing.clear()
+        self._disconnected.clear()
         try:
             self.process = subprocess.Popen(
                 [*self.command, "app-server", "--stdio"],
@@ -55,6 +61,7 @@ class CodexAppServer:
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
         except OSError as exc:
@@ -73,17 +80,21 @@ class CodexAppServer:
         self._reader_thread.start()
         self._stderr_thread.start()
 
-        self.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "telegram-cli-gateway",
-                    "title": "Telegram CLI Gateway",
-                    "version": "0.1.0",
-                }
-            },
-        )
-        self.notify("initialized", {})
+        try:
+            self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "telegram-cli-gateway",
+                        "title": "Telegram CLI Gateway",
+                        "version": "0.1.0",
+                    }
+                },
+            )
+            self.notify("initialized", {})
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         process = self.process
@@ -117,7 +128,7 @@ class CodexAppServer:
 
     def _send_message(self, message: dict[str, Any]) -> None:
         process = self.process
-        if not process or process.poll() is not None or not process.stdin:
+        if self._disconnected.is_set() or not process or process.poll() is not None or not process.stdin:
             raise CodexBackendError("codex app-server is not running")
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         with self._write_lock:
@@ -125,7 +136,7 @@ class CodexAppServer:
                 process.stdin.write(encoded + "\n")
                 process.stdin.flush()
             except (BrokenPipeError, OSError) as exc:
-                raise CodexBackendError("codex app-server connection closed") from exc
+                raise CodexBackendError("codex app-server connection closed", ambiguous=True) from exc
 
     def request(self, method: str, params: dict[str, Any], timeout: float = 30) -> Any:
         with self._pending_lock:
@@ -138,14 +149,14 @@ class CodexAppServer:
             try:
                 response = response_queue.get(timeout=timeout)
             except queue.Empty as exc:
-                raise CodexBackendError(f"codex app-server request timed out: {method}") from exc
+                raise CodexBackendError(f"codex app-server request timed out: {method}", ambiguous=True) from exc
         finally:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
         if "error" in response:
             error = response["error"]
             detail = error.get("message", "unknown error") if isinstance(error, dict) else str(error)
-            raise CodexBackendError(f"codex {method} failed: {detail}")
+            raise CodexBackendError(f"codex {method} failed: {detail}", ambiguous=bool(response.get("connection_closed")))
         return response.get("result")
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
@@ -158,33 +169,48 @@ class CodexAppServer:
         process = self.process
         if not process or not process.stdout:
             return
-        for line in process.stdout:
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                LOGGER.warning("ignored malformed line from codex app-server")
-                continue
-            request_id = message.get("id")
-            method = message.get("method")
-            if request_id is not None and isinstance(method, str):
-                params = message.get("params")
-                self.on_server_request(
-                    request_id,
-                    method,
-                    params if isinstance(params, dict) else {},
-                )
-                continue
-            if request_id is not None:
-                with self._pending_lock:
-                    response_queue = self._pending.get(request_id)
-                if response_queue:
-                    response_queue.put(message)
-                continue
-            if isinstance(method, str):
-                params = message.get("params")
-                self.on_notification(method, params if isinstance(params, dict) else {})
-        if not self._closing.is_set():
-            LOGGER.warning("codex app-server stdout closed unexpectedly")
+        try:
+            for line in process.stdout:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    LOGGER.warning("ignored malformed line from codex app-server")
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                request_id = message.get("id")
+                method = message.get("method")
+                try:
+                    if isinstance(request_id, (str, int)) and isinstance(method, str):
+                        params = message.get("params")
+                        self.on_server_request(
+                            request_id, method, params if isinstance(params, dict) else {}
+                        )
+                    elif isinstance(request_id, (str, int)):
+                        with self._pending_lock:
+                            response_queue = self._pending.get(request_id)
+                        if response_queue:
+                            try:
+                                response_queue.put_nowait(message)
+                            except queue.Full:
+                                pass  # Ignore a duplicate response, never block the reader.
+                    elif isinstance(method, str):
+                        params = message.get("params")
+                        self.on_notification(method, params if isinstance(params, dict) else {})
+                except Exception:
+                    LOGGER.exception("could not handle codex app-server event")
+        finally:
+            self._disconnected.set()
+            with self._pending_lock:
+                for response_queue in self._pending.values():
+                    try:
+                        response_queue.put_nowait({"error": {"message": "app-server connection closed"}, "connection_closed": True})
+                    except queue.Full:
+                        pass
+            if not self._closing.is_set():
+                LOGGER.warning("codex app-server stdout closed unexpectedly")
+                if self.on_disconnect:
+                    self.on_disconnect()
 
     def _stderr_loop(self) -> None:
         process = self.process
