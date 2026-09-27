@@ -1,26 +1,25 @@
-# 直连命令扩展（Direct Command Extensions）
+# Direct Command Extensions
 
-一个扩展 = 一个目录 + `manifest.json` + 一个可执行入口。命中命令时网关**直接 spawn 本地进程**，
-不调用任何 AI CLI，不占用会话上下文，也不消耗 token。
+An extension is a directory plus a `manifest.json` plus one executable entry point. When its command is invoked, the gateway **spawns a local process directly** — it calls no AI CLI, occupies no session context, and consumes no tokens.
 
 ```
 extensions/
 ├─ README.md
-└─ example/                 # 命令名来自 manifest.command，目录名随意但建议同名
-   ├─ manifest.json
+└─ example/                 # the command name comes from manifest.command; the directory
+   ├─ manifest.json         # name is arbitrary, but matching it is recommended
    └─ main.py
 ```
 
-## 发现规则
+## Discovery Rules
 
-| 来源 | 说明 |
+| Source | Notes |
 |---|---|
-| `<repo>/extensions/*/manifest.json` | 随仓库版本化，始终扫描 |
-| `COMMAND_DIR` 指向的目录 | 可选，必须位于 `ALLOWED_WORKDIRS` 内，用于放在别处的扩展 |
+| `<repo>/extensions/*/manifest.json` | Versioned with the repository, always scanned |
+| The directory `COMMAND_DIR` points at | Optional, must be inside `ALLOWED_WORKDIRS`, for extensions kept elsewhere |
 
-- 修改 manifest 或新增扩展需要重启网关；**没有热重载**。
-- 单个扩展出错只跳过它自己并写 warning 日志，不影响网关启动，也不影响其他扩展。
-- `command` 与内置命令同名，或与已加载的扩展同名时，后者被跳过并告警。
+- Editing a manifest or adding an extension requires a gateway restart; **there is no hot reload**.
+- A failing extension only skips itself and logs a warning; it does not affect gateway startup or other extensions.
+- When `command` collides with a built-in command or with an already loaded extension, the later one is skipped with a warning.
 
 ## manifest.json
 
@@ -28,10 +27,10 @@ extensions/
 {
   "schema_version": 1,
   "id": "bilibili",
-  "name": "哔哩哔哩下载",
+  "name": "Bilibili Download",
   "command": "bili",
   "usage": "/bili <URL> [1080p|720p]",
-  "description": "下载 B站视频并回传 Telegram",
+  "description": "Download a Bilibili video and send it back to Telegram",
   "exec": ["python3", "main.py"],
   "cwd": "/srv/projects/downloads",
   "timeout_seconds": 1800,
@@ -40,69 +39,68 @@ extensions/
 }
 ```
 
-| 字段 | 必填 | 说明 |
+| Field | Required | Notes |
 |---|---|---|
-| `schema_version` | ✅ | 必须为 `1` |
-| `id` | ✅ | `^[a-z][a-z0-9_]{0,31}$`，仅标识用 |
-| `command` | ✅ | Telegram 上触发的命令名，同样的字符集 |
-| `exec` | ✅ | argv 数组。**不经过 shell**，不要再自己拼引号 |
-| `name` | ❌ | 展示名，缺省用 `id` |
-| `usage` | ❌ | `/help` 和 `/commands` 里显示的用法 |
-| `description` | ❌ | 一行说明，也用于 Telegram 的 `/` 菜单 |
-| `cwd` | ❌ | 工作目录，缺省 `DEFAULT_WORKDIR`；必须位于 `ALLOWED_WORKDIRS` 内；相对路径按扩展目录解析 |
-| `timeout_seconds` | ❌ | 1 ~ 21600，默认 1800；超时会 `SIGTERM` 进程组，5 秒后 `SIGKILL` |
-| `max_output_bytes` | ❌ | 展示时保留的输出尾部字节数，默认 16384。下载进度这类长任务建议调大 |
-| `enabled` | ❌ | `false` 时跳过（不告警） |
+| `schema_version` | ✅ | Must be `1` |
+| `id` | ✅ | `^[a-z][a-z0-9_]{0,31}$`, used only as an identifier |
+| `command` | ✅ | The command name triggered on Telegram; same character set |
+| `exec` | ✅ | argv array. **Not passed through a shell**, so do not add your own quoting |
+| `name` | ❌ | Display name, defaults to `id` |
+| `usage` | ❌ | Usage string shown in `/help` and `/commands` |
+| `description` | ❌ | One-line description, also used for Telegram's `/` menu |
+| `cwd` | ❌ | Working directory, defaults to `DEFAULT_WORKDIR`; must be inside `ALLOWED_WORKDIRS`; relative paths resolve against the extension directory |
+| `timeout_seconds` | ❌ | 1–21600, default 1800; on timeout the process group is `SIGTERM`ed and `SIGKILL`ed 5 seconds later |
+| `max_output_bytes` | ❌ | Trailing bytes of output kept for display, default 16384. Raise it for long-running tasks such as downloads |
+| `enabled` | ❌ | `false` skips the extension (without a warning) |
 
-## 插件契约
+## Plugin Contract
 
-网关传给插件的东西：
+What the gateway passes to the plugin:
 
-| 参数 | 内容 |
+| Argument | Content |
 |---|---|
-| `argv[1:]` | 网关**不做 shell 分词**。`argv[0]`（子命令）通过 `TG_ARGV0` 传，其余每个换行分隔的非空行是一个 argv 元素 |
-| `TG_RAW_ARGS` | 用户输入的**原始文本**，一个字都没动过 |
-| `TG_COMMAND_ID` / `TG_COMMAND` / `TG_COMMAND_NAME` | 扩展标识、命令名、展示名 |
-| `TG_ARGS_JSON` | 按行拆好的参数 JSON 数组 |
-| `TG_CHAT_ID` / `TG_USER_ID` | 发起者上下文 |
-| `TG_WORKDIR` | 解析后的 `cwd` |
-| `TG_MANIFEST_DIR` | 扩展目录的绝对路径 |
-| `cwd` | 同 `TG_WORKDIR` |
+| `argv[1:]` | The gateway **does not do shell tokenization**. `argv[0]` (the subcommand) is passed via `TG_ARGV0`, and every other newline-separated non-empty line is one argv element |
+| `TG_RAW_ARGS` | The **raw text** the user typed, untouched |
+| `TG_COMMAND_ID` / `TG_COMMAND` / `TG_COMMAND_NAME` | Extension id, command name, display name |
+| `TG_ARGS_JSON` | The newline-split arguments as a JSON array |
+| `TG_CHAT_ID` / `TG_USER_ID` | Requester context |
+| `TG_WORKDIR` | The resolved `cwd` |
+| `TG_MANIFEST_DIR` | Absolute path of the extension directory |
+| `cwd` | Same as `TG_WORKDIR` |
 
-插件返回给网关：
+What the plugin returns to the gateway:
 
-| 通道 | 语义 |
+| Channel | Semantics |
 |---|---|
-| stdout 中 `@@PROGRESS <文本>` 开头的行 | 进度。原地刷新进度卡片，**不进入最终输出** |
-| 其余 stdout | 最终输出，按 `max_output_bytes` 截尾展示 |
-| stderr | 失败时附加展示；成功时记录到日志 |
-| 退出码 | `0` 成功，非 `0` 失败 |
-| stdout 里的绝对路径 | 若位于 `ALLOWED_WORKDIRS` 内且文件确实存在，会挂上「发送文件/图片/视频」按钮（MP4 按视频发送） |
+| stdout lines starting with `@@PROGRESS <text>` | Progress. Refreshes the progress card in place and **never enters the final output** |
+| Other stdout | Final output, displayed truncated to `max_output_bytes` from the tail |
+| stderr | Appended to the display on failure; logged on success |
+| Exit code | `0` success, non-zero failure |
+| Absolute paths on stdout | If they are inside `ALLOWED_WORKDIRS` and the file really exists, "send file/image/video" buttons are attached (MP4 is sent as video) |
 
-产物发送继承网关既有规则：
+Artifact delivery inherits the gateway's existing rules:
 
-- `TELEGRAM_MAX_FILE_BYTES`（默认 45 MiB）是发送上限，来自 Bot API 的 50 MB 上传限制
-- 超过上限的产物不会自动发送，卡片上只给「路径」按钮，点开回一条本机绝对路径
-- `AUTO_SEND_ARTIFACTS`（默认 `off`）决定是否自动发送
-- 想发超过 50 MB 的文件需要自建 Local Bot API Server，网关不代管
+- `TELEGRAM_MAX_FILE_BYTES` (default 45 MiB) is the send limit, derived from the Bot API's 50 MB upload limit
+- An artifact over the limit is not auto-sent; the card only shows a "path" button that replies with the local absolute path
+- `AUTO_SEND_ARTIFACTS` (default `off`) decides whether artifacts are sent automatically
+- Sending files over 50 MB requires a self-hosted Local Bot API Server, which the gateway does not manage
 
-所以长视频扩展应该自己控制输出体积，或者在超过上限时明确只回路径。
+So a long-video extension should bound its own output size, or explicitly return only a path when it exceeds the limit.
 
-## 安全模型
+## Security Model
 
-进程以网关账号权限运行，**与免审批的 CLI 完全同级**。网关只做三件事：
+The process runs with the gateway account's privileges, **exactly as privileged as an approval-free CLI**. The gateway guarantees only three things:
 
-1. `exec` 是 argv 数组、`shell=False`，用户参数不会被 shell 解释；
-2. `cwd` 与产物路径必须落在 `ALLOWED_WORKDIRS` 内；
-3. 超时后杀整个进程组。
+1. `exec` is an argv array with `shell=False`, so user arguments are never interpreted by a shell;
+2. `cwd` and artifact paths must stay inside `ALLOWED_WORKDIRS`;
+3. On timeout the whole process group is killed.
 
-**除此之外没有沙箱。** 装扩展等于把代码放进网关进程的同权限环境，
-所以只安装自己审过源码的扩展；不要使用来路不明的二进制扩展。
+**There is no sandbox beyond that.** Installing an extension is equivalent to putting code into the gateway process's own privilege environment, so only install extensions whose source you have reviewed; do not use binary extensions from untrusted sources.
 
-## 最小验证
+## Minimal Verification
 
 ```bash
-# 直接跑插件本体（模拟网关传入的参数）
+# Run the plugin itself, simulating the arguments the gateway passes
 cd extensions/example
 TG_WORKDIR=/srv/projects python3 main.py hello world
 ```

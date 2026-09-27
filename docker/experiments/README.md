@@ -1,20 +1,26 @@
-# 三 Bot 隔离实验环境
+# Three-Bot Isolation Experiment
 
-该 Compose 栈为 Codex、Claude Code 和 Grok 各运行一个独立的 gateway。每个服务只有自己的 CLI、网络、HOME、工作区、runtime、认证和 Telegram Bot。
+This Compose stack runs one independent gateway each for Codex, Claude Code, and Grok.
+Every service has only its own CLI, network, HOME, workspace, runtime, credentials, and
+Telegram bot.
 
-## Bot 映射
+## Bot Mapping
 
-- `codex`：`@OpenClaw30w2w_bot`
-- `claude`：`@jr_claude_code_bot`
-- `grok`：`@myopenclaw_news_report_bot`
+- `codex`: one dedicated Telegram bot (bot handle redacted)
+- `claude`: one dedicated Telegram bot (bot handle redacted)
+- `grok`: one dedicated Telegram bot (bot handle redacted)
 
-Bot Token 保存在被 Git 忽略的 `secrets/*.bot-token` 文件中。Compose 从项目根目录 `.env` 读取相同的 `TELEGRAM_ALLOWED_USERS`，不会把原 Bot Token传入实验容器。
+The bot tokens live in the Git-ignored `secrets/*.bot-token` files. Compose reads the same
+`TELEGRAM_ALLOWED_USERS` from the project-root `.env` and never passes the original bot tokens
+into the experiment containers.
 
-CLI 认证从宿主机的最小认证文件或本目录的私密配置复制到各自 HOME；不会复制历史、缓存、记忆或旧会话。Token 不会写入镜像层或容器环境变量。
+CLI credentials are copied from the host's minimal auth files or this directory's private
+configuration into each HOME; history, caches, memories, and old sessions are not copied.
+Tokens never reach an image layer or a container environment variable.
 
-## 使用
+## Usage
 
-从项目根目录运行：
+Run from the project root:
 
 ```bash
 docker compose --env-file .env -f docker/experiments/compose.yaml build
@@ -22,7 +28,7 @@ docker compose --env-file .env -f docker/experiments/compose.yaml up -d
 docker compose --env-file .env -f docker/experiments/compose.yaml ps
 ```
 
-首次给三个 Bot 分别发送：
+Send one of these to each of the three bots the first time:
 
 ```text
 /new codex
@@ -30,37 +36,44 @@ docker compose --env-file .env -f docker/experiments/compose.yaml ps
 /new grok
 ```
 
-每个工作区首次启动时从同一个镜像快照复制到 `/workspace/project`，并创建只有一个基线提交的新 Git 仓库。候选代码和 CLI 会话保存在各自命名卷中，容器重启不会丢失。
+On first startup each workspace is copied from the same image snapshot into
+`/workspace/project` and initialized as a fresh Git repository with a single baseline commit.
+Candidate code and CLI sessions live in their own named volumes, so restarting a container
+loses nothing.
 
-查看日志：
+Follow the logs:
 
 ```bash
 docker compose --env-file .env -f docker/experiments/compose.yaml logs -f codex
 ```
 
-导出候选补丁：
+Export a candidate patch:
 
 ```bash
 docker compose --env-file .env -f docker/experiments/compose.yaml exec codex \
   git -C /workspace/project diff --binary HEAD
 ```
 
-停止容器不会删除结果：
+Stopping a container does not delete results:
 
 ```bash
 docker compose --env-file .env -f docker/experiments/compose.yaml stop
 ```
 
-不要使用 `down -v`，除非明确准备删除三个实验的工作区、会话和 runtime。
+Do not use `down -v` unless you explicitly intend to delete all three experiment workspaces,
+sessions, and runtimes.
 
-本机旧的 `telegram-cli-gateway.service` 使用 Codex 实验 Bot 的同一个 Token，因此三容器栈运行期间必须保持禁用。回退到原服务时先停止容器，再恢复服务：
+The older local `telegram-cli-gateway.service` used the same token as the Codex experiment bot,
+so it must stay disabled while the three-container stack is running. To fall back to the original
+service, stop the containers first and then re-enable the service:
 
 ```bash
 docker compose --env-file .env -f docker/experiments/compose.yaml stop
 systemctl --user enable --now telegram-cli-gateway.service
 ```
 
-轮换任一 Bot 或模型 API Token 后，更新对应的 `docker/experiments/secrets/` 文件并重建容器配置：
+After rotating any bot or model API token, update the corresponding
+`docker/experiments/secrets/` file and recreate the container configuration:
 
 ```bash
 docker compose --env-file .env -f docker/experiments/compose.yaml up -d --force-recreate

@@ -1,55 +1,54 @@
 # Telegram CLI Gateway
 
-通过一个 Telegram Bot 远程使用本机的 Claude Code、Codex、Grok 和 Pi，并在多个持久会话之间切换。
+Drive the Claude Code, Codex, Grok, and Pi CLIs installed on your machine from a single Telegram bot, and switch between multiple persistent sessions.
 
-项目的产品边界和实现原则见 [`AGENTS.md`](AGENTS.md)：这是原生 CLI 的轻量 Telegram 控制层，不是通用 Agent 平台。
+The product boundary and engineering principles are documented in [`AGENTS.md`](AGENTS.md): this is a thin Telegram control layer over native CLIs, not a general agent platform.
 
-## 当前能力
+## Features
 
-- Telegram 用户 ID 白名单，默认只接受私聊
-- `/new`、`/use`、`/back`、`/sessions`、`/tasks`、`/where`、`/interrupt`、`/resume`、`/cancel`
-- `/reload` 可点选重载当前会话或全部 CLI；Codex 会重启共享 app-server 并恢复全部原生 thread，Claude/Grok/Pi 的下一轮任务天然使用当前安装版本
-- `/tasks` 提供中断当前、清空等待和中断并清空按钮；每个会话最多排队 20 条输入
-- `/sessions` 返回 Telegram 按钮，可切换、中断、归档、恢复和确认删除会话；每个会话显示状态徽章（🟡 运行中 / 🟢 空闲 / ⚫ 上次失败 / 🔴 已中断待恢复 / ⏳ 排队 N）
-- `/rename` 设置易读会话名称；`/sessions all` 查看已归档会话
-- `/model` 查看/切换当前会话模型，`/effort` 查看/切换推理力度（下次任务生效；选择项来自各 CLI 自己的模型目录，改完直接透传给 CLI，网关不接管模型路由）
-- 回复任意历史 CLI 结果会自动切回对应会话，再把消息发送给它
-- Codex 使用 `app-server`；Claude、Grok、Pi 使用各自的 headless JSON 流
-- Codex 运行中收到新消息时使用原生 `turn/steer` 追加到当前任务；其他 CLI 先按会话 FIFO 排队并在完成后自动继续
-- 任务被网关重启/关机连累中断后：网关重启时提示“回复 /resume 继续，或 /cancel 放弃”，/resume 通过 CLI 原生 resume 续跑同一会话（改网关代码后重启自己这类场景可配合 `AUTO_RESUME=true` 自动续跑）；用户主动 /interrupt 的任务不会进入恢复候选
-- 使用原生 Rich Message 原地编辑流式更新回答、当前命令和运行秒数（不用 Draft：Draft 一旦被中断无法由网关收尾，会留下永久“加载中”气泡）
-- 多会话并发时只直播“当前” session：切到谁就在底部发一条每 10 秒原地刷新的进度卡片；切走的那条定格为“后台运行中”，任务跑完后只原地更新它的卡片（不把长回答或文件插到当前正在看的会话底部）；稍后切回空闲 session 时会把最后一条成功结果复制到聊天底部，`/clear` 后则显示简短的新对话提示；来回切换时残留的旧卡片会在任务结束时收尾为一句短状态
-- Telegram 限流或临时失败时按 `retry_after` 或封顶指数退避重试消息更新
-- `/tgstats` 查看今日和最近 7 天的 Telegram 新消息、编辑、失败、429 与本地延后次数；按 UTC 聚合，只保留最近 14 天，不记录消息内容或 chat_id
-- 使用原生 Rich Markdown 渲染表格、标题、列表、任务列表、链接、引用、公式和代码块
-- Rich Messages 不可用时自动回退到安全 HTML/纯文本
-- 接收 Telegram 文件和图片并交给当前 CLI
-- 回答提到允许目录内真实存在的文件时，自动附加“一键发送文件/图片/视频”按钮；MP4 作为可预览的视频消息发送
-- 超过 45 MiB（`TELEGRAM_MAX_FILE_BYTES`）的产物不自动发送、也不给「发送文件」按钮，只给一个
-  「路径」按钮回本机绝对路径（Bot API 上传上限 50 MB，突破需要自建 Local Bot API Server）
-- 回答完成后默认不自动发送产物，只在卡片上留「发送文件/图片/视频」按钮：`AUTO_SEND_ARTIFACTS=off`（默认）/ `images`（只自动发≤10MB 的图片）/ `all`（回答里提到的已有文件也会发出去，容易把源码一并发出）。非当前 session 的后台完成不会自动发文件
-- 会话 ID、本地状态和 CLI 上下文持久化
-- 单实例文件锁
-- 直连命令扩展：`extensions/*/manifest.json` 声明一个命令，网关直接 spawn 本地进程；不调用 AI、不进会话上下文、不烧 token。`/commands` 列出已安装的命令，`/help` 附上用法；命令支持 `@@PROGRESS` 进度行原地刷新，产物自动获得「发送文件/图片/视频」按钮。契约见 [`extensions/README.md`](extensions/README.md)
+- Telegram user-ID allowlist; direct messages only by default
+- `/new`, `/use`, `/back`, `/sessions`, `/tasks`, `/where`, `/interrupt`, `/resume`, `/cancel`
+- `/reload` reloads the current session or every CLI through a picker; Codex restarts its shared app-server and restores all native threads, while Claude/Grok/Pi naturally use the currently installed version on their next turn
+- `/tasks` provides interrupt-current, clear-queue, and interrupt-and-clear buttons; each session queues at most 20 inputs
+- `/sessions` returns Telegram buttons to switch, interrupt, archive, restore, and confirm deletion; each session shows a status badge (🟡 running / 🟢 idle / ⚫ last turn failed / 🔴 interrupted, resumable / ⏳ N queued)
+- `/rename` sets a human-readable session name; `/sessions all` lists archived sessions
+- `/model` inspects and switches the current session's model, `/effort` the reasoning effort (takes effect on the next turn; the choices come from each CLI's own model catalog and the selection is passed straight through, so the gateway never owns model routing)
+- Replying to any earlier CLI result automatically switches back to that session before delivering the message
+- Codex uses `app-server`; Claude, Grok, and Pi use their own headless JSON streams
+- When Codex receives a new message mid-turn, it appends to the current task with native `turn/steer`; other CLIs queue it per-session FIFO and continue automatically once the turn finishes
+- When a task is interrupted by a gateway restart or shutdown, the gateway asks on restart whether to "reply /resume to continue, or /cancel to give up"; `/resume` continues the same session through the CLI's native resume (pair with `AUTO_RESUME=true` for cases such as restarting the gateway after editing its own code); tasks you stopped with `/interrupt` are not recovery candidates
+- Streaming answers, the current command, and elapsed seconds are edited in place using native Rich Messages (no Drafts: an interrupted Draft can no longer be finalized by the gateway and leaves a permanent "loading" bubble)
+- With several concurrent sessions, only the "current" session is live-streamed: switching to a session posts a progress card at the bottom that refreshes in place every 10 seconds; the session you switched away from freezes as "running in background" and, once finished, only its own card is updated (long answers and files are never injected at the bottom of the session you are currently reading); switching back to an idle session later copies its last successful result to the bottom of the chat, while after `/clear` you get a short new-conversation notice; leftover cards are closed out with a one-line status when their task ends
+- Message edits retry on `retry_after` or capped exponential backoff when Telegram rate-limits or fails transiently
+- `/tgstats` shows today's and the last 7 days' Telegram new messages, edits, failures, 429s, and local deferrals; aggregated in UTC, retained for 14 days, and it records neither message content nor chat_id
+- Native Rich Markdown rendering for tables, headings, lists, task lists, links, quotes, formulas, and code blocks
+- Automatic fallback to safe HTML/plain text when Rich Messages are unavailable
+- Receives Telegram files and images and hands them to the current CLI
+- When an answer mentions a real file inside the allowed directories, a one-tap "send file/image/video" button is attached; MP4 files are sent as previewable video messages
+- Artifacts over 45 MiB (`TELEGRAM_MAX_FILE_BYTES`) are neither auto-sent nor offered a "send file" button; the card only shows a "path" button that returns the local absolute path (the Bot API upload limit is 50 MB, and raising it requires a self-hosted Local Bot API Server)
+- Artifacts are not auto-sent when an answer completes; the card keeps its "send file/image/video" buttons: `AUTO_SEND_ARTIFACTS=off` (default) / `images` (auto-send only images ≤10 MB) / `all` (also send existing files mentioned in the answer, which easily leaks source code along with the artifacts). A background completion in a non-current session never auto-sends files
+- Session IDs, local state, and CLI context are persisted
+- Single-instance file lock
+- Direct command extensions: `extensions/*/manifest.json` declares a command and the gateway spawns a local process directly — no AI call, no session context, no tokens burned. `/commands` lists installed commands and `/help` appends their usage; commands support `@@PROGRESS` lines that refresh in place, and their artifacts automatically get "send file/image/video" buttons. See the contract in [`extensions/README.md`](extensions/README.md)
 
-语音转文字和文字转语音尚未接入。
+Voice transcription and text-to-speech are not wired up yet.
 
-## 权限模式
+## Permission Mode
 
-四个 CLI 都按免审批方式运行：
+All four CLIs run without approval prompts:
 
-- Codex：`approvalPolicy=never`、`sandbox=danger-full-access`
-- Claude Code：`--dangerously-skip-permissions`
-- Grok：`--always-approve --permission-mode bypassPermissions`
-- Pi：`--approve`
+- Codex: `approvalPolicy=never`, `sandbox=danger-full-access`
+- Claude Code: `--dangerously-skip-permissions`
+- Grok: `--always-approve --permission-mode bypassPermissions`
+- Pi: `--approve`
 
-这意味着白名单账号发出的提示可以让 CLI 读写本机文件并执行命令。请把 Telegram Bot token 和白名单账号视为高权限凭据，不要开启陌生用户或不受控群聊。
+This means a prompt from an allowlisted account can make the CLI read and write local files and execute commands. Treat the Telegram bot token and the allowlisted accounts as high-privilege credentials, and do not open the bot to unknown users or uncontrolled group chats.
 
-`ALLOWED_WORKDIRS` 限制会话起始目录以及网关可发送的本地产物路径，但它不是 CLI 的文件系统沙箱；免审批 CLI 本身仍能访问其操作系统账号有权访问的内容。
+`ALLOWED_WORKDIRS` limits session starting directories and the local artifact paths the gateway may send, but it is not a filesystem sandbox for the CLIs; an approval-free CLI can still reach anything its operating-system account can access.
 
-## 配置
+## Configuration
 
-项目只需要 Telegram token、白名单和 CLI 路径。创建 `.env` 并确保只有当前用户可读：
+The project only needs a Telegram token, an allowlist, and CLI paths. Create `.env` and make sure only the current user can read it:
 
 ```bash
 cp .env.example .env
@@ -57,22 +56,17 @@ chmod 600 .env
 ./scripts/run.sh --check
 ```
 
-需要多个 Telegram Bot 入口时，直接增加任意非空的
-`TELEGRAM_BOT_TOKEN_<名称>`，无需额外开关：
+To run multiple Telegram bot entrances, just add any non-empty `TELEGRAM_BOT_TOKEN_<name>`; no extra switch is needed:
 
 ```dotenv
-TELEGRAM_BOT_TOKEN=主入口_token
-TELEGRAM_BOT_TOKEN_2=第二入口_token
-TELEGRAM_BOT_TOKEN_RESEARCH=研究入口_token
+TELEGRAM_BOT_TOKEN=primary_bot_token
+TELEGRAM_BOT_TOKEN_2=second_bot_token
+TELEGRAM_BOT_TOKEN_RESEARCH=research_bot_token
 ```
 
-所有 Bot 共享同一套 CLI session。每个 Bot 对话的当前 session 与返回历史独立；
-一个 Bot 切换 session 不会影响另一个。任务结果始终返回发起任务的 Bot，其他 Bot
-可用 `/use <会话ID>` 主动读取该 session 的最新运行快照或本次网关运行期间缓存的
-最近结果。运行中从另一 Bot 追加输入不会改变原任务的回复入口。`<名称>` 会作为
-持久状态键使用，配置后不要随意改名。
+All bots share the same set of CLI sessions. Each bot conversation keeps its own current session and back-history, so switching sessions in one bot does not affect another. A task's result always returns to the bot that started it; other bots can use `/use <session-id>` to read that session's latest run snapshot or the most recent result cached during the current gateway run. Appending input from another bot while a task runs does not change the original task's reply entrance. The `<name>` is used as a persistent state key, so do not rename it once configured.
 
-常用配置：
+Common settings:
 
 ```dotenv
 TELEGRAM_ALLOW_GROUPS=false
@@ -81,59 +75,54 @@ ALLOWED_WORKDIRS=/srv/projects
 STREAM_UPDATE_INTERVAL=10
 TELEGRAM_MAX_FILE_BYTES=47185920
 AUTO_RESUME=false
-# 可选：额外的直连命令扩展目录，必须在 ALLOWED_WORKDIRS 内
+# Optional: an extra direct command extension directory, must be inside ALLOWED_WORKDIRS
 # COMMAND_DIR=/srv/projects/my-commands
 ENABLED_CLIS=claude,codex,grok,pi
 DEFAULT_CODEX_MODEL=gpt-6-astra
 DEFAULT_CODEX_EFFORT=high
 ```
 
-`AUTO_RESUME=true` 时，网关重启后会自动续跑上次被意外中断的任务（用户主动 /interrupt 的除外）；默认 `false`，收到提示后用 `/resume` 手动恢复、用 `/cancel` 放弃。
+With `AUTO_RESUME=true`, the gateway automatically continues tasks that were interrupted by an unexpected restart (excluding tasks you stopped with `/interrupt`); the default is `false`, in which case you reply `/resume` to recover manually or `/cancel` to give up.
 
-`ENABLED_CLIS` 可把一个网关实例限制为指定 CLI；例如 `ENABLED_CLIS=codex`。未启用的 CLI 不能创建或切换会话，Codex 未启用时也不会启动其 app-server。
+`ENABLED_CLIS` can restrict one gateway instance to specific CLIs, for example `ENABLED_CLIS=codex`. Disabled CLIs can neither create nor switch sessions, and when Codex is disabled its app-server is not started at all.
 
-`DEFAULT_<CLI>_MODEL` 和 `DEFAULT_<CLI>_EFFORT` 设置该 CLI 的新会话默认值；已有会话只要没有用 `/model` 或 `/effort` 显式覆盖，也会继承它。`/model default`、`/effort default` 可恢复继承。上面的 Codex 配置使用官方模型标识 `gpt-6-astra` 和 `high` 推理力度，不会改动机器上其他 Codex CLI 的全局配置。
+`DEFAULT_<CLI>_MODEL` and `DEFAULT_<CLI>_EFFORT` set defaults for that CLI's new sessions; existing sessions also inherit them as long as they have not explicitly overridden them with `/model` or `/effort`. `/model default` and `/effort default` restore inheritance. The Codex settings above use the official model identifier `gpt-6-astra` and `high` reasoning effort, and do not modify the global configuration of other Codex CLIs on the machine.
 
-附件保存在 `.runtime/uploads/`，目录权限为 `0700`、文件权限为 `0600`。默认最大 20 MiB。
+Attachments are stored in `.runtime/uploads/` with directory permissions `0700` and file permissions `0600`. The default maximum is 20 MiB.
 
-发送上限 `TELEGRAM_MAX_FILE_BYTES` 默认 45 MiB：Telegram Bot API 允许 `sendDocument`/
-`sendVideo` 上传 50 MB、`sendPhoto` 10 MB。**超过上限的产物不会被自动发送，也不会提供
-「发送文件」按钮**，卡片上只给一个「路径」按钮，点开会回一条含本机绝对路径的消息。
-想发更大的文件需要自建 Local Bot API Server（上限 2 GB），那是额外的部署件，网关不代管。
+The send limit `TELEGRAM_MAX_FILE_BYTES` defaults to 45 MiB: the Telegram Bot API allows `sendDocument`/`sendVideo` uploads of 50 MB and `sendPhoto` of 10 MB. **An artifact over the limit is never auto-sent and never offered a "send file" button**; the card only shows a "path" button, and tapping it replies with the local absolute path. Sending larger files requires a self-hosted Local Bot API Server (2 GB limit), which is a separate deployment piece the gateway does not manage.
 
-## 直连命令扩展
+## Direct Command Extensions
 
-把一个目录放到仓库的 `extensions/` 下（或用 `COMMAND_DIR` 指向别处），网关启动时会扫描
-`extensions/*/manifest.json`，并在 Telegram 上注册对应命令：
+Put a directory under the repository's `extensions/` (or point `COMMAND_DIR` somewhere else) and the gateway scans `extensions/*/manifest.json` at startup, registering the corresponding command on Telegram:
 
 ```
 extensions/bilibili/
-├─ manifest.json      # 声明命令名、exec、cwd、超时
-└─ main.py            # 插件本体，只依赖 argv + TG_* 环境变量 + stdout
+├─ manifest.json      # declares command name, exec, cwd, timeout
+└─ main.py            # the plugin itself; depends only on argv + TG_* env vars + stdout
 ```
 
-命中命令时网关**直接执行本地进程**，不启动任何 AI CLI、不创建会话、不消耗 token：
+When the command is invoked, the gateway **runs a local process directly**, starting no AI CLI, creating no session, and consuming no tokens:
 
 ```text
 /bili https://www.bilibili.com/video/BV1xx411c7mD 1080p
 ```
 
-- 进度：插件往 stdout 写 `@@PROGRESS <文本>`，网关原地刷新同一条消息；其余输出跑完一次性发出
-- 产物：stdout 里位于 `ALLOWED_WORKDIRS` 内的真实文件会挂上「发送文件/图片/视频」按钮，
-  走既有的 `TELEGRAM_MAX_FILE_BYTES` 与 `AUTO_SEND_ARTIFACTS` 规则
-- 中断：`/interrupt` 在会话空闲时终止本聊天正在运行的命令（会杀整个进程组）
-- 排障：`/commands` 查看已加载的扩展、用法、工作目录和 manifest 路径；单个扩展不合格只跳过它自己
+- Progress: the plugin writes `@@PROGRESS <text>` to stdout and the gateway refreshes the same message in place; all other output is sent once when the run finishes
+- Artifacts: real files on stdout that live inside `ALLOWED_WORKDIRS` get "send file/image/video" buttons, following the existing `TELEGRAM_MAX_FILE_BYTES` and `AUTO_SEND_ARTIFACTS` rules
+- Interruption: `/interrupt` terminates the command currently running in this chat when the session is idle (killing the whole process group)
+- Troubleshooting: `/commands` shows the loaded extensions, their usage, working directory, and manifest path; a single invalid extension only skips itself
 
-仓库自带的扩展：
+Extensions bundled with the repository:
 
-| 命令 | 说明 |
+| Command | Description |
 |---|---|
-| `/example` | 示例扩展，演示 argv / `@@PROGRESS` / 产物路径 |
-| `/bili` | B站下载：`/bili <URL|BV号> [画质]`，支持 Cookie 与扫码登录、分P、音频分离。用法与已踩过的坑见 [`extensions/bilibili/README.md`](extensions/bilibili/README.md) |
+| `/example` | Sample extension demonstrating argv / `@@PROGRESS` / artifact paths |
+| `/bili` | Bilibili download: `/bili <URL\|BV-id> [quality]`, supporting cookie and QR login, multi-part videos, and audio-only extraction. Usage and the pitfalls already hit are documented in [`extensions/bilibili/README.md`](extensions/bilibili/README.md) |
 
-完整字段、插件契约和安全边界见 [`extensions/README.md`](extensions/README.md)。
+Full field reference, plugin contract, and security boundary: [`extensions/README.md`](extensions/README.md).
 
-## 使用
+## Usage
 
 ```text
 /new
@@ -143,7 +132,7 @@ extensions/bilibili/
 /sessions
 /tasks
 /tgstats
-/rename codex-a8d1 主项目
+/rename codex-a8d1 main-project
 /back
 /interrupt
 /resume
@@ -158,15 +147,15 @@ extensions/bilibili/
 /example hello
 ```
 
-普通文字直接发给当前会话。发送文件或图片时，caption 会作为提示；没有 caption 时使用“请查看并处理这个附件”。
+Plain text goes straight to the current session. When you send a file or image, its caption is used as the prompt; without a caption the gateway uses "please look at and handle this attachment".
 
-`/reload` 只重启已配置 CLI 的运行后端，不会重读 `.env` 或 Gateway 源码；修改配置或 Gateway 本身后仍需重启 systemd 服务。任何目标会话仍在运行时，重载会拒绝执行，不会自动中断或重放任务。
+`/reload` only restarts the running backend of the configured CLIs; it does not re-read `.env` or the Gateway source. After changing the configuration or the Gateway itself you still need to restart the systemd service. If any target session is still running, the reload is refused rather than interrupting or replaying the task.
 
-项目使用 `uv` 管理本地 `.venv`，`scripts/run.sh` 会优先通过 `/home/openclaw/.local/bin/uv` 启动并在找不到 uv 时回退到系统 Python。
+The project manages its local `.venv` with `uv`; `scripts/run.sh` prefers to launch through `/home/openclaw/.local/bin/uv` and falls back to the system Python when `uv` is missing.
 
-私聊中的运行状态先发送一条 Rich Message，任务运行期间每 10 秒原地编辑更新（回答、当前命令、运行秒数），任务完成后把同一条消息编辑为最终答案并附产物按钮；编辑失败时回退到安全 HTML 消息。不使用临时 Draft，因为被中断的 Draft 无法由网关收尾，会留下无法消除的“加载中”气泡。
+Run status in a direct message starts as a Rich Message that is edited in place every 10 seconds for the duration of the task (answer, current command, elapsed seconds); when the task completes, the same message is edited into the final answer with artifact buttons attached, and if the edit fails the gateway falls back to a safe HTML message. No temporary Drafts are used, because an interrupted Draft cannot be finalized by the gateway and leaves an unremovable "loading" bubble.
 
-## systemd 用户服务
+## systemd User Service
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -176,12 +165,12 @@ systemctl --user enable --now telegram-cli-gateway
 journalctl --user -u telegram-cli-gateway -f
 ```
 
-## 测试
+## Tests
 
 ```bash
 uv run python -W error::ResourceWarning -m unittest discover -s tests -v
 ```
 
-## 三 Bot 隔离实验
+## Three-Bot Isolation Experiment
 
-Codex、Claude Code 和 Grok 的三容器隔离部署见 [`docker/experiments/README.md`](docker/experiments/README.md)。这是独立 gateway 实例的部署方式，不在 gateway 内增加多 Agent 编排。
+See [`docker/experiments/README.md`](docker/experiments/README.md) for the three-container isolated deployment of Codex, Claude Code, and Grok. This is a way to deploy independent gateway instances, not to add multi-agent orchestration inside the gateway.
