@@ -40,6 +40,13 @@ MAX_PUBLISH_RETRY_SECONDS = 30.0
 MAX_AUTO_SENT_ARTIFACTS = 3
 PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Telegram sendPhoto 上限
 
+# 客户端把超过 4096 字符的长文本拆成多条消息（无 media_group_id 等分组标记），
+# 这些片段在同一个 getUpdates 批次里连续到达。这里把它们拼回一条输入，否则
+# 后半段会变成 steer（追加）或排队。
+TEXT_FRAGMENT_MAX_CHARS = 4000
+TEXT_FRAGMENT_MAX_PARTS = 12
+TEXT_FRAGMENT_MAX_TOTAL_CHARS = 50_000
+
 # 会话状态（展示用，事件驱动；busy 判定仍是运行逻辑的权威）
 STATE_IDLE = "idle"
 STATE_WORKING = "working"
@@ -3271,6 +3278,112 @@ class GatewayApp:
             combined["caption"] = caption
         return {"update_id": max_update_id, "message": combined}
 
+    def _coalesce_text_fragments(
+        self, updates: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """把同一批次里被客户端拆开的长文本片段拼回一条更新。
+
+        客户端把超过 4096 字符的文本拆成多条普通消息，没有 media_group_id 之类
+        的分组标记，但会在同一个 getUpdates 批次里按顺序到达：除最后一段外每段
+        都达到 TEXT_FRAGMENT_MAX_CHARS。只合并这种保守模式，避免把用户连续发送的
+        若干条普通消息误当成一条。
+        """
+        merged: list[dict[str, Any]] = []
+        index = 0
+        while index < len(updates):
+            update = updates[index]
+            first = self._fragment_message(update)
+            if first is None or len(first["text"]) < TEXT_FRAGMENT_MAX_CHARS:
+                merged.append(update)
+                index += 1
+                continue
+            group = [update]
+            total = len(first["text"])
+            last = first
+            index += 1
+            while (
+                len(group) < TEXT_FRAGMENT_MAX_PARTS
+                and len(last["text"]) >= TEXT_FRAGMENT_MAX_CHARS
+                and index < len(updates)
+            ):
+                candidate = self._fragment_message(updates[index])
+                if candidate is None or not self._same_fragment_run(last, candidate):
+                    break
+                if total + len(candidate["text"]) > TEXT_FRAGMENT_MAX_TOTAL_CHARS:
+                    break
+                group.append(updates[index])
+                total += len(candidate["text"])
+                last = candidate
+                index += 1
+            merged.append(self._stitch_text_fragments(group) if len(group) > 1 else update)
+        return merged
+
+    @staticmethod
+    def _fragment_message(update: dict[str, Any]) -> dict[str, Any] | None:
+        """仅纯文本消息参与片段合并；附件、相册都不属于长文本拆分。"""
+        message = update.get("message")
+        if not isinstance(message, dict):
+            return None
+        if any(
+            key in message
+            for key in (
+                "caption",
+                "document",
+                "media",
+                "media_group_id",
+                "photo",
+                "sticker",
+                "voice",
+            )
+        ):
+            return None
+        text = message.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        return message
+
+    @staticmethod
+    def _same_fragment_run(previous: dict[str, Any], candidate: dict[str, Any]) -> bool:
+        def identity(message: dict[str, Any]) -> tuple[Any, ...]:
+            chat = message.get("chat")
+            sender = message.get("from")
+            return (
+                chat.get("id") if isinstance(chat, dict) else None,
+                sender.get("id") if isinstance(sender, dict) else None,
+                message.get("message_thread_id"),
+                message.get("direct_messages_topic_id"),
+            )
+
+        # 只有第一段能带 reply_to_message（用户在回复某条消息时输入超长文本）。
+        # 后续段都带回复时就说明这是连续发的多条回复，不能拼在一起。
+        if isinstance(candidate.get("reply_to_message"), dict):
+            return False
+        if identity(previous) != identity(candidate):
+            return False
+        previous_id = previous.get("message_id")
+        candidate_id = candidate.get("message_id")
+        if (
+            not isinstance(previous_id, int)
+            or not isinstance(candidate_id, int)
+            or not 0 < candidate_id - previous_id <= 2
+        ):
+            return False
+        previous_date = previous.get("date")
+        candidate_date = candidate.get("date")
+        if (
+            isinstance(previous_date, int)
+            and isinstance(candidate_date, int)
+            and not 0 <= candidate_date - previous_date <= 2
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _stitch_text_fragments(group: list[dict[str, Any]]) -> dict[str, Any]:
+        first = dict(group[0]["message"])
+        first["text"] = "".join(part["message"]["text"] for part in group)
+        return {"update_id": group[-1].get("update_id"), "message": first}
+
     def handle_update(self, update: dict[str, Any]) -> None:
         callback = update.get("callback_query")
         if isinstance(callback, dict):
@@ -3389,8 +3502,10 @@ class GatewayApp:
         offset = self.sessions.get_telegram_offset(bot_key)
         while not self.stop_event.is_set():
             try:
-                updates = telegram.get_updates(offset, self.config.poll_timeout)
-                for update in self._coalesce_updates(updates):
+                batch = self._coalesce_updates(
+                    telegram.get_updates(offset, self.config.poll_timeout)
+                )
+                for update in self._coalesce_text_fragments(batch):
                     update_id = update.get("update_id")
                     if isinstance(update_id, int):
                         offset = update_id + 1

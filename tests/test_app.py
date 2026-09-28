@@ -658,6 +658,165 @@ class GatewayEventTests(unittest.TestCase):
             self.assertNotIn("document", message)
             self.assertEqual(coalesced[1], updates[3])
 
+    def test_client_split_long_text_is_stitched_back_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            tail = "end of the long message"
+            updates = [
+                {
+                    "update_id": 20,
+                    "message": {
+                        "message_id": 100,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1700,
+                        "text": "a" * 4096,
+                    },
+                },
+                {
+                    "update_id": 21,
+                    "message": {
+                        "message_id": 101,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1701,
+                        "text": tail,
+                    },
+                },
+            ]
+            coalesced = app._coalesce_text_fragments(updates)
+            self.assertEqual(len(coalesced), 1)
+            self.assertEqual(coalesced[0]["update_id"], 21)
+            self.assertEqual(coalesced[0]["message"]["text"], "a" * 4096 + tail)
+            # 单段文本不受影响
+            self.assertEqual(app._coalesce_text_fragments([updates[1]]), [updates[1]])
+
+    def test_ordinary_consecutive_messages_stay_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            updates = [
+                {
+                    "update_id": 30,
+                    "message": {
+                        "message_id": 200,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1700,
+                        "text": "first normal message",
+                    },
+                },
+                {
+                    "update_id": 31,
+                    "message": {
+                        "message_id": 201,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1701,
+                        "text": "second normal message",
+                    },
+                },
+            ]
+            self.assertEqual(app._coalesce_text_fragments(updates), updates)
+
+    def test_reply_continuation_parts_are_not_stitched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            reply = {"message_id": 900}
+            updates = [
+                {
+                    "update_id": 50,
+                    "message": {
+                        "message_id": 400,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1700,
+                        "reply_to_message": reply,
+                        "text": "y" * 4096,
+                    },
+                },
+                {
+                    "update_id": 51,
+                    "message": {
+                        "message_id": 401,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1701,
+                        "reply_to_message": reply,
+                        "text": "separate reply",
+                    },
+                },
+            ]
+            self.assertEqual(app._coalesce_text_fragments(updates), updates)
+
+    def test_long_reply_keeps_its_reply_route_after_stitching(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            reply = {"message_id": 900}
+            updates = [
+                {
+                    "update_id": 60,
+                    "message": {
+                        "message_id": 500,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1700,
+                        "reply_to_message": reply,
+                        "text": "z" * 4096,
+                    },
+                },
+                {
+                    "update_id": 61,
+                    "message": {
+                        "message_id": 501,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1701,
+                        "text": "rest of the reply",
+                    },
+                },
+            ]
+            coalesced = app._coalesce_text_fragments(updates)
+            self.assertEqual(len(coalesced), 1)
+            self.assertEqual(coalesced[0]["message"]["reply_to_message"], reply)
+            self.assertEqual(
+                coalesced[0]["message"]["text"], "z" * 4096 + "rest of the reply"
+            )
+
+    def test_split_long_text_queues_one_turn_instead_of_steering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            app.sessions.create_headless("pi", project, 1)
+            turns: list[str] = []
+            app._send_to_current = (  # type: ignore[method-assign]
+                lambda _chat_id, text, _attachments=(): turns.append(text)
+            )
+            updates = [
+                {
+                    "update_id": 40,
+                    "message": {
+                        "message_id": 300,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1700,
+                        "text": "x" * 4096,
+                    },
+                },
+                {
+                    "update_id": 41,
+                    "message": {
+                        "message_id": 301,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "date": 1701,
+                        "text": "last part",
+                    },
+                },
+            ]
+            for update in app._coalesce_text_fragments(updates):
+                app.handle_update(update)
+            self.assertEqual(turns, ["x" * 4096 + "last part"])
+
     def test_media_group_forwards_all_attachments_in_one_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
