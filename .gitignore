@@ -8,3 +8,6 @@ __pycache__/
 .pytest_cache/
 .learnings/
 docker/experiments/secrets/
+
+# Locally installed commands are discovered without being versioned.
+/extensions/article/

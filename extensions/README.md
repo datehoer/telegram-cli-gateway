@@ -14,12 +14,16 @@ extensions/
 
 | Source | Notes |
 |---|---|
-| `<repo>/extensions/*/manifest.json` | Versioned with the repository, always scanned |
+| `<repo>/extensions/*/manifest.json` | Bundled or locally installed, always scanned |
 | The directory `COMMAND_DIR` points at | Optional, must be inside `ALLOWED_WORKDIRS`, for extensions kept elsewhere |
 
 - Editing a manifest or adding an extension requires a gateway restart; **there is no hot reload**.
 - A failing extension only skips itself and logs a warning; it does not affect gateway startup or other extensions.
 - When `command` collides with a built-in command or with an already loaded extension, the later one is skipped with a warning.
+
+Local installations can stay under `extensions/` without being tracked by Git.
+`extensions/article/` is one such installation and is ignored by this repository.
+It uses the existing manifest contract and requires no gateway core changes.
 
 ## manifest.json
 
