@@ -294,8 +294,8 @@ for value in values:
         session = CliSession("pi-compact", "pi", "/tmp", "", "", 1, "now", "headless-json", "sess-1")
         result = backend.compact_session(session)
         self.assertEqual(result, "已触发上下文压缩。")
-        # RPC compact 只发 JSON 命令，不走事件流，因此不产生任何 CLI 事件。
-        self.assertEqual([kind for kind, _data in events], [])
+        # Compression invalidates the old occupancy without creating an answer turn.
+        self.assertEqual(events, [("usage", {"context_tokens": None, "external_id": "sess-1"})])
 
     def test_compact_session_reports_failure(self) -> None:
         """Pi RPC compact 失败（无可压缩内容等）返回错误摘要而不是抛异常。"""

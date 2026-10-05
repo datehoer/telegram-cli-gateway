@@ -327,7 +327,7 @@ class OversizedArtifactTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.project = Path(temporary.name)
 
-    def make_app(self, limit: int) -> GatewayApp:
+    def make_app(self, limit: int, local_api_url: str | None = None) -> GatewayApp:
         config = Config(
             project_dir=self.project,
             bot_token="test",
@@ -341,6 +341,7 @@ class OversizedArtifactTests(unittest.TestCase):
             output_max_bytes=65536,
             tmux_socket_name="tcg-oversize-test",
             telegram_max_file_bytes=limit,
+            telegram_local_api_url=local_api_url,
         )
         app = GatewayApp(config)
         for telegram in app._telegrams.values():
@@ -413,3 +414,19 @@ class OversizedArtifactTests(unittest.TestCase):
     def test_smaller_default_limit_still_allows_45mb_uploads(self) -> None:
         app = self.make_app(limit=45 * 1024 * 1024)
         self.assertEqual(app.artifact_send_limit, 45 * 1024 * 1024)
+
+    def test_local_one_gib_limit_offers_the_original_video_and_rejects_larger_files(self) -> None:
+        app = self.make_app(limit=1024 ** 3, local_api_url="http://127.0.0.1:8081")
+        session = app.sessions.create_headless("pi", self.project, 1)
+        original = self.project / "original.mp4"
+        too_large = self.project / "too-large.mp4"
+        for path, size in ((original, 101151627), (too_large, 1024 ** 3 + 1)):
+            with path.open("wb") as handle:
+                handle.truncate(size)
+        view = app._register_turn(session, "turn-local-large")
+        view.artifacts = [original, too_large]
+        markup = app._artifact_markup(view)
+        buttons = markup["inline_keyboard"]  # type: ignore[index]
+        self.assertEqual(buttons[0][0]["callback_data"].split(":")[0], "video")
+        self.assertEqual(buttons[1][0]["callback_data"].split(":")[0], "sendpath")
+        self.assertTrue(app.telegram._local_api)

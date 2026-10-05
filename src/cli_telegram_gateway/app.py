@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .attachments import Attachment
+from .claude_usage import read_claude_usage
 from .codex_backend import CodexAppServer, CodexBackendError
 from .commands import (
     CommandError,
@@ -32,6 +33,7 @@ from .headless_backend import HeadlessBackend, HeadlessBackendError
 from .models import list_efforts, list_models
 from .sessions import CliSession, SessionError, SessionManager
 from .telegram import TelegramClient, TelegramError
+from .usage import codex_usage, context_lines, quota_lines, usage_lines
 
 
 LOGGER = logging.getLogger("telegram-cli-gateway")
@@ -78,6 +80,8 @@ HELP_TEXT = """远程 CLI 网关
 /tasks              查看当前任务与等待队列
 /tgstats            查看 Telegram 写入与限流统计
 /where              查看当前会话和目录
+/status             查看 CLI 状态、上下文用量与账户额度
+/context            查看上下文用量与剩余空间
 /interrupt          中断当前任务
 /resume [会话]      继续上次被中断的任务
 /cancel [会话]      放弃上次被中断的任务
@@ -106,6 +110,8 @@ BOT_COMMANDS = (
     ("tasks", "查看任务队列"),
     ("tgstats", "查看 Telegram API 统计"),
     ("where", "显示当前会话"),
+    ("status", "查看 CLI 状态与额度"),
+    ("context", "查看上下文用量"),
     ("interrupt", "中断当前任务"),
     ("resume", "继续上次被中断的任务"),
     ("cancel", "放弃上次被中断的任务"),
@@ -185,7 +191,9 @@ class GatewayApp:
                 else f"telegram-metrics-{bot_key}.json"
             )
             self._telegrams[bot_key] = TelegramClient(
-                token, config.runtime_dir / metrics_name
+                token,
+                config.runtime_dir / metrics_name,
+                local_api_url=config.telegram_local_api_url,
             )
         self._default_telegram = next(iter(self._telegrams.values()))
         self.sessions = SessionManager(config)
@@ -515,6 +523,11 @@ class GatewayApp:
             return
         if command == "tgstats":
             self._send(chat_id, self._telegram_stats_text())
+            return
+        if command in {"status", "context"}:
+            session = self._current_or_reply(chat_id)
+            if session:
+                self._send(chat_id, self._session_diagnostics_text(session, full=command == "status"))
             return
         if command == "where":
             session = self._current_or_reply(chat_id)
@@ -875,6 +888,75 @@ class GatewayApp:
         if queued:
             text += f" · 排队 {queued}"
         return text
+
+    def _session_diagnostics_text(self, session: CliSession, *, full: bool) -> str:
+        session = self.sessions.get(session.session_id) or session
+        claude_quota: list[str] = []
+        claude_context_unavailable = False
+        if (
+            session.cli == "claude" and session.backend == "headless-json" and session.external_id
+            and "context_tokens" not in (session.usage or {})
+        ):
+            snapshot = read_claude_usage(session.external_id, session.cwd)
+            if snapshot:
+                self.sessions.update_usage(
+                    session.session_id, session.external_id, snapshot, only_if_missing=True,
+                )
+            session = self.sessions.get(session.session_id) or session
+        if session.cli == "claude" and session.backend == "headless-json":
+            usage_model = (session.usage or {}).get("model")
+            try:
+                diagnostics = self.headless.read_claude_diagnostics(
+                    session, model=usage_model or session.model, include_quota=full,
+                )
+                context = diagnostics.get("context") or {}
+                if context and (not usage_model or context.get("model") == usage_model):
+                    if not self.sessions.update_usage(
+                        session.session_id, session.external_id, context, expected_model=usage_model,
+                    ):
+                        claude_context_unavailable = True
+                else:
+                    claude_context_unavailable = True
+                claude_quota = diagnostics.get("quota_lines") or []
+            except HeadlessBackendError:
+                claude_context_unavailable = True
+                claude_quota = ["账户额度：暂时无法查询，请稍后重试。"]
+            session = self.sessions.get(session.session_id) or session
+        lines = [f"{session.label}（{session.session_id}） · {session.cli}"]
+        if full:
+            lines.extend([
+                f"状态：{self._session_status_text(session)}",
+                f"目录：{session.cwd}",
+                f"模型：{self._model_display(session)}",
+                f"推理力度：{self._effort_display(session)}",
+            ])
+            with self._state_lock:
+                view = next((
+                    view for (session_id, _turn_id), view in self._turns.items()
+                    if session_id == session.session_id and view.status == "running"
+                ), None)
+                if view:
+                    lines.append(f"当前任务：已运行 {max(0, int(time.monotonic() - view.started_at))}秒")
+                    if (
+                        view.model_label != self._model_header_label(session)
+                        or view.effort_label != self._effort_header_label(session)
+                    ):
+                        lines.append(f"当前任务模型：{view.model_label} · 推理力度：{view.effort_label}")
+        lines.extend(context_lines(session.usage))
+        if claude_context_unavailable:
+            lines.append("Claude 原生窗口查询暂时不可用，当前显示已保存数据。")
+        if full:
+            lines.extend(usage_lines(session.usage))
+            if session.backend == "codex-app-server":
+                try:
+                    lines.extend(quota_lines(self.codex.read_rate_limits()))
+                except CodexBackendError:
+                    lines.append("账户额度：暂时无法查询，请稍后重试。")
+            elif session.cli == "claude" and session.backend == "headless-json":
+                lines.extend(claude_quota or ["账户额度：Claude 未返回额度数据。"])
+            else:
+                lines.append(f"账户额度：{session.cli} 当前接入方式未提供额度查询。")
+        return "\n".join(lines)
 
     def _surface_switched_session(self, session: CliSession) -> None:
         with self._publish_lock:
@@ -2041,6 +2123,10 @@ class GatewayApp:
                 return
         session = self.sessions.get(session_id)
         if session:
+            if kind == "usage":
+                if isinstance(data, dict):
+                    self.sessions.update_usage(session_id, data.get("external_id"), data)
+                return
             if not self._update_turn(session, turn_id, kind, data):
                 return
             if kind in {"completed", "error"}:
@@ -2056,6 +2142,11 @@ class GatewayApp:
         session = self.sessions.find_by_external_id(thread_id)
         if not session:
             return
+        if method == "thread/tokenUsage/updated":
+            usage = codex_usage(params.get("tokenUsage"))
+            if usage:
+                self.sessions.update_usage(session.session_id, thread_id, usage)
+            return  # Usage can arrive after turn/completed; never create an answer card.
         with self._state_lock:
             if session.session_id in self._starting_events:
                 self._starting_events[session.session_id].append(("codex", (method, params)))
@@ -2098,6 +2189,9 @@ class GatewayApp:
         with self._state_lock:
             if (session.session_id, turn_id) in self._finished_turns:
                 return
+        item = params.get("item")
+        if method == "item/completed" and isinstance(item, dict) and item.get("type") == "contextCompaction":
+            self.sessions.update_usage(session.session_id, thread_id, {"context_tokens": None})
         compaction_key = (session.session_id, turn_id)
         with self._state_lock:
             is_compaction_turn = compaction_key in self._codex_compaction_turns
@@ -2109,6 +2203,7 @@ class GatewayApp:
             if method == "turn/completed":
                 with self._state_lock:
                     self._codex_compaction_turns.pop(compaction_key, None)
+                self.sessions.update_usage(session.session_id, thread_id, {"context_tokens": None})
                 self._finish_turn(session, thread_id, turn_id)
             return
         if method == "item/agentMessage/delta":
@@ -2569,8 +2664,7 @@ class GatewayApp:
             self._auto_send_artifacts(view)
         return True
 
-    # Bot API 的 sendPhoto 上限是 10MB，而 sendDocument/sendVideo 上传上限是 50MB。
-    # 用 45MB 作为默认上限，留 5MB 余量给 multipart 封装、文件名和未来收紧。
+    # 官方 Bot API 默认 45 MiB；配置本地 --local 服务后默认 1 GiB。
     @property
     def artifact_send_limit(self) -> int:
         return self.config.telegram_max_file_bytes

@@ -10,6 +10,66 @@ from cli_telegram_gateway.config import Config, ConfigError, load_env_file
 
 
 class ConfigTests(unittest.TestCase):
+    def test_local_bot_api_defaults_to_one_gib_and_accepts_an_explicit_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            values = {
+                "TELEGRAM_BOT_TOKEN": "123:test",
+                "TELEGRAM_ALLOWED_USERS": "100",
+                "ALLOWED_WORKDIRS": str(project),
+                "DEFAULT_WORKDIR": str(project),
+                "TELEGRAM_LOCAL_API_URL": "http://127.0.0.1:8081/",
+            }
+            with patch.dict(os.environ, values, clear=True):
+                config = Config.load(project)
+            self.assertEqual(config.telegram_local_api_url, "http://127.0.0.1:8081")
+            self.assertEqual(config.telegram_max_file_bytes, 1024 ** 3)
+            with patch.dict(os.environ, {**values, "TELEGRAM_MAX_FILE_BYTES": "100"}, clear=True):
+                self.assertEqual(Config.load(project).telegram_max_file_bytes, 100)
+
+    def test_cloud_bot_api_rejects_a_limit_it_cannot_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            values = {
+                "TELEGRAM_BOT_TOKEN": "123:test",
+                "TELEGRAM_ALLOWED_USERS": "100",
+                "ALLOWED_WORKDIRS": str(project),
+                "DEFAULT_WORKDIR": str(project),
+            }
+            with patch.dict(os.environ, values, clear=True):
+                self.assertEqual(Config.load(project).telegram_max_file_bytes, 45 * 1024 * 1024)
+            with patch.dict(os.environ, {**values, "TELEGRAM_MAX_FILE_BYTES": str(1024 ** 3)}, clear=True):
+                with self.assertRaisesRegex(ConfigError, "requires TELEGRAM_LOCAL_API_URL"):
+                    Config.load(project)
+
+    def test_local_api_requires_a_loopback_origin_and_supported_file_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            values = {
+                "TELEGRAM_BOT_TOKEN": "123:test",
+                "TELEGRAM_ALLOWED_USERS": "100",
+                "ALLOWED_WORKDIRS": str(project),
+                "DEFAULT_WORKDIR": str(project),
+            }
+            for url in (
+                "http://example.com:8081", "http://user:password@localhost:8081",
+                "file:///srv/projects", "http://localhost:8081/bot",
+                "http://localhost:8081?token=secret", "http://localhost:8081#fragment",
+                "http://localhost:65536", "http://localhost:0",
+            ):
+                with self.subTest(url=url), patch.dict(
+                    os.environ, {**values, "TELEGRAM_LOCAL_API_URL": url}, clear=True
+                ):
+                    with self.assertRaisesRegex(ConfigError, "loopback origin"):
+                        Config.load(project)
+            with patch.dict(os.environ, {
+                **values,
+                "TELEGRAM_LOCAL_API_URL": "http://[::1]:8081",
+                "TELEGRAM_MAX_FILE_BYTES": "2000000001",
+            }, clear=True):
+                with self.assertRaisesRegex(ConfigError, "2000 MB"):
+                    Config.load(project)
+
     def test_load_env_file_supports_quotes_and_comments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             env_file = Path(temporary) / ".env"

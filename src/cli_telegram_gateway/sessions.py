@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .usage import merge_usage
+
+
+_ANY_USAGE_MODEL = object()
 
 
 class SessionError(RuntimeError):
@@ -64,6 +68,7 @@ class CliSession:
     effort: str | None = None
     last_completed_message_id: int | None = None
     last_completed_message_ids: dict[str, int] | None = None
+    usage: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "CliSession":
@@ -75,6 +80,7 @@ class CliSession:
         normalized.setdefault("effort", None)
         normalized.setdefault("last_completed_message_id", None)
         normalized.setdefault("last_completed_message_ids", None)
+        normalized.setdefault("usage", None)
         return cls(**normalized)
 
     @property
@@ -309,6 +315,7 @@ class SessionManager:
                 raise SessionError(f"session not found: {session_id}")
             session.external_id = str(uuid.uuid4())
             session.turn_count = 0
+            session.usage = None
             self._state["sessions"][session_id] = asdict(session)
             self._save_state()
             return str(session.external_id)
@@ -321,6 +328,8 @@ class SessionManager:
             if session.backend == "tmux" and session.tmux_name:
                 self._tmux("kill-session", "-t", session.tmux_name, check=False)
             session.backend = backend
+            if session.external_id != external_id:
+                session.usage = None
             session.external_id = external_id
             session.tmux_name = ""
             session.log_path = ""
@@ -328,6 +337,24 @@ class SessionManager:
             self._state["sessions"][session_id] = asdict(session)
             self._save_state()
             return session
+
+    def update_usage(
+        self, session_id: str, external_id: str | None, usage: dict[str, Any], *,
+        only_if_missing: bool = False,
+        expected_model: object = _ANY_USAGE_MODEL,
+    ) -> bool:
+        with self._lock:
+            session = self._session_from_state(session_id)
+            if not session or session.external_id != external_id:
+                return False  # Ignore late reports from a cleared/deleted native session.
+            if only_if_missing and "context_tokens" in (session.usage or {}):
+                return False  # A live report or compaction won the race with history reads.
+            if expected_model is not _ANY_USAGE_MODEL and (session.usage or {}).get("model") != expected_model:
+                return False  # A window query must not attach the old model's capacity to a new model.
+            session.usage = merge_usage(session.usage, usage)
+            self._state["sessions"][session_id] = asdict(session)
+            self._save_state()
+            return True
 
     def all_sessions(self) -> list[CliSession]:
         with self._lock:

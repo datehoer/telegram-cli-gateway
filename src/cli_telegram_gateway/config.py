@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shlex
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -74,6 +75,29 @@ def _auto_send_mode(values: dict[str, str], key: str, default: str) -> str:
     return raw
 
 
+def _local_api_url(values: dict[str, str]) -> str | None:
+    raw = values.get("TELEGRAM_LOCAL_API_URL", "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        valid = (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and parsed.port != 0
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError("TELEGRAM_LOCAL_API_URL must be an HTTP(S) loopback origin")
+    return raw.rstrip("/")
+
+
 @dataclass(frozen=True)
 class Config:
     project_dir: Path
@@ -96,6 +120,7 @@ class Config:
     cli_default_models: dict[str, str] = field(default_factory=dict)
     cli_default_efforts: dict[str, str] = field(default_factory=dict)
     command_dir: Path | None = None
+    telegram_local_api_url: str | None = None
 
     @property
     def direct_command_roots(self) -> tuple[Path, ...]:
@@ -239,6 +264,20 @@ class Config:
         if not socket_name or not all(ch.isalnum() or ch in "-_" for ch in socket_name):
             raise ConfigError("TMUX_SOCKET_NAME may contain only letters, numbers, '-' and '_'")
 
+        local_api_url = _local_api_url(values)
+        file_limit = _positive_int(
+            values,
+            "TELEGRAM_MAX_FILE_BYTES",
+            1024 ** 3 if local_api_url else 45 * 1024 * 1024,
+        )
+        if not local_api_url and file_limit > 50 * 1024 * 1024:
+            raise ConfigError(
+                "TELEGRAM_MAX_FILE_BYTES above 50 MiB requires TELEGRAM_LOCAL_API_URL "
+                "and a Bot API server running with --local"
+            )
+        if local_api_url and file_limit > 2_000_000_000:
+            raise ConfigError("TELEGRAM_MAX_FILE_BYTES exceeds the Local Bot API 2000 MB limit")
+
         return cls(
             project_dir=project_dir,
             bot_token=token,
@@ -253,9 +292,8 @@ class Config:
             tmux_socket_name=socket_name,
             enabled_clis=enabled_clis,
             stream_update_interval=_positive_float(values, "STREAM_UPDATE_INTERVAL", 10.0),
-            telegram_max_file_bytes=_positive_int(
-                values, "TELEGRAM_MAX_FILE_BYTES", 45 * 1024 * 1024
-            ),
+            telegram_max_file_bytes=file_limit,
+            telegram_local_api_url=local_api_url,
             auto_send_artifacts=_auto_send_mode(values, "AUTO_SEND_ARTIFACTS", "off"),
             auto_resume=_boolean(values, "AUTO_RESUME", False),
             bot_tokens=tuple(configured_tokens),

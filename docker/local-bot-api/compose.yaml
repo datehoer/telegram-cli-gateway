@@ -1,0 +1,27 @@
+name: telegram-local-bot-api
+services:
+  bot-api:
+    build: .
+    image: telegram-cli-local-bot-api:e3e9dd8
+    restart: unless-stopped
+    env_file: ../../.telegram-bot-api.env
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - /srv/projects:/srv/projects:ro
+      - /srv/projects/telegram-cli-gateway/.runtime/local-bot-api:/srv/projects/telegram-cli-gateway/.runtime/local-bot-api:rw
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command:
+      - --local
+      - --http-ip-address=0.0.0.0
+      - --http-port=8081
+      - --dir=/srv/projects/telegram-cli-gateway/.runtime/local-bot-api
+      - --temp-dir=/srv/projects/telegram-cli-gateway/.runtime/local-bot-api/tmp
+      - --verbosity=0
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

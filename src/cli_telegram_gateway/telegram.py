@@ -58,9 +58,13 @@ def split_message(text: str, limit: int = 3800) -> list[str]:
 
 
 class TelegramClient:
-    def __init__(self, token: str, metrics_path: Path | None = None):
-        self._base_url = f"https://api.telegram.org/bot{token}/"
-        self._file_base_url = f"https://api.telegram.org/file/bot{token}/"
+    def __init__(
+        self, token: str, metrics_path: Path | None = None, *, local_api_url: str | None = None
+    ):
+        origin = (local_api_url or "https://api.telegram.org").rstrip("/")
+        self._base_url = f"{origin}/bot{token}/"
+        self._file_base_url = f"{origin}/file/bot{token}/"
+        self._local_api = bool(local_api_url)
         self._flood_wait_lock = threading.Lock()
         self._flood_wait_until = 0.0
         self._metrics = TelegramMetrics(metrics_path)
@@ -98,7 +102,9 @@ class TelegramClient:
         snapshot["flood_wait_seconds"] = int(remaining + 0.999)
         return snapshot
 
-    def _call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
+    def _call(
+        self, method: str, payload: dict[str, Any] | None = None, *, timeout: float = 45
+    ) -> Any:
         self._begin_api_call(method)
         encoded_payload: dict[str, str] = {}
         for key, value in (payload or {}).items():
@@ -109,7 +115,7 @@ class TelegramClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             try:
@@ -464,12 +470,17 @@ class TelegramClient:
         reported_size = metadata.get("file_size")
         if isinstance(reported_size, int) and reported_size > max_bytes:
             raise TelegramError(f"文件超过大小限制（最大 {max_bytes // 1024 // 1024} MB）")
-        request = urllib.request.Request(self._file_base_url + metadata["file_path"], method="GET")
+        file_path = metadata["file_path"]
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".part")
         total = 0
         try:
-            with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as handle:
+            if self._local_api and Path(file_path).is_absolute():
+                source = Path(file_path).open("rb")
+            else:
+                request = urllib.request.Request(self._file_base_url + file_path, method="GET")
+                source = urllib.request.urlopen(request, timeout=60)
+            with source as response, temporary.open("wb") as handle:
                 while chunk := response.read(64 * 1024):
                     total += len(chunk)
                     if total > max_bytes:
@@ -499,6 +510,22 @@ class TelegramClient:
             method, field_name = "sendVideo", "video"
         else:
             method, field_name = "sendDocument", "document"
+        if self._local_api:
+            try:
+                resolved = path.resolve(strict=True)
+                with resolved.open("rb"):
+                    pass
+            except OSError as exc:
+                self._metrics.record(method, "failed")
+                raise TelegramError(f"无法读取发送文件：{exc}") from exc
+            payload: dict[str, Any] = {"chat_id": chat_id, field_name: resolved.as_uri()}
+            if as_video:
+                payload["supports_streaming"] = "true"
+            # The --local server recognizes local inputs by the file:/ prefix;
+            # a bare absolute path is interpreted as a remote file identifier.
+            # It reads the file itself without buffering it in the gateway.
+            self._call(method, payload, timeout=3600)
+            return
         self._begin_api_call(method)
         content_type = "video/mp4" if as_video else "application/octet-stream"
         boundary = f"----telegram-cli-gateway-{uuid.uuid4().hex}"

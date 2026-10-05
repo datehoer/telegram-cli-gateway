@@ -61,6 +61,10 @@ If these conditions are not met, defer the work and record the concrete trigger 
 - An artifact over `TELEGRAM_MAX_FILE_BYTES` is never uploaded and never offered as a send
   button; it is reported as a local path instead. Do not add retry or chunking workarounds
   for the Bot API upload limit; raising it requires a self-hosted Local Bot API Server.
+  `TELEGRAM_LOCAL_API_URL` explicitly selects a loopback server running with `--local`;
+  it must share the gateway's absolute filesystem paths. Local uploads pass file URIs instead
+  of buffering large files, and local `getFile` paths are copied with the same size checks.
+  Never switch a live bot to this endpoint before its cloud `logOut` and an idle gateway.
 - Never log tokens, credentials, raw environment files, or unnecessary conversation contents.
 - For provider-policy reviews, verify current terms for the exact authentication route and usage pattern. A documented CLI flag alone does not establish permission for a gateway; distinguish billing restrictions, account enforcement, and credential sharing.
 

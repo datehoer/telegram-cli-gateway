@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,88 @@ from cli_telegram_gateway.telegram import TelegramClient, TelegramError, split_m
 
 
 class TelegramTests(unittest.TestCase):
+    def test_local_video_upload_sends_a_path_without_reading_the_file_into_memory(self) -> None:
+        client = TelegramClient("test", local_api_url="http://127.0.0.1:8081/")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true, "result": {"message_id": 7}}'
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "large clip.mp4"
+            with path.open("wb") as handle:
+                handle.truncate(1024 ** 3)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("must not buffer")):
+                with patch("urllib.request.urlopen", return_value=response) as upload:
+                    client.send_local_file(1, path, as_video=True)
+            request = upload.call_args.args[0]
+            self.assertEqual(request.full_url, "http://127.0.0.1:8081/bottest/sendVideo")
+            payload = urllib.parse.parse_qs(request.data.decode())
+            self.assertEqual(payload["video"], [path.resolve().as_uri()])
+            self.assertEqual(payload["supports_streaming"], ["true"])
+            self.assertEqual(upload.call_args.kwargs["timeout"], 3600)
+            self.assertLess(len(request.data), 1024)
+        self.assertEqual(client.metrics_snapshot()["today"]["new_messages"], 1)
+
+    def test_local_document_and_photo_use_their_own_fields(self) -> None:
+        client = TelegramClient("test", local_api_url="http://127.0.0.1:8081")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "asset.bin"
+            path.write_bytes(b"asset")
+            for as_photo, method, field in (
+                (False, "sendDocument", "document"), (True, "sendPhoto", "photo")
+            ):
+                with self.subTest(method=method), patch.object(client, "_call") as call:
+                    client.send_local_file(1, path, as_photo=as_photo)
+                self.assertEqual(call.call_args.args, (method, {
+                    "chat_id": 1, field: path.resolve().as_uri()
+                }))
+
+    def test_local_file_uri_preserves_spaces_unicode_and_reserved_filename_characters(self) -> None:
+        client = TelegramClient("test", local_api_url="http://127.0.0.1:8081")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "视频 #1+?.mp4"
+            path.write_bytes(b"video")
+            with patch.object(client, "_call") as call:
+                client.send_local_file(1, path, as_video=True)
+            uri = call.call_args.args[1]["video"]
+            self.assertTrue(uri.startswith("file:///"))
+            parsed = urllib.parse.urlsplit(uri)
+            self.assertEqual(parsed.query, "")
+            self.assertEqual(parsed.fragment, "")
+            self.assertEqual(urllib.parse.unquote(parsed.path), str(path.resolve()))
+
+    def test_local_download_copies_absolute_paths_and_enforces_the_size_limit(self) -> None:
+        client = TelegramClient("test", local_api_url="http://127.0.0.1:8081")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "server" / "video.mp4"
+            source.parent.mkdir()
+            source.write_bytes(b"video bytes")
+            destination = root / "uploads" / "video.mp4"
+            metadata = {"file_path": str(source)}
+            with patch.object(client, "get_file", return_value=metadata):
+                with patch("urllib.request.urlopen") as request:
+                    self.assertEqual(client.download_file("id", destination, 20), 11)
+                request.assert_not_called()
+                self.assertEqual(destination.read_bytes(), b"video bytes")
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+                destination.write_bytes(b"keep existing")
+                with self.assertRaisesRegex(TelegramError, "大小限制"):
+                    client.download_file("id", destination, 5)
+                self.assertEqual(destination.read_bytes(), b"keep existing")
+                self.assertFalse(destination.with_suffix(".mp4.part").exists())
+
+    def test_cloud_download_does_not_open_a_server_absolute_path(self) -> None:
+        client = TelegramClient("test")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = [b"bytes", b""]
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "video.mp4"
+            with patch.object(client, "get_file", return_value={"file_path": "/server/video.mp4"}):
+                with patch("urllib.request.urlopen", return_value=response) as request:
+                    self.assertEqual(client.download_file("id", destination, 20), 5)
+            self.assertTrue(request.call_args.args[0].full_url.startswith("https://api.telegram.org/"))
+
     def test_http_error_exposes_telegram_retry_after(self) -> None:
         client = TelegramClient("test")
         body = json.dumps({

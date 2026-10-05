@@ -21,6 +21,9 @@ The product boundary and engineering principles are documented in [`AGENTS.md`](
 - With several concurrent sessions, only the "current" session is live-streamed: switching to a session posts a progress card at the bottom that refreshes in place every 10 seconds; the session you switched away from freezes as "running in background" and, once finished, only its own card is updated (long answers and files are never injected at the bottom of the session you are currently reading); switching back to an idle session later copies its last successful result to the bottom of the chat, while after `/clear` you get a short new-conversation notice; leftover cards are closed out with a one-line status when their task ends
 - Message edits retry on `retry_after` or capped exponential backoff when Telegram rate-limits or fails transiently
 - `/tgstats` shows today's and the last 7 days' Telegram new messages, edits, failures, 429s, and local deferrals; aggregated in UTC, retained for 14 days, and it records neither message content nor chat_id
+- `/status` shows the current CLI, model, effort, running/queued state, context usage, and Codex/Claude account quotas (remaining percentage and reset time, plus Codex additional credits when reported). Codex quota reads time out after 5 seconds; Claude native diagnostics share an 8-second deadline. Failures preserve local session status and saved context usage
+- `/context` shows the latest native context-usage snapshot and remaining space when the CLI reports a window size. Codex reports the latest request separately from cumulative session tokens; Claude/Grok use the latest main-agent input, including cache tokens, and Pi uses the latest successful response. Window sizes and balances are never guessed. These commands create no model turn; snapshots survive gateway restarts and are cleared on `/clear`, with context occupancy invalidated after compaction until the next report. Existing Claude sessions can backfill missing context on `/status` or `/context` from their native JSONL history (`CLAUDE_CONFIG_DIR` or `~/.claude`), with the original report time shown; failed/zero-token replies, subagents, discarded branches, and pre-compaction usage are excluded. Reads are limited to the last 8 MiB of the selected session file, and only numeric usage metadata is saved. Other older sessions acquire a snapshot on their next native report. Grok/Pi account quotas are not exposed by the current integrations
+- Claude window sizes and plan quotas come from its SDK controls, not a model-name table or terminal scraping. Each query starts a bounded ephemeral CLI process with session persistence, hooks, and MCP startup disabled. `get_context_usage` uses `detail: summary` to avoid token-count API requests; `/status` also reads `get_usage` with `skip_behaviors: true` to avoid scanning unrelated transcripts. The probe sends only control requests, neither resumes nor writes a native conversation, and never substitutes its empty conversation's usage for the selected session's snapshot. Unsupported controls, timeouts, and API-key/provider sessions without plan quotas are reported explicitly
 - Native Rich Markdown rendering for tables, headings, lists, task lists, links, quotes, formulas, and code blocks
 - Automatic fallback to safe HTML/plain text when Rich Messages are unavailable
 - Receives Telegram files and images and hands them to the current CLI
@@ -90,7 +93,7 @@ With `AUTO_RESUME=true`, the gateway automatically continues tasks that were int
 
 Attachments are stored in `.runtime/uploads/` with directory permissions `0700` and file permissions `0600`. The default maximum is 20 MiB.
 
-The send limit `TELEGRAM_MAX_FILE_BYTES` defaults to 45 MiB: the Telegram Bot API allows `sendDocument`/`sendVideo` uploads of 50 MB and `sendPhoto` of 10 MB. **An artifact over the limit is never auto-sent and never offered a "send file" button**; the card only shows a "path" button, and tapping it replies with the local absolute path. Sending larger files requires a self-hosted Local Bot API Server (2 GB limit), which is a separate deployment piece the gateway does not manage.
+The send limit `TELEGRAM_MAX_FILE_BYTES` defaults to 45 MiB with the cloud Bot API. **An artifact over the configured limit is never auto-sent and never offered a "send file" button**; the card shows a "path" button. For larger files, deploy a co-located Bot API server with `--local` and set `TELEGRAM_LOCAL_API_URL=http://127.0.0.1:8081`. Local mode defaults to 1 GiB and sends file URIs without buffering the artifact in gateway memory. It also supports local `getFile` downloads. See [local deployment and migration](docs/local-bot-api.md); Telegram application credentials and cloud `logOut` are required before switching.
 
 ## Direct Command Extensions
 
@@ -132,6 +135,8 @@ Full field reference, plugin contract, and security boundary: [`extensions/READM
 /sessions
 /tasks
 /tgstats
+/status
+/context
 /rename codex-a8d1 main-project
 /back
 /interrupt
@@ -151,7 +156,7 @@ Plain text goes straight to the current session. When you send a file or image, 
 
 `/reload` only restarts the running backend of the configured CLIs; it does not re-read `.env` or the Gateway source. After changing the configuration or the Gateway itself you still need to restart the systemd service. If any target session is still running, the reload is refused rather than interrupting or replaying the task.
 
-The project manages its local `.venv` with `uv`; `scripts/run.sh` prefers to launch through `/home/openclaw/.local/bin/uv` and falls back to the system Python when `uv` is missing.
+The project manages its local `.venv` with `uv`; `scripts/run.sh` prefers to launch through `~/.local/bin/uv` and falls back to the system Python when `uv` is missing.
 
 Run status in a direct message starts as a Rich Message that is edited in place every 10 seconds for the duration of the task (answer, current command, elapsed seconds); when the task completes, the same message is edited into the final answer with artifact buttons attached, and if the edit fails the gateway falls back to a safe HTML message. No temporary Drafts are used, because an interrupted Draft cannot be finalized by the gateway and leaves an unremovable "loading" bubble.
 

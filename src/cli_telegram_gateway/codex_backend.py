@@ -319,6 +319,10 @@ class CodexAppServer:
         """手动压缩一个线程的上下文（原生 thread/compact/start）。"""
         self.request("thread/compact/start", {"threadId": thread_id})
 
+    def read_rate_limits(self) -> Any:
+        """Read account quotas without starting an inference turn."""
+        return self.request("account/rateLimits/read", {}, timeout=5)
+
     def archive_thread(self, thread_id: str) -> None:
         """归档一个线程，从活跃列表里收起（/clear 开新对话时归档旧线程）。"""
         self.request("thread/archive", {"threadId": thread_id})

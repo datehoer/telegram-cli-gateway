@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,18 @@ class GatewayEventTests(unittest.TestCase):
             cli_default_efforts=cli_default_efforts or {},
         )
         return GatewayApp(config)
+
+    def test_local_api_endpoint_is_used_for_every_bot_entrance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self.make_app(Path(temporary)).config
+            app = GatewayApp(replace(
+                config,
+                bot_tokens=(("default", "primary:test"), ("worker", "worker:test")),
+                telegram_local_api_url="http://127.0.0.1:8081",
+                telegram_max_file_bytes=1024 ** 3,
+            ))
+            self.assertEqual(app._telegrams["default"]._base_url, "http://127.0.0.1:8081/botprimary:test/")
+            self.assertEqual(app._telegrams["worker"]._base_url, "http://127.0.0.1:8081/botworker:test/")
 
     def test_turn_output_stays_with_the_bot_that_started_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

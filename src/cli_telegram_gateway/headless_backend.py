@@ -4,14 +4,17 @@ import json
 import os
 import signal
 import logging
+import selectors
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
 
 from .attachments import Attachment
 from .sessions import CliSession
+from .usage import claude_context_window, claude_quota_lines, headless_usage
 
 
 LOGGER = logging.getLogger("telegram-cli-gateway.headless")
@@ -38,6 +41,95 @@ class HeadlessBackend:
         with self._lock:
             process = self._active.get(session_id)
             return bool(process and process.poll() is None)
+
+    def read_claude_diagnostics(
+        self, session: CliSession, *, model: str | None = None,
+        include_quota: bool = False, timeout: float = 8,
+    ) -> dict[str, Any]:
+        """Query native SDK controls in an ephemeral process; send no user turn."""
+        if session.cli != "claude":
+            raise HeadlessBackendError("Claude diagnostics require a Claude session")
+        command = [*self.commands["claude"]]
+        if model:
+            command.extend(["--model", model])
+        command.extend([
+            "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            "--no-session-persistence", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--settings", '{"disableAllHooks":true}',
+        ])
+        try:
+            process = subprocess.Popen(
+                command, cwd=session.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0,
+            )
+        except OSError as exc:
+            raise HeadlessBackendError("无法启动 Claude 原生状态查询") from exc
+        selector = selectors.DefaultSelector()
+        assert process.stdin is not None and process.stdout is not None
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        buffer = b""
+        bytes_read = 0
+
+        def request(subtype: str, **options: Any) -> dict[str, Any]:
+            nonlocal buffer, bytes_read
+            if time.monotonic() >= deadline:
+                raise HeadlessBackendError("Claude 原生状态查询超时")
+            request_id = str(uuid.uuid4())
+            process.stdin.write(json.dumps({
+                "type": "control_request", "request_id": request_id,
+                "request": {"subtype": subtype, **options},
+            }).encode() + b"\n")
+            process.stdin.flush()
+            while True:
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    try:
+                        value = json.loads(line)
+                    except (ValueError, UnicodeDecodeError, RecursionError):
+                        continue
+                    if not isinstance(value, dict) or value.get("type") != "control_response":
+                        continue
+                    response = value.get("response")
+                    if not isinstance(response, dict) or response.get("request_id") != request_id:
+                        continue
+                    payload = response.get("response")
+                    if response.get("subtype") != "success" or not isinstance(payload, dict):
+                        raise HeadlessBackendError("Claude 原生状态接口未返回有效数据")
+                    return payload
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise HeadlessBackendError("Claude 原生状态查询超时")
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    raise HeadlessBackendError("Claude 原生状态查询已退出")
+                bytes_read += len(chunk)
+                if bytes_read > 2 * 1024 * 1024:
+                    raise HeadlessBackendError("Claude 原生状态响应超过限制")
+                buffer += chunk
+
+        try:
+            request("initialize")
+            result: dict[str, Any] = {}
+            try:
+                result["context"] = claude_context_window(request("get_context_usage", detail="summary"))
+            except (HeadlessBackendError, OSError):
+                result["context"] = {}
+            if include_quota:
+                try:
+                    # Wire protocol uses snake_case; the SDK's skipBehaviors
+                    # option maps to this and avoids scanning unrelated history.
+                    result["quota_lines"] = claude_quota_lines(request("get_usage", skip_behaviors=True))
+                except (HeadlessBackendError, OSError):
+                    result["quota_lines"] = ["账户额度：暂时无法查询，请稍后重试。"]
+            return result
+        except OSError as exc:
+            raise HeadlessBackendError("Claude 原生状态查询连接失败") from exc
+        finally:
+            self._terminate_process(process)
+            selector.close()
+            process.stdin.close()
+            process.stdout.close()
 
     def start_turn(
         self,
@@ -154,6 +246,9 @@ class HeadlessBackend:
                         return f"压缩未执行：{value['errorMessage']}"
                     if value.get("aborted"):
                         return "压缩已中止。"
+                    self.on_event(session.session_id, "compact", "usage", {
+                        "context_tokens": None, "external_id": session.external_id,
+                    })
                     summary = value.get("result", {}).get("summary") if isinstance(value.get("result"), dict) else None
                     if summary:
                         result_text = str(summary)[:600]
@@ -162,6 +257,9 @@ class HeadlessBackend:
                 elif value_type == "response" and value.get("id") == "compact":
                     if not value.get("success"):
                         return f"压缩未执行：{value.get('error') or 'compaction failed'}"
+                    self.on_event(session.session_id, "compact", "usage", {
+                        "context_tokens": None, "external_id": session.external_id,
+                    })
                     if result_text:
                         return f"压缩完成。摘要：{result_text}"
                     return "已触发上下文压缩。"
@@ -294,6 +392,8 @@ class HeadlessBackend:
                             if terminal_result is None or priority[kind] >= priority[terminal_result[0]]:
                                 terminal_result = (kind, data)
                         else:
+                            if kind == "usage":
+                                data = {**data, "external_id": session.external_id}
                             self.on_event(session.session_id, turn_id, kind, data)
             return_code = process.wait()
             stderr_thread.join(timeout=2)
@@ -335,9 +435,11 @@ class HeadlessBackend:
         tool_json_parts: dict[int, list[str]],
         emitted_text: bool,
     ) -> list[tuple[str, Any]]:
+        usage = headless_usage(cli, value)
+        events: list[tuple[str, Any]] = [("usage", usage)] if usage else []
         if cli in {"claude", "grok"}:
-            return self._parse_anthropic_event(value, tool_json_parts, emitted_text)
-        return self._parse_pi_event(value, emitted_text)
+            return events + self._parse_anthropic_event(value, tool_json_parts, emitted_text)
+        return events + self._parse_pi_event(value, emitted_text)
 
     def _parse_anthropic_event(
         self,
@@ -508,7 +610,7 @@ class HeadlessBackend:
         return True
 
     @staticmethod
-    def _terminate_process(process: subprocess.Popen[str]) -> None:
+    def _terminate_process(process: subprocess.Popen[Any]) -> None:
         # All processes created here own a fresh process group. Signal that
         # group so tools inheriting stdout cannot keep the reader alive forever.
         try:
