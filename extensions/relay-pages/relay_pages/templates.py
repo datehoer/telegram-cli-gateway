@@ -1,0 +1,201 @@
+"""HTML shells around the rendered body (design/components/ReaderPage.md).
+
+Every value interpolated here is escaped; only `body_html` (already sanitized by
+render.sanitize) is inserted as markup.
+"""
+from __future__ import annotations
+
+import math
+from datetime import datetime
+from html import escape
+from typing import Any
+
+from .store import now_utc, parse_iso
+
+ASSET_VERSION = {"value": "1"}  # replaced at server start with a content hash
+
+
+def _asset(name: str) -> str:
+    return f"/assets/{name}?v={ASSET_VERSION['value']}"
+
+
+def _head(title: str, *, og: dict[str, str] | None = None, script: str | None = "reader.js") -> str:
+    meta = ""
+    if og:
+        meta = "".join(
+            f'<meta property="og:{key}" content="{escape(value)}">\n' for key, value in og.items()
+        )
+    tail = f'<script src="{_asset(script)}" defer></script>\n' if script else ""
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<meta name="robots" content="noindex, nofollow">\n'
+        '<link rel="icon" href="data:,">\n'
+        f"<title>{escape(title)}</title>\n{meta}"
+        '<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">\n'
+        '<meta name="theme-color" content="#151e27" media="(prefers-color-scheme: dark)">\n'
+        f'<link rel="stylesheet" href="{_asset("tokens.css")}">\n'
+        f'<link rel="stylesheet" href="{_asset("relay-pages.css")}">\n'
+        f'<link rel="stylesheet" href="{_asset("app.css")}">\n'
+        f'<script src="{_asset("theme.js")}"></script>\n{tail}'
+        "</head>\n<body>\n"
+    )
+
+
+def _identity(meta: dict[str, Any]) -> tuple[str, str]:
+    """(display name, @username or '') for the header and footer."""
+    bot = meta.get("bot") or {}
+    username = str(bot.get("username") or "")
+    name = str(meta.get("author") or bot.get("name") or username or "Bot")
+    return name, username
+
+
+def _header(meta: dict[str, Any], *, minutes: bool = True) -> str:
+    name, username = _identity(meta)
+    created = parse_iso(meta.get("created_at")) or now_utc()
+    spans = []
+    if username:
+        spans.append(f"<span>@{escape(username)}</span>")
+    spans.append(
+        f'<span><time datetime="{escape(meta.get("created_at") or "")}">'
+        f"{created:%Y-%m-%d %H:%M} UTC</time></span>"
+    )
+    if minutes:
+        spans.append(f"<span>{int(meta.get('reading_minutes') or 1)} min read</span>")
+    return (
+        '<header class="rp-header">\n'
+        f'  <div class="rp-avatar" aria-hidden="true">{escape(name[:1].upper())}</div>\n'
+        '  <div class="rp-who">\n'
+        f'    <div class="rp-bot">{escape(name)}</div>\n'
+        f'    <div class="rp-meta">{"".join(spans)}</div>\n'
+        "  </div>\n</header>\n"
+    )
+
+
+def expiry_text(meta: dict[str, Any], moment: datetime | None = None) -> str:
+    expires = parse_iso(meta.get("expires_at"))
+    if expires is None:
+        return "Kept forever"
+    remaining = (expires - (moment or now_utc())).total_seconds()
+    if remaining <= 0:
+        return "Expired"
+    if remaining < 86400:
+        hours = max(1, math.ceil(remaining / 3600))
+        return f"Expires in {hours} hour{'' if hours == 1 else 's'}"
+    days = math.ceil(remaining / 86400)
+    return f"Expires in {days} day{'' if days == 1 else 's'}"
+
+
+def _back_link(username: str) -> str:
+    href = f"https://t.me/{escape(username)}" if username else "https://t.me/"
+    return f'<a class="rp-btn rp-btn-primary" href="{href}">Back to chat</a>'
+
+
+def _toc(toc: list[dict[str, Any]]) -> str:
+    if len(toc) <= 3:
+        return ""
+    items = "".join(
+        ('<li class="lv3">' if entry.get("level") == 3 else "<li>")
+        + f'<a href="#{escape(str(entry["id"]))}">{escape(str(entry["text"]))}</a></li>\n'
+        for entry in toc
+    )
+    return f'<details class="rp-toc" open>\n<summary>Contents</summary>\n<ol>\n{items}</ol>\n</details>\n'
+
+
+def page(meta: dict[str, Any], body_html: str, source: str) -> str:
+    name, username = _identity(meta)
+    title = str(meta.get("title") or "Untitled")
+    page_id = escape(str(meta["id"]))
+    by = f"@{escape(username)}" if username else escape(name)
+    og = {"title": title, "description": str(meta.get("description") or ""), "site_name": name}
+    return (
+        _head(f"{title} · {name}", og=og)
+        + f'<div class="rp-page"><article class="rp-card" data-page="{page_id}">\n'
+        + _header(meta)
+        + f'<h1 class="rp-title">{escape(title)}</h1>\n'
+        + _toc(meta.get("toc") or [])
+        + f'<div class="rp-prose">\n{body_html}</div>\n'
+        + f'<textarea class="rp-raw" hidden readonly aria-hidden="true">{escape(source)}</textarea>\n'
+        + '<footer class="rp-footer">\n'
+        + f'  <div class="rp-footer-note">Generated by {by} · {expiry_text(meta)} · '
+        + f'<a href="/p/{page_id}/raw">View raw Markdown</a></div>\n'
+        + '  <div class="rp-footer-actions"><button class="rp-btn" type="button" data-copy-all>Copy all</button>'
+        + f"{_back_link(username)}</div>\n"
+        + "</footer>\n</article></div>\n</body>\n</html>\n"
+    )
+
+
+def expired(meta: dict[str, Any]) -> str:
+    name, username = _identity(meta)
+    by = f"@{escape(username)}" if username else escape(name)
+    return (
+        _head(f"Expired · {name}")
+        + '<div class="rp-page"><article class="rp-card">\n'
+        + _header(meta, minutes=False)
+        + '<div class="rp-prose"><p>This page has expired.</p></div>\n'
+        + '<footer class="rp-footer">\n'
+        + f'  <div class="rp-footer-note">Generated by {by} · Expired</div>\n'
+        + f'  <div class="rp-footer-actions">{_back_link(username)}</div>\n'
+        + "</footer>\n</article></div>\n</body>\n</html>\n"
+    )
+
+
+def login(next_path: str, *, error: str | None = None, username: str = "") -> str:
+    """Says nothing about the page behind it: not its title, bot, or whether it exists."""
+    focus_user = "" if username else " autofocus"
+    focus_password = " autofocus" if username else ""
+    alert = f'<p class="rp-form-error" role="alert">{escape(error)}</p>\n' if error else ""
+    return (
+        _head("Sign in", script=None)
+        + '<div class="rp-page"><article class="rp-card rp-gate">\n'
+        + '<h1 class="rp-title">Sign in</h1>\n'
+        + '<div class="rp-prose"><p>This page is private. Sign in to read it.</p></div>\n'
+        + '<form class="rp-form" method="post" action="/auth/login">\n'
+        + f'<input type="hidden" name="next" value="{escape(next_path)}">\n'
+        + '<label class="rp-field"><span class="rp-label">Username</span>'
+        + '<input class="rp-input" name="username" autocomplete="username" autocapitalize="none" '
+        + f'spellcheck="false" required value="{escape(username)}"{focus_user}></label>\n'
+        + '<label class="rp-field"><span class="rp-label">Password</span>'
+        + f'<input class="rp-input" type="password" name="password" autocomplete="current-password" required{focus_password}></label>\n'
+        + alert
+        + '<div class="rp-form-actions"><button class="rp-btn rp-btn-primary" type="submit">Sign in</button></div>\n'
+        + "</form>\n</article></div>\n</body>\n</html>\n"
+    )
+
+
+def notice(title: str, text: str, *, link: tuple[str, str] | None = None) -> str:
+    action = (
+        f'<div class="rp-gate-actions"><a class="rp-btn" href="{escape(link[0])}">{escape(link[1])}</a></div>\n'
+        if link
+        else ""
+    )
+    return (
+        _head(title, script=None)
+        + '<div class="rp-page"><article class="rp-card rp-gate">\n'
+        + f'<h1 class="rp-title">{escape(title)}</h1>\n'
+        + f'<div class="rp-prose"><p>{escape(text)}</p></div>\n{action}'
+        + "</article></div>\n</body>\n</html>\n"
+    )
+
+
+def index(pages: list[dict[str, Any]], moment: datetime | None = None) -> str:
+    rows = []
+    for meta in pages[:200]:
+        name, _username = _identity(meta)
+        state = expiry_text(meta, moment)
+        rows.append(
+            f'<li><a href="/p/{escape(str(meta["id"]))}"><div class="rp-bot">{escape(str(meta.get("title") or "Untitled"))}</div>'
+            f'<div class="rp-meta"><span>{escape(name)}</span><span><time datetime="{escape(meta.get("created_at") or "")}">'
+            f'{escape(meta.get("created_at") or "")}</time></span><span>{state}</span></div></a></li>\n'
+        )
+    listing = f'<ul class="rp-list">\n{"".join(rows)}</ul>\n' if rows else '<div class="rp-prose"><p>No pages yet.</p></div>\n'
+    return (
+        _head("Pages")
+        + '<div class="rp-page"><article class="rp-card">\n'
+        + '<h1 class="rp-title">Pages</h1>\n'
+        + listing
+        + '<form class="rp-list-actions" method="post" action="/auth/logout">'
+        + '<button class="rp-btn" type="submit">Sign out</button></form>\n'
+        + "</article></div>\n</body>\n</html>\n"
+    )

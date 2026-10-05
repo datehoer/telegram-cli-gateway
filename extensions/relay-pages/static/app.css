@@ -1,0 +1,92 @@
+/* Relay Pages server additions. design/ holds the exported design system untouched;
+   this file fills its gaps (README "Design gaps") and styles the states the export
+   does not cover. Only tokens.css variables are used. */
+
+/* Interface copy is English (the export's Chinese copy is not used) */
+.rp-toc summary::after { content: "Show"; }
+.rp-toc[open] summary::after { content: "Hide"; }
+
+/* The page background fills the window (example.html set this inline; the CSP forbids inline style) */
+html, body { margin: 0; background: var(--surface-sunken); }
+.rp-page { min-height: 100vh; box-sizing: border-box; }
+@media (max-width: 640px) { html, body { background: var(--surface); } }
+
+/* measure (720px) is the card's width, giving the ~40 CJK characters per line DESIGN.md promises */
+.rp-card { box-sizing: border-box; }
+
+/* Block spacing: paragraphs space-4 (relay-pages.css), blocks space-6, ## space-8 */
+.rp-toc + .rp-prose { margin-top: var(--space-6); }
+.rp-prose > :first-child { margin-top: 0; }
+.rp-prose > :is(.rp-code, .rp-table-wrap, .rp-callout, blockquote, .footnotes),
+.rp-prose > :is(.rp-code, .rp-table-wrap, .rp-callout, blockquote) + :not(h2, h3, h4) { margin-top: var(--space-6); }
+.rp-prose > h2 { margin-top: var(--space-8); }
+.rp-prose > :is(h2, h3, h4) + * { margin-top: var(--space-2); }
+
+/* Nested paragraphs (callouts, quotes, loose lists) */
+.rp-prose :is(.rp-callout, blockquote, li) > p { margin: 0; }
+.rp-prose :is(.rp-callout, blockquote, li) > p + p { margin-top: var(--space-2); }
+.rp-prose li > :is(ul, ol) { margin-top: var(--space-1); }
+.rp-prose h4 { margin-bottom: 0; }
+
+/* A wrapped inline code span keeps a whole box on each line */
+.rp-prose :not(pre) > code { -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+
+/* Table alignment from Markdown (:--:) — inline styles are blocked by the CSP */
+.rp-table td.center, .rp-table th.center { text-align: center; }
+
+/* Task lists */
+.rp-prose li.task-list-item { list-style: none; }
+.rp-prose li.task-list-item > .task-list-item-checkbox { margin: 0 var(--space-2) 0 -1.4em; vertical-align: -1px; }
+
+/* Footnotes */
+.rp-prose .footnotes-sep { margin: var(--space-8) 0 0; }
+.rp-prose .footnotes { font-size: 14px; line-height: 22px; color: var(--ink-muted); }
+.rp-prose .footnotes ol { padding-left: 1.5em; margin: 0; }
+.rp-prose .footnote-ref a, .rp-prose .footnote-backref { text-decoration: none; }
+
+/* Line icons (16px, 1.6px stroke) drawn with a mask so they follow currentColor */
+.rp-icon { display: inline-block; width: 16px; height: 16px; flex: none; background-color: currentColor; -webkit-mask: var(--rp-icon) center / contain no-repeat; mask: var(--rp-icon) center / contain no-repeat; }
+.rp-btn-sm .rp-icon { width: 14px; height: 14px; }
+.rp-icon-info { --rp-icon: url("/assets/icons/info.svg"); }
+.rp-icon-check { --rp-icon: url("/assets/icons/check.svg"); }
+.rp-icon-warn { --rp-icon: url("/assets/icons/warn.svg"); }
+.rp-icon-danger { --rp-icon: url("/assets/icons/danger.svg"); }
+.rp-icon-copy { --rp-icon: url("/assets/icons/copy.svg"); }
+
+/* CodeBlock: blocks over 40 lines fold to 24 (pre: 22px lines + space-3 padding) */
+.rp-code.is-folded pre { max-height: calc(24 * 22px + var(--space-3)); overflow: hidden; }
+.rp-code-more { display: flex; justify-content: center; padding: var(--space-2); border-top: 1px solid var(--border); }
+
+/* Footer: when a long note pushes the buttons to their own row, they stay on the right */
+.rp-footer-actions { margin-left: auto; }
+
+/* Raw Markdown for "Copy all" */
+.rp-raw { display: none; }
+
+/* Login form and notices */
+.rp-gate .rp-prose { color: var(--ink-muted); }
+.rp-gate-actions { margin-top: var(--space-6); display: flex; gap: var(--space-2); }
+.rp-form { display: grid; gap: var(--space-4); max-width: 360px; margin-top: var(--space-6); }
+.rp-field { display: grid; gap: var(--space-1); }
+.rp-label { font-size: 14px; line-height: 20px; font-weight: 600; color: var(--ink); }
+.rp-input { box-sizing: border-box; width: 100%; height: 44px; padding: 0 var(--space-3); border: 1px solid var(--border-strong); border-radius: var(--radius-md); background: var(--surface); color: var(--ink); font-family: var(--font-sans); font-size: 16px; line-height: 24px; }
+.rp-input:hover { border-color: var(--accent); }
+.rp-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent); }
+.rp-form-error { margin: 0; font-size: 14px; line-height: 22px; color: var(--danger); }
+.rp-form-actions { display: flex; margin-top: var(--space-2); }
+.rp-form-actions .rp-btn { min-width: 120px; }
+
+/* Page list */
+.rp-list { list-style: none; margin: 0; padding: 0; }
+.rp-list li + li { border-top: 1px solid var(--border); }
+.rp-list a { display: block; padding: var(--space-3) var(--space-2); margin: 0 calc(-1 * var(--space-2)); border-radius: var(--radius-sm); color: var(--ink); text-decoration: none; transition: background-color .12s; }
+.rp-list a:hover { background: var(--surface-raised); }
+.rp-list a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rp-list .rp-meta { margin-top: 2px; }
+.rp-list-actions { margin-top: var(--space-8); padding-top: var(--space-6); border-top: 1px solid var(--border); display: flex; justify-content: flex-end; }
+
+/* Phones: the login button spans the form, 44px tall like the footer buttons */
+@media (max-width: 640px) {
+  .rp-form { max-width: none; }
+  .rp-form-actions .rp-btn { flex: 1; height: 44px; font-size: 15px; }
+}

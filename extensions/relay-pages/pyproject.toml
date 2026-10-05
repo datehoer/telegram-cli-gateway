@@ -1,0 +1,21 @@
+[project]
+name = "relay-pages"
+version = "0.1.0"
+description = "Publish long bot replies as private reading pages (Relay Pages design system)."
+requires-python = ">=3.11"
+dependencies = [
+    "markdown-it-py[linkify]>=3.0",
+    "mdit-py-plugins>=0.4",
+    "pygments>=2.17",
+    "nh3>=0.2.17",
+]
+
+[project.scripts]
+relay-page = "relay_pages.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["relay_pages*"]

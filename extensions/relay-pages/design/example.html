@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>部署日志汇总：v2.3.0 · Deploy Bot</title>
+<meta property="og:title" content="部署日志汇总：v2.3.0">
+<meta property="og:description" content="本次部署共执行 14 个任务，用时 3 分 12 秒。其中 2 个需要你处理。">
+<meta property="og:site_name" content="Deploy Bot">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#151e27" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="relay-pages.css">
+<style>html,body{margin:0}</style>
+</head>
+<body>
+<div class="rp-page"><article class="rp-card">
+<header class="rp-header">
+  <div class="rp-avatar" aria-hidden="true">D</div>
+  <div class="rp-who">
+    <div class="rp-bot">Deploy Bot</div>
+    <div class="rp-meta"><span>@deploy_bot</span><span>10月5日 14:32</span><span>约 6 分钟读完</span></div>
+  </div>
+</header>
+<h1 class="rp-title">部署日志汇总：v2.3.0</h1>
+<details class="rp-toc" open>
+  <summary>目录</summary>
+  <ol>
+    <li><a href="#a" class="is-active">执行结果</a></li>
+    <li class="lv3"><a href="#b">失败的任务</a></li>
+    <li class="lv3"><a href="#c">需要确认的任务</a></li>
+    <li><a href="#d">完整日志</a></li>
+  </ol>
+</details>
+<div style="height:24px"></div>
+<div class="rp-prose">
+<p>本次部署共执行 <strong>14 个任务</strong>，用时 3 分 12 秒。其中 <mark>2 个需要你处理</mark>，详见 <a href="#">失败的任务</a>。</p>
+<h2>执行结果</h2>
+<ul><li>web 前端已构建并上线</li><li>数据库迁移暂停，等待确认</li><li>运维通知发送失败，可运行 <code>tgcli retry notify:ops</code> 重试</li></ul>
+<blockquote>迁移会锁表约 20 秒，建议在低峰期确认。</blockquote>
+<h3>下一步</h3>
+<ol><li>在对话里回复「确认」继续迁移</li><li>检查 Webhook 配置</li></ol>
+</div>
+<div style="height:24px"></div>
+<div class="rp-callout warn"><div class="rp-callout-label"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 1.8 15 14H1z"/><path d="M8 6.5v3.5M8 11.8v.1"/></svg>注意</div>本次部署跳过了缓存预热，首次访问可能变慢。</div>
+<div style="height:24px"></div>
+<div class="rp-table-wrap"><table class="rp-table">
+  <thead><tr><th>任务</th><th>状态</th><th class="num">耗时</th></tr></thead>
+  <tbody>
+    <tr><td>build:web</td><td>完成</td><td class="num">1m 42s</td></tr>
+    <tr><td>migrate:db</td><td>需确认</td><td class="num">0m 18s</td></tr>
+    <tr><td>notify:ops</td><td>失败</td><td class="num">0m 03s</td></tr>
+  </tbody>
+</table></div>
+<div style="height:24px"></div>
+<div class="rp-code">
+  <div class="rp-code-bar"><span class="rp-code-lang">bash</span><button class="rp-btn rp-btn-sm" type="button" aria-label="复制代码"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>复制</button></div>
+<pre><code><span class="tok-c"># 把长回复发布成页面，返回 URL</span>
+<span class="tok-k">curl</span> -X POST https://pages.example.dev/api/pages \
+  -H <span class="tok-s">"Authorization: Bearer $TOKEN"</span> \
+  --data-binary @report.md \
+  -d <span class="tok-s">"ttl=</span><span class="tok-n">604800</span><span class="tok-s">"</span></code></pre>
+</div>
+<footer class="rp-footer">
+  <div class="rp-footer-note">由 @deploy_bot 生成 · 7 天后过期 · <a href="#">查看原始 Markdown</a></div>
+  <div class="rp-footer-actions"><button class="rp-btn" type="button">复制全文</button><a class="rp-btn rp-btn-primary" href="#">返回对话</a></div>
+</footer>
+</article></div>
+</body>
+</html>

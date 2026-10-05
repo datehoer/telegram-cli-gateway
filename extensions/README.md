@@ -21,6 +21,10 @@ extensions/
 - A failing extension only skips itself and logs a warning; it does not affect gateway startup or other extensions.
 - When `command` collides with a built-in command or with an already loaded extension, the later one is skipped with a warning.
 
+`extensions/relay-pages/` is not a command extension: it has no manifest, so discovery
+skips it. It is an optional companion service that turns long CLI replies into private
+reading pages; see its [README](relay-pages/README.md).
+
 Local installations can stay under `extensions/` without being tracked by Git.
 `extensions/article/` is one such installation and is ignored by this repository.
 It uses the existing manifest contract and requires no gateway core changes.

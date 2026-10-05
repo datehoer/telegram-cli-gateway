@@ -35,6 +35,7 @@ The product boundary and engineering principles are documented in [`AGENTS.md`](
 - Session IDs, local state, and CLI context are persisted
 - Single-instance file lock
 - Direct command extensions: `extensions/*/manifest.json` declares a command and the gateway spawns a local process directly — no AI call, no session context, no tokens burned. `/commands` lists installed commands and `/help` appends their usage; commands support `@@PROGRESS` lines that refresh in place, and their artifacts automatically get "send file/image/video" buttons. See the contract in [`extensions/README.md`](extensions/README.md)
+- Optional Relay Pages companion: agents publish long replies as private, password-protected reading pages and answer in Telegram with a summary and the link. It runs as its own service and the gateway does not depend on it; see [`extensions/relay-pages/README.md`](extensions/relay-pages/README.md)
 
 Voice transcription and text-to-speech are not wired up yet.
 

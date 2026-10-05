@@ -1,0 +1,15 @@
+[Unit]
+Description=Relay Pages (private reading pages for long bot replies)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/projects/telegram-cli-gateway/extensions/relay-pages
+ExecStart=/srv/projects/telegram-cli-gateway/extensions/relay-pages/.venv/bin/relay-page serve
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target
