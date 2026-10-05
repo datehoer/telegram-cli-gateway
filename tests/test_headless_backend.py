@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 import subprocess
 import threading
+from pathlib import Path
 
+from cli_telegram_gateway.attachments import Attachment
 from cli_telegram_gateway.headless_backend import HeadlessBackend, HeadlessBackendError
 from cli_telegram_gateway.sessions import CliSession
 
@@ -328,6 +330,22 @@ for value in values:
         args = backend._build_command(pi, "hi", ())
         self.assertIn(("--model", "hotday-deepseek/deepseek-v4-flash"), zip(args, args[1:]))
         self.assertIn(("--thinking", "low"), zip(args, args[1:]))
+
+    def test_pi_attaches_images_and_lists_other_files(self) -> None:
+        """pi 把非图片的 @file 当文本整段内联，WAV 这类二进制文件只能给路径。"""
+        backend = HeadlessBackend({"pi": ("pi",)}, lambda *_args: None)
+        pi = CliSession("p1", "pi", "/tmp", "", "", 1, "now", "headless-json", "id")
+        photo = Attachment(Path("/up/photo.jpg"), "photo.jpg", "image/jpeg", True)
+        heic = Attachment(Path("/up/shot.heic"), "shot.heic", "image/heic", True)
+        wav = Attachment(Path("/up/take.wav"), "take.wav", "audio/x-wav", False)
+        args = backend._build_command(pi, "听一下", (photo, heic, wav))
+        self.assertEqual([arg for arg in args if arg.startswith("@")], ["@/up/photo.jpg"])
+        prompt = args[-1]
+        self.assertTrue(prompt.startswith("听一下\n\n"))
+        self.assertIn("- shot.heic: /up/shot.heic", prompt)
+        self.assertIn("- take.wav: /up/take.wav", prompt)
+        self.assertNotIn("photo.jpg", prompt)
+        self.assertEqual(backend._build_command(pi, "hi", (photo,))[-1], "hi")
 
     def test_build_command_omits_unset_model_and_effort(self) -> None:
         backend = HeadlessBackend(

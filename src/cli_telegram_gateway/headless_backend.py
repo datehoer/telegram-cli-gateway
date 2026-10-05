@@ -19,6 +19,9 @@ from .usage import claude_context_window, claude_quota_lines, headless_usage
 
 LOGGER = logging.getLogger("telegram-cli-gateway.headless")
 
+# pi 只把这几种图片的 @file 作为图像附带，其余 @file 一律按 UTF-8 文本整段内联。
+PI_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+
 
 class HeadlessBackendError(RuntimeError):
     pass
@@ -333,7 +336,10 @@ class HeadlessBackend:
                 *session_args,
             ]
         session_args = ["--session-id", external_id] if first_turn else ["--session", external_id]
-        file_args = [f"@{item.path}" for item in attachments]
+        # 音频、视频、压缩包这类二进制文件内联后会塞满上下文，和 claude/grok 一样只给路径。
+        images = tuple(item for item in attachments if item.mime_type in PI_IMAGE_TYPES)
+        others = tuple(item for item in attachments if item.mime_type not in PI_IMAGE_TYPES)
+        file_args = [f"@{item.path}" for item in images]
         effort_args = ["--thinking", session.effort] if session.effort else []
         return [
             *base,
@@ -345,7 +351,7 @@ class HeadlessBackend:
             *effort_args,
             *session_args,
             *file_args,
-            text,
+            self._attachment_prompt(text, others),
         ]
 
     def _read_process(

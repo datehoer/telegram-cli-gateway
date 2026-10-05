@@ -28,7 +28,7 @@ The product boundary and engineering principles are documented in [`AGENTS.md`](
 - Claude window sizes and plan quotas come from its SDK controls, not a model-name table or terminal scraping. Each query starts a bounded ephemeral CLI process with session persistence, hooks, and MCP startup disabled. `get_context_usage` uses `detail: summary` to avoid token-count API requests; `/status` also reads `get_usage` with `skip_behaviors: true` to avoid scanning unrelated transcripts. The probe sends only control requests, neither resumes nor writes a native conversation, and never substitutes its empty conversation's usage for the selected session's snapshot. Unsupported controls, timeouts, and API-key/provider sessions without plan quotas are reported explicitly
 - Native Rich Markdown rendering for tables, headings, lists, task lists, links, quotes, formulas, and code blocks
 - Automatic fallback to safe HTML/plain text when Rich Messages are unavailable
-- Receives Telegram files and images and hands them to the current CLI
+- Receives any Telegram file and hands it to the current CLI: documents, images, audio (WAV, MP3, …), video, GIFs, voice and video notes, singly or as an album (stickers are not forwarded). Pi gets JPEG/PNG/GIF/WebP images as image attachments and every other file as a path, like the other CLIs
 - When an answer mentions a real file inside the allowed directories, a one-tap "send file/image/video" button is attached; MP4 files are sent as previewable video messages
 - Artifacts over 45 MiB (`TELEGRAM_MAX_FILE_BYTES`) are neither auto-sent nor offered a "send file" button; the card only shows a "path" button that returns the local absolute path (the Bot API upload limit is 50 MB, and raising it requires a self-hosted Local Bot API Server)
 - Artifacts are not auto-sent when an answer completes; the card keeps its "send file/image/video" buttons: `AUTO_SEND_ARTIFACTS=off` (default) / `images` (auto-send only images ≤10 MB) / `all` (also send existing files mentioned in the answer, which easily leaks source code along with the artifacts). A background completion in a non-current session never auto-sends files
@@ -37,7 +37,7 @@ The product boundary and engineering principles are documented in [`AGENTS.md`](
 - Direct command extensions: `extensions/*/manifest.json` declares a command and the gateway spawns a local process directly — no AI call, no session context, no tokens burned. `/commands` lists installed commands and `/help` appends their usage; commands support `@@PROGRESS` lines that refresh in place, and their artifacts automatically get "send file/image/video" buttons. See the contract in [`extensions/README.md`](extensions/README.md)
 - Optional Relay Pages companion: agents publish long replies as private, password-protected reading pages and answer in Telegram with a summary and the link. It runs as its own service and the gateway does not depend on it; see [`extensions/relay-pages/README.md`](extensions/relay-pages/README.md)
 
-Voice transcription and text-to-speech are not wired up yet.
+Voice notes reach the CLI as plain OGG files; voice transcription and text-to-speech are not wired up yet.
 
 ## Permission Mode
 

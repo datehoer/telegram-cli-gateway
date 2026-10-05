@@ -635,6 +635,76 @@ class GatewayEventTests(unittest.TestCase):
             self.assertTrue(forwarded[0][2][0].is_image)
             self.assertEqual(app.sessions.current(1).session_id, session.session_id)  # type: ignore[union-attr]
 
+    def test_audio_video_and_voice_updates_are_forwarded_as_files(self) -> None:
+        """WAV 常以 audio 到达；视频、语音、圆形视频和 GIF 也都是文件，一样转交给 CLI。"""
+        gif = {"file_id": "g", "file_name": "cat.gif.mp4", "mime_type": "video/mp4"}
+        cases: list[tuple[dict[str, Any], str, str]] = [
+            ({"audio": {"file_id": "a", "file_name": "take.wav", "mime_type": "audio/x-wav"}},
+             "take.wav", "audio/x-wav"),
+            ({"video": {"file_id": "v", "file_name": "clip.mov", "mime_type": "video/quicktime"}},
+             "clip.mov", "video/quicktime"),
+            ({"voice": {"file_id": "o", "file_unique_id": "u1", "mime_type": "audio/ogg"}},
+             "voice-u1.", "audio/ogg"),
+            ({"video_note": {"file_id": "n", "file_unique_id": "u2"}}, "video_note-u2.mp4", "video/mp4"),
+            # Bot API 给 GIF 同时下发 animation 和 document，只算一个附件。
+            ({"animation": gif, "document": gif}, "cat.gif.mp4", "video/mp4"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            app.sessions.create_headless("claude", project, 1)
+
+            def fake_download(_file_id: str, destination: Path, _max_bytes: int) -> int:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"data")
+                return 4
+
+            forwarded: list[tuple[int, str, tuple[Any, ...]]] = []
+            sent: list[str] = []
+            app.telegram.download_file = fake_download  # type: ignore[method-assign]
+            app._send = lambda _chat_id, text: sent.append(text)  # type: ignore[method-assign]
+            app._send_to_session = (  # type: ignore[method-assign]
+                lambda chat_id, _session, text, attachments=(): forwarded.append(
+                    (chat_id, text, attachments)
+                )
+            )
+            for fields, name_prefix, mime_type in cases:
+                with self.subTest(kind=next(iter(fields))):
+                    forwarded.clear()
+                    app.handle_update(
+                        {"message": {"from": {"id": 1}, "chat": {"id": 1, "type": "private"}, **fields}}
+                    )
+                    self.assertEqual(len(forwarded), 1)
+                    self.assertEqual(forwarded[0][1], "请查看并处理这个附件。")
+                    (attachment,) = forwarded[0][2]
+                    self.assertTrue(attachment.name.startswith(name_prefix), attachment.name)
+                    self.assertEqual(attachment.mime_type, mime_type)
+                    self.assertFalse(attachment.is_image)
+                    self.assertTrue(attachment.path.name.endswith(attachment.name))
+            self.assertEqual(sent, [])
+
+    def test_sticker_is_not_forwarded_to_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            app.sessions.create_headless("claude", project, 1)
+            sent: list[str] = []
+            forwarded: list[Any] = []
+            app._send = lambda _chat_id, text: sent.append(text)  # type: ignore[method-assign]
+            app._send_to_session = lambda *args: forwarded.append(args)  # type: ignore[method-assign]
+            app.handle_update(
+                {
+                    "message": {
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "sticker": {"file_id": "s", "type": "regular"},
+                    }
+                }
+            )
+            self.assertEqual(forwarded, [])
+            self.assertEqual(len(sent), 1)
+            self.assertIn("贴纸", sent[0])
+
     def test_media_group_is_coalesced_into_single_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = self.make_app(Path(temporary))
@@ -1080,6 +1150,49 @@ class GatewayEventTests(unittest.TestCase):
                 }
             )
             self.assertEqual(forwarded[0][1], "请查看并处理这些附件。")
+
+    def test_audio_album_is_coalesced_and_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            app.sessions.create_headless("claude", project, 1)
+            downloaded: list[str] = []
+
+            def fake_download(file_id: str, destination: Path, _max_bytes: int) -> int:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"RIFF")
+                downloaded.append(file_id)
+                return 4
+
+            forwarded: list[tuple[int, str, tuple[Any, ...]]] = []
+            app.telegram.download_file = fake_download  # type: ignore[method-assign]
+            app._send_to_session = (  # type: ignore[method-assign]
+                lambda chat_id, _session, text, attachments=(): forwarded.append(
+                    (chat_id, text, attachments)
+                )
+            )
+            updates = [
+                {
+                    "update_id": 20 + index,
+                    "message": {
+                        "message_id": 1 + index,
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "media_group_id": "mg-audio",
+                        **({"caption": "混一下"} if index == 0 else {}),
+                        "audio": {"file_id": f"a{index}", "file_name": name, "mime_type": "audio/x-wav"},
+                    },
+                }
+                for index, name in enumerate(["drums.wav", "bass.wav"])
+            ]
+            (merged,) = app._coalesce_updates(updates)
+            self.assertEqual(merged["update_id"], 21)
+            self.assertNotIn("audio", merged["message"])
+            app.handle_update(merged)
+            self.assertEqual(downloaded, ["a0", "a1"])
+            self.assertEqual(len(forwarded), 1)
+            self.assertEqual(forwarded[0][1], "混一下")
+            self.assertEqual([item.name for item in forwarded[0][2]], ["drums.wav", "bass.wav"])
 
     def test_running_turn_render_includes_command_and_elapsed_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

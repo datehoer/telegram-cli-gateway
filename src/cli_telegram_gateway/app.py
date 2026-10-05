@@ -44,6 +44,18 @@ MAX_PUBLISH_RETRY_SECONDS = 30.0
 MAX_AUTO_SENT_ARTIFACTS = 3
 PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Telegram sendPhoto 上限
 
+# 收到的文件按客户端的发送方式落在不同字段（WAV/MP3 常是 audio），全部转交给 CLI。
+# 值是缺 mime_type 时的类型：video_note 没有这个字段，voice 几乎总是 OGG/Opus。
+# GIF 的 animation 为兼容旧客户端同时带 document，所以 document 排第一；贴纸不转交。
+TELEGRAM_FILE_FIELDS = {
+    "document": "application/octet-stream",
+    "audio": "application/octet-stream",
+    "video": "video/mp4",
+    "animation": "video/mp4",
+    "voice": "audio/ogg",
+    "video_note": "video/mp4",
+}
+
 # 客户端把超过 4096 字符（按 UTF-16 计）的长文本拆成多条消息，没有 media_group_id
 # 之类的分组标记。Telegram Desktop 在 2048~4096 之间挑段落/换行/空格断开，Android
 # 在 4096 处硬切；服务端会去掉每段首尾的空白，片段也常常分几个 getUpdates 批次到达。
@@ -194,6 +206,14 @@ def _command_help_section(commands: tuple[DirectCommand, ...]) -> str:
 def _utf16_len(text: str) -> int:
     """Telegram 按 UTF-16 码元计文本长度，emoji 等算两个。"""
     return len(text.encode("utf-16-le")) // 2
+
+
+def _file_field(message: dict[str, Any]) -> str | None:
+    """消息里携带单个文件的字段名；照片（多尺寸列表）单独处理。"""
+    return next(
+        (field for field in TELEGRAM_FILE_FIELDS if isinstance(message.get(field), dict)),
+        None,
+    )
 
 
 def _fragment_separator(previous: str, following: str, multiline: bool) -> str:
@@ -3292,12 +3312,21 @@ class GatewayApp:
         name = ""
         mime_type = "application/octet-stream"
         is_image = False
-        document = message.get("document")
+        field = _file_field(message)
         photos = message.get("photo")
-        if isinstance(document, dict):
-            file_id = document.get("file_id") if isinstance(document.get("file_id"), str) else None
-            name = str(document.get("file_name") or "document.bin")
-            mime_type = str(document.get("mime_type") or mimetypes.guess_type(name)[0] or mime_type)
+        if field:
+            media = message[field]
+            file_id = media.get("file_id") if isinstance(media.get("file_id"), str) else None
+            name = str(media.get("file_name") or "")
+            mime_type = str(
+                media.get("mime_type")
+                or mimetypes.guess_type(name)[0]
+                or TELEGRAM_FILE_FIELDS[field]
+            )
+            if not name:
+                # 语音和圆形视频没有文件名，手机现拍的视频通常也没有。
+                unique = str(media.get("file_unique_id") or uuid.uuid4().hex)
+                name = f"{field}-{unique}{mimetypes.guess_extension(mime_type) or '.bin'}"
             is_image = mime_type.startswith("image/")
         elif isinstance(photos, list) and photos:
             photo = max(
@@ -3394,10 +3423,10 @@ class GatewayApp:
             message = member.get("message")
             if not isinstance(message, dict):
                 continue
-            document = message.get("document")
+            field = _file_field(message)
             photos = message.get("photo")
-            if isinstance(document, dict):
-                media.append({"document": document})
+            if field:
+                media.append({field: message[field]})
             elif isinstance(photos, list):
                 media.append({"photo": photos})
             if not caption:
@@ -3407,7 +3436,7 @@ class GatewayApp:
         combined = {
             key: value
             for key, value in first.items()
-            if key not in {"document", "photo", "caption"}
+            if key not in {*TELEGRAM_FILE_FIELDS, "photo", "caption"}
         }
         combined["media"] = media
         if caption:
@@ -3636,7 +3665,7 @@ class GatewayApp:
             prompt = caption.strip() if isinstance(caption, str) and caption.strip() else "请查看并处理这些附件。"
             self._send_to_session(chat_id, session, prompt, tuple(attachments))
             return
-        if isinstance(message.get("document"), dict) or isinstance(message.get("photo"), list):
+        if _file_field(message) or isinstance(message.get("photo"), list):
             session = routed_session or self._current_or_reply(chat_id)
             if not session:
                 return
@@ -3652,7 +3681,7 @@ class GatewayApp:
             prompt = caption.strip() if isinstance(caption, str) and caption.strip() else "请查看并处理这个附件。"
             self._send_to_session(chat_id, session, prompt, (attachment,))
             return
-        self._send(chat_id, "目前支持文本、文件和图片；语音功能稍后接入。")
+        self._send(chat_id, "目前支持文本和各类文件（图片、音频、视频、语音等）；贴纸这类消息不会转给 CLI。")
 
     def stop(self, *_args: object) -> None:
         self.codex.begin_shutdown()
