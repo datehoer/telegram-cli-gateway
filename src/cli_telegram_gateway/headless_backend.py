@@ -464,10 +464,16 @@ class HeadlessBackend:
                 elif isinstance(delta, dict) and delta.get("type") == "input_json_delta":
                     partial = delta.get("partial_json")
                     if isinstance(partial, str):
+                        # Tool input is valid JSON only once its block closes. Parsing the
+                        # growing buffer on every fragment cost quadratic CPU on this reader
+                        # thread (about 2 s for a 256 KiB Write).
                         tool_json_parts.setdefault(index, []).append(partial)
-                        command = self._command_from_partial_json("".join(tool_json_parts[index]))
-                        if command:
-                            output.append(("command", command))
+            elif event_type == "content_block_stop":
+                parts = tool_json_parts.pop(index, None)
+                if parts:
+                    command = self._command_from_tool_json("".join(parts))
+                    if command:
+                        output.append(("command", command))
             elif event_type == "content_block_start":
                 # Block indices restart for every assistant message/tool call.
                 tool_json_parts.pop(index, None)
@@ -568,7 +574,7 @@ class HeadlessBackend:
             return [("completed", None)]
         return []
 
-    def _command_from_partial_json(self, raw: str) -> str | None:
+    def _command_from_tool_json(self, raw: str) -> str | None:
         try:
             value = json.loads(raw)
         except json.JSONDecodeError:

@@ -3,7 +3,7 @@
 FROM node:22-bookworm-slim AS gateway-base
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git python3 tmux \
+    && apt-get install -y --no-install-recommends ca-certificates git python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/gateway

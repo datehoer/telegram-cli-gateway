@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import secrets
+import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
 from cli_telegram_gateway.config import Config
-from cli_telegram_gateway.sessions import SessionManager, clean_terminal_output
-
-
-class TerminalOutputTests(unittest.TestCase):
-    def test_removes_ansi_and_applies_backspace(self) -> None:
-        raw = b"\x1b[31mred\x1b[0m ab\bcd\r\n"
-        self.assertEqual(clean_terminal_output(raw), "red acd")
+from cli_telegram_gateway.sessions import SessionManager
 
 
 class SessionStateTests(unittest.TestCase):
@@ -28,9 +21,6 @@ class SessionStateTests(unittest.TestCase):
                 default_workdir=project,
                 cli_commands={"pi": ("pi",)},
                 poll_timeout=1,
-                output_poll_interval=0.1,
-                output_max_bytes=65536,
-                tmux_socket_name="unused",
             )
         )
 
@@ -145,41 +135,59 @@ class SessionStateTests(unittest.TestCase):
             self.assertIsNone(restored.last_completed_message_id)  # type: ignore[union-attr]
 
 
-class TmuxIntegrationTests(unittest.TestCase):
-    def test_create_send_read_and_stop(self) -> None:
+class UsagePersistenceTests(unittest.TestCase):
+    make_manager = SessionStateTests.make_manager
+
+    def stored_usage(self, project: Path, session_id: str) -> dict:
+        state = json.loads((project / ".runtime" / "state.json").read_text(encoding="utf-8"))
+        return state["sessions"][session_id]["usage"] or {}
+
+    def test_usage_refresh_stays_in_memory_until_the_next_state_write(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
-            socket_name = f"tcg-test-{secrets.token_hex(4)}"
-            config = Config(
-                project_dir=project,
-                bot_token="test",
-                allowed_user_ids=frozenset({1}),
-                allow_groups=False,
-                allowed_roots=(project,),
-                default_workdir=project,
-                cli_commands={"sh": ("/bin/sh", "-i")},
-                poll_timeout=1,
-                output_poll_interval=0.1,
-                output_max_bytes=65536,
-                tmux_socket_name=socket_name,
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.update_usage(
+                session.session_id, session.external_id, {"context_tokens": 1200}, deferred=True,
             )
-            manager = SessionManager(config)
-            session = manager.create("sh", project, 1)
-            try:
-                self.assertTrue(manager.is_alive(session))
-                time.sleep(0.2)
-                manager.read_new_output(session)
-                manager.send_text(session, "printf 'gateway-test-output\\n'")
+            self.assertEqual(manager.get(session.session_id).usage["context_tokens"], 1200)  # type: ignore[union-attr,index]
+            self.assertEqual(self.stored_usage(project, session.session_id), {})
+            manager.set_in_flight(session.session_id, 1, "turn-1")
+            self.assertEqual(self.stored_usage(project, session.session_id)["context_tokens"], 1200)
 
-                output = ""
-                deadline = time.monotonic() + 4
-                while "gateway-test-output" not in output and time.monotonic() < deadline:
-                    time.sleep(0.1)
-                    output += manager.read_new_output(session)
-                self.assertIn("gateway-test-output", output)
-            finally:
-                manager.stop(session)
-            self.assertFalse(manager.is_alive(session))
+    def test_flush_writes_pending_usage_and_is_a_no_op_when_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.update_usage(
+                session.session_id, session.external_id, {"context_tokens": 900}, deferred=True,
+            )
+            manager.flush()
+            self.assertEqual(self.stored_usage(project, session.session_id)["context_tokens"], 900)
+            state_path = project / ".runtime" / "state.json"
+            written = state_path.stat().st_mtime_ns
+            manager.flush()
+            self.assertEqual(state_path.stat().st_mtime_ns, written)
+
+    def test_explicit_usage_updates_are_written_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.update_usage(session.session_id, session.external_id, {"context_tokens": 700})
+            self.assertEqual(self.stored_usage(project, session.session_id)["context_tokens"], 700)
+
+    def test_compaction_invalidation_is_written_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manager = self.make_manager(project)
+            session = manager.create_headless("pi", project, 1)
+            manager.update_usage(session.session_id, session.external_id, {"context_tokens": 5000})
+            manager.update_usage(
+                session.session_id, session.external_id, {"context_tokens": None}, deferred=True,
+            )
+            self.assertIsNone(self.stored_usage(project, session.session_id)["context_tokens"])
 
 
 if __name__ == "__main__":

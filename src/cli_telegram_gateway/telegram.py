@@ -95,6 +95,9 @@ class TelegramClient:
             self._metrics.record(method, "local_deferred")
             raise
 
+    def flush_metrics(self) -> None:
+        self._metrics.flush()
+
     def metrics_snapshot(self) -> dict[str, Any]:
         snapshot = self._metrics.snapshot()
         with self._flood_wait_lock:
@@ -114,6 +117,17 @@ class TelegramClient:
             data=urllib.parse.urlencode(encoded_payload).encode("utf-8"),
             method="POST",
         )
+        return self._send_request(method, request, timeout=timeout)
+
+    def _send_request(
+        self,
+        method: str,
+        request: urllib.request.Request,
+        *,
+        timeout: float,
+        connection_error: str = "connection failed",
+    ) -> Any:
+        """Send one Bot API request and record its outcome; returns `result`."""
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
@@ -140,7 +154,9 @@ class TelegramClient:
         except (OSError, urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             self._metrics.record(method, "failed")
             reason = getattr(exc, "reason", exc)
-            raise TelegramError(f"Telegram {method} connection failed: {reason}", fallback_allowed=False) from exc
+            raise TelegramError(
+                f"Telegram {method} {connection_error}: {reason}", fallback_allowed=False
+            ) from exc
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             self._metrics.record(method, "failed")
             raise TelegramError(f"Telegram {method} returned invalid JSON", fallback_allowed=False) from exc
@@ -558,49 +574,7 @@ class TelegramClient:
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=90) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            try:
-                error_body = json.loads(exc.read().decode("utf-8"))
-                detail = (
-                    error_body.get("description", "HTTP error")
-                    if isinstance(error_body, dict)
-                    else f"HTTP {exc.code}"
-                )
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                error_body = None
-                detail = f"HTTP {exc.code}"
-            raw_retry_after = _retry_after(error_body)
-            self._metrics.record(
-                method, "rate_limited" if raw_retry_after is not None else "failed"
-            )
-            raise TelegramError(
-                f"Telegram {method} failed: {detail}",
-                retry_after=self._record_flood_wait(method, raw_retry_after),
-                fallback_allowed=exc.code in {400, 404},
-            ) from exc
-        except (OSError, urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            self._metrics.record(method, "failed")
-            reason = getattr(exc, "reason", exc)
-            raise TelegramError(f"Telegram {method} failed: {reason}", fallback_allowed=False) from exc
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            self._metrics.record(method, "failed")
-            raise TelegramError(f"Telegram {method} returned invalid JSON", fallback_allowed=False) from exc
-        if not isinstance(body, dict):
-            self._metrics.record(method, "failed")
-            raise TelegramError(f"Telegram {method} returned a non-object response", fallback_allowed=False)
-        if not body.get("ok"):
-            raw_retry_after = _retry_after(body)
-            self._metrics.record(
-                method, "rate_limited" if raw_retry_after is not None else "failed"
-            )
-            raise TelegramError(
-                f"Telegram {method} failed: {body.get('description', 'unknown error')}",
-                retry_after=self._record_flood_wait(method, raw_retry_after),
-            )
-        self._metrics.record(method, "success")
+        self._send_request(method, request, timeout=90, connection_error="failed")
 
     def send_action(self, chat_id: int, action: str = "typing") -> None:
         self._call("sendChatAction", {"chat_id": chat_id, "action": action})

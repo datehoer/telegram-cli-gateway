@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "article",
+  "name": "文章正文提取",
+  "command": "article",
+  "usage": "/article <URL> [--archive]",
+  "description": "提取网页正文为 Markdown；通过 BPC 尝试处理付费墙",
+  "exec": ["node", "main.mjs"],
+  "cwd": "/srv/projects/artifacts",
+  "timeout_seconds": 180,
+  "max_output_bytes": 8192
+}

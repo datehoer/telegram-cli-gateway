@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,9 @@ from typing import Any
 
 LOGGER = logging.getLogger("telegram-cli-gateway")
 RETENTION_DAYS = 14
+# Counters change on every Telegram call; persisting each one rewrote the file
+# per edit. A crash loses at most this window of informational counts.
+SAVE_INTERVAL_SECONDS = 30.0
 IGNORED_METHODS = frozenset({"getUpdates", "getFile"})
 NEW_MESSAGE_METHODS = frozenset(
     {
@@ -53,6 +57,8 @@ class TelegramMetrics:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
         self._days = self._load()
+        self._unsaved = False
+        self._last_save: float | None = None
 
     def _load(self) -> dict[str, dict[str, Any]]:
         if self.path is None or not self.path.exists():
@@ -74,7 +80,9 @@ class TelegramMetrics:
         return normalized
 
     def _save(self) -> None:
+        self._last_save = time.monotonic()
         if self.path is None:
+            self._unsaved = False
             return
         try:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -85,6 +93,7 @@ class TelegramMetrics:
             )
             os.chmod(temporary, 0o600)
             temporary.replace(self.path)
+            self._unsaved = False
         except OSError as exc:
             LOGGER.warning("could not persist Telegram metrics: %s", exc)
 
@@ -127,7 +136,14 @@ class TelegramMetrics:
 
             for stale_day in sorted(self._days)[:-RETENTION_DAYS]:
                 self._days.pop(stale_day, None)
-            self._save()
+            self._unsaved = True
+            if self._last_save is None or time.monotonic() - self._last_save >= SAVE_INTERVAL_SECONDS:
+                self._save()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._unsaved:
+                self._save()
 
     def snapshot(self, days: int = 7) -> dict[str, Any]:
         now = self._now().astimezone(timezone.utc)

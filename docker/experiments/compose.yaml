@@ -6,8 +6,6 @@ x-gateway-environment: &gateway-environment
   DEFAULT_WORKDIR: /workspace/project
   ALLOWED_WORKDIRS: /workspace
   TELEGRAM_POLL_TIMEOUT: "10"
-  OUTPUT_POLL_INTERVAL: "1.0"
-  OUTPUT_MAX_BYTES: "65536"
   STREAM_UPDATE_INTERVAL: "5"
   AUTO_RESUME: "false"
   AUTO_SEND_ARTIFACTS: off
@@ -48,7 +46,6 @@ services:
       AGENT_BACKEND: codex
       ENABLED_CLIS: codex
       CLI_CODEX: /usr/local/bin/codex
-      TMUX_SOCKET_NAME: telegram-cli-codex
     volumes:
       - codex_home:/home/agent
       - codex_workspace:/workspace
@@ -77,7 +74,6 @@ services:
       AGENT_BACKEND: claude
       ENABLED_CLIS: claude
       CLI_CLAUDE: /usr/local/bin/claude
-      TMUX_SOCKET_NAME: telegram-cli-claude
     volumes:
       - claude_home:/home/agent
       - claude_workspace:/workspace
@@ -105,7 +101,6 @@ services:
       AGENT_BACKEND: grok
       ENABLED_CLIS: grok
       CLI_GROK: /usr/local/bin/grok
-      TMUX_SOCKET_NAME: telegram-cli-grok
     volumes:
       - grok_home:/home/agent
       - grok_workspace:/workspace

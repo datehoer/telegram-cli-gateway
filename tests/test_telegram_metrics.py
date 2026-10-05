@@ -20,6 +20,7 @@ class TelegramMetricsTests(unittest.TestCase):
             metrics.record("answerCallbackQuery", "success")
             metrics.record("sendRichMessage", "rate_limited")
             metrics.record("copyMessage", "local_deferred")
+            metrics.flush()
 
             snapshot = TelegramMetrics(path, now=now).snapshot()
             today = snapshot["today"]
@@ -54,12 +55,32 @@ class TelegramMetricsTests(unittest.TestCase):
                     days=offset
                 )
                 metrics.record("sendMessage", "success")
+            metrics.flush()
 
             stored = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(len(stored["days"]), 14)
             self.assertNotIn("2026-08-01", stored["days"])
             self.assertNotIn("2026-08-02", stored["days"])
             self.assertIn("2026-08-16", stored["days"])
+
+    def test_writes_are_coalesced_until_flush(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "telegram-metrics.json"
+            now = lambda: datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
+            metrics = TelegramMetrics(path, now=now)
+
+            def stored_edits() -> int:
+                days = json.loads(path.read_text(encoding="utf-8"))["days"]
+                return days["2026-08-26"]["message_edits"]
+
+            metrics.record("editMessageText", "success")
+            self.assertEqual(stored_edits(), 1)
+            for _ in range(50):
+                metrics.record("editMessageText", "success")
+            self.assertEqual(stored_edits(), 1)
+            self.assertEqual(metrics.snapshot()["today"]["message_edits"], 51)
+            metrics.flush()
+            self.assertEqual(stored_edits(), 51)
 
     def test_malformed_bucket_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

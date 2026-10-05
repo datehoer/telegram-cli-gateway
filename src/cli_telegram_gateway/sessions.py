@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
-import shlex
-import subprocess
 import threading
 import uuid
 from dataclasses import asdict, dataclass
@@ -24,36 +21,15 @@ class SessionError(RuntimeError):
     pass
 
 
-OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
-ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
-def clean_terminal_output(raw: bytes) -> str:
-    text = raw.decode("utf-8", errors="replace")
-    text = OSC_RE.sub("", text)
-    text = ANSI_RE.sub("", text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Apply backspaces instead of leaking terminal redraw control characters.
-    rebuilt: list[str] = []
-    for char in text:
-        if char == "\b":
-            if rebuilt and rebuilt[-1] != "\n":
-                rebuilt.pop()
-        else:
-            rebuilt.append(char)
-    text = "".join(rebuilt)
-    text = CONTROL_RE.sub("", text)
-    text = re.sub(r"\n{4,}", "\n\n\n", text)
-    return text.strip()
-
-
 @dataclass
 class CliSession:
     session_id: str
     cli: str
     cwd: str
+    # tmux_name, log_path and cursor belonged to the removed tmux backend. They
+    # are still written because builds before its removal require tmux_name and
+    # log_path when loading state.json; drop them once rollback past that change
+    # is no longer needed.
     tmux_name: str
     log_path: str
     chat_id: int
@@ -92,14 +68,12 @@ class SessionManager:
     def __init__(self, config: Config):
         self.config = config
         self.runtime_dir = config.runtime_dir
-        self.logs_dir = self.runtime_dir / "logs"
         self.state_path = self.runtime_dir / "state.json"
         self.runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.logs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.runtime_dir, 0o700)
-        os.chmod(self.logs_dir, 0o700)
         self._lock = threading.RLock()
         self._state = self._load_state()
+        self._unsaved = False
 
     def _empty_state(self) -> dict[str, Any]:
         return {
@@ -161,40 +135,20 @@ class SessionManager:
         )
         os.chmod(temporary, 0o600)
         temporary.replace(self.state_path)
+        self._unsaved = False
 
-    def _tmux(
-        self,
-        *args: str,
-        check: bool = True,
-        input_data: bytes | None = None,
-    ) -> subprocess.CompletedProcess[bytes]:
-        command = ["tmux", "-L", self.config.tmux_socket_name, *args]
-        try:
-            return subprocess.run(
-                command,
-                input=input_data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=check,
-                timeout=10,
-            )
-        except FileNotFoundError as exc:
-            raise SessionError("tmux is not installed or not in PATH") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise SessionError("tmux command timed out") from exc
-        except subprocess.CalledProcessError as exc:
-            detail = exc.stderr.decode("utf-8", errors="replace").strip()
-            raise SessionError(detail or "tmux command failed") from exc
+    def flush(self) -> None:
+        """Write usage snapshots that were kept in memory; called on shutdown."""
+        with self._lock:
+            if self._unsaved:
+                self._save_state()
 
     def _session_from_state(self, session_id: str) -> CliSession | None:
         raw = self._state["sessions"].get(session_id)
         return CliSession.from_dict(raw) if raw else None
 
     def is_alive(self, session: CliSession) -> bool:
-        if session.backend != "tmux":
-            return bool(session.external_id)
-        result = self._tmux("has-session", "-t", session.tmux_name, check=False)
-        return result.returncode == 0
+        return bool(session.external_id)
 
     @staticmethod
     def _entrance_key(chat_id: int, bot_key: str) -> str:
@@ -204,51 +158,6 @@ class SessionManager:
     def _message_key(cls, chat_id: int, message_id: int, bot_key: str) -> str:
         entrance = cls._entrance_key(chat_id, bot_key)
         return f"{entrance}:{message_id}"
-
-    def create(
-        self, cli: str, cwd: Path, chat_id: int, bot_key: str = "default"
-    ) -> CliSession:
-        if cli not in self.config.cli_commands:
-            raise SessionError(f"unknown CLI: {cli}")
-
-        with self._lock:
-            for _ in range(10):
-                session_id = f"{cli}-{secrets.token_hex(2)}"
-                if session_id not in self._state["sessions"]:
-                    break
-            else:
-                raise SessionError("could not allocate a unique session ID")
-
-            tmux_name = f"tcg_{session_id.replace('-', '_')}"
-            log_path = self.logs_dir / f"{session_id}.log"
-            log_path.touch(mode=0o600, exist_ok=False)
-            os.chmod(log_path, 0o600)
-
-            try:
-                self._tmux("new-session", "-d", "-s", tmux_name, "-c", str(cwd))
-                pipe_command = f"cat >> {shlex.quote(str(log_path))}"
-                self._tmux("pipe-pane", "-o", "-t", f"{tmux_name}:0.0", pipe_command)
-                cli_command = "exec " + shlex.join(self.config.cli_commands[cli])
-                self._tmux("send-keys", "-t", f"{tmux_name}:0.0", "-l", cli_command)
-                self._tmux("send-keys", "-t", f"{tmux_name}:0.0", "Enter")
-            except Exception:
-                self._tmux("kill-session", "-t", tmux_name, check=False)
-                log_path.unlink(missing_ok=True)
-                raise
-
-            session = CliSession(
-                session_id=session_id,
-                cli=cli,
-                cwd=str(cwd),
-                tmux_name=tmux_name,
-                log_path=str(log_path),
-                chat_id=chat_id,
-                created_at=datetime.now(timezone.utc).isoformat(),
-            )
-            self._state["sessions"][session_id] = asdict(session)
-            self.switch(chat_id, session_id, bot_key)
-            self._save_state()
-            return session
 
     def create_virtual(
         self,
@@ -325,8 +234,6 @@ class SessionManager:
             session = self._session_from_state(session_id)
             if not session:
                 raise SessionError(f"session not found: {session_id}")
-            if session.backend == "tmux" and session.tmux_name:
-                self._tmux("kill-session", "-t", session.tmux_name, check=False)
             session.backend = backend
             if session.external_id != external_id:
                 session.usage = None
@@ -342,6 +249,7 @@ class SessionManager:
         self, session_id: str, external_id: str | None, usage: dict[str, Any], *,
         only_if_missing: bool = False,
         expected_model: object = _ANY_USAGE_MODEL,
+        deferred: bool = False,
     ) -> bool:
         with self._lock:
             session = self._session_from_state(session_id)
@@ -353,7 +261,14 @@ class SessionManager:
                 return False  # A window query must not attach the old model's capacity to a new model.
             session.usage = merge_usage(session.usage, usage)
             self._state["sessions"][session_id] = asdict(session)
-            self._save_state()
+            if deferred and usage.get("context_tokens", 0) is not None:
+                # Live CLI streams report usage on every model request. Keep those
+                # refreshes in memory; the next state write (turn end, routing,
+                # shutdown) saves them. A compaction invalidation is always written
+                # so a restart never shows the pre-compaction occupancy.
+                self._unsaved = True
+            else:
+                self._save_state()
             return True
 
     def all_sessions(self) -> list[CliSession]:
@@ -705,35 +620,8 @@ class SessionManager:
             self._save_state()
             return None
 
-    def send_text(self, session: CliSession, text: str) -> None:
-        if session.backend != "tmux":
-            raise SessionError(f"session backend does not accept tmux input: {session.backend}")
-        if not self.is_alive(session):
-            raise SessionError(f"session is no longer running: {session.session_id}")
-        safe_text = text.replace("\x00", "")
-        buffer_name = f"tcg_{secrets.token_hex(4)}"
-        self._tmux("load-buffer", "-b", buffer_name, "-", input_data=safe_text.encode("utf-8"))
-        self._tmux(
-            "paste-buffer",
-            "-d",
-            "-b",
-            buffer_name,
-            "-t",
-            f"{session.tmux_name}:0.0",
-        )
-        self._tmux("send-keys", "-t", f"{session.tmux_name}:0.0", "Enter")
-
-    def interrupt(self, session: CliSession) -> None:
-        if session.backend != "tmux":
-            raise SessionError(f"session backend does not accept tmux interrupts: {session.backend}")
-        if not self.is_alive(session):
-            raise SessionError(f"session is no longer running: {session.session_id}")
-        self._tmux("send-keys", "-t", f"{session.tmux_name}:0.0", "C-c")
-
     def stop(self, session: CliSession) -> None:
         with self._lock:
-            if session.backend == "tmux" and session.tmux_name:
-                self._tmux("kill-session", "-t", session.tmux_name, check=False)
             self._state["sessions"].pop(session.session_id, None)
             self._state["in_flight"].pop(session.session_id, None)
             self._state["message_routes"] = {
@@ -753,27 +641,6 @@ class SessionManager:
                 if chat.get("current") == session.session_id:
                     chat["current"] = None
             self._save_state()
-
-    def read_new_output(self, session: CliSession) -> str:
-        if session.backend != "tmux":
-            return ""
-        with self._lock:
-            current = self._session_from_state(session.session_id)
-            if not current:
-                return ""
-            log_path = Path(current.log_path)
-            if not log_path.exists():
-                return ""
-            size = log_path.stat().st_size
-            if current.cursor > size:
-                current.cursor = 0
-            with log_path.open("rb") as handle:
-                handle.seek(current.cursor)
-                raw = handle.read(self.config.output_max_bytes)
-                current.cursor = handle.tell()
-            self._state["sessions"][current.session_id] = asdict(current)
-            self._save_state()
-        return clean_terminal_output(raw)
 
     def get_telegram_offset(self, bot_key: str = "default") -> int | None:
         with self._lock:

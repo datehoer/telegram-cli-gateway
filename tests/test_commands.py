@@ -52,9 +52,6 @@ class ParseManifestTests(unittest.TestCase):
             default_workdir=self.project,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-commands-test",
         )
 
     def write_manifest(self, text: str) -> Path:
@@ -129,9 +126,6 @@ class LoadDirectCommandsTests(unittest.TestCase):
             default_workdir=self.project,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-commands-test",
         )
 
     def add(self, directory: str, text: str) -> None:
@@ -204,9 +198,6 @@ class DirectCommandRunnerTests(unittest.TestCase):
             default_workdir=self.project,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-commands-test",
         )
         command = parse_manifest(manifest_path, config)
         return DirectCommandRunner(config, {command.command: command})
@@ -366,9 +357,6 @@ class CommandConfigTests(unittest.TestCase):
             default_workdir=Path("/srv/projects"),
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-commands-test",
         )
         roots = config.direct_command_roots
         self.assertIn(Path("/srv/projects/telegram-cli-gateway/extensions"), roots)
@@ -389,9 +377,6 @@ class BundledExampleTests(unittest.TestCase):
             default_workdir=repo.parent,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-commands-test",
         )
         command = parse_manifest(example, config)
         self.assertEqual(command.command, "example")
@@ -444,9 +429,6 @@ class RawArgsTests(unittest.TestCase):
             default_workdir=self.project,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-rawargs-test",
         )
 
     def run_with(self, raw_args: str) -> tuple[str, str]:

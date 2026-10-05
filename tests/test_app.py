@@ -34,6 +34,13 @@ class FakeCodex:
         self.responses.append((request_id, result))
 
 
+def run_background_inline(app: GatewayApp) -> None:
+    """Run off-dispatch actions synchronously; tests of the threads restore it."""
+    app._run_in_background = (  # type: ignore[method-assign]
+        lambda _name, target, *args: target(*args)
+    )
+
+
 class GatewayEventTests(unittest.TestCase):
     def make_app(
         self,
@@ -53,16 +60,18 @@ class GatewayEventTests(unittest.TestCase):
             default_workdir=project,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-app-test",
             enabled_clis=enabled_clis,
             auto_resume=auto_resume,
             bot_tokens=bot_tokens,
             cli_default_models=cli_default_models or {},
             cli_default_efforts=cli_default_efforts or {},
         )
-        return GatewayApp(config)
+        app = GatewayApp(config)
+        run_background_inline(app)
+        for telegram in app._telegrams.values():
+            # The typing indicator is best effort; keep it off the network in tests.
+            telegram.send_action = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+        return app
 
     def test_local_api_endpoint_is_used_for_every_bot_entrance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -87,11 +96,13 @@ class GatewayEventTests(unittest.TestCase):
             app.sessions.switch(1, session.session_id, "worker")
             sent_by_primary: list[str] = []
             sent_by_worker: list[str] = []
-            app._telegrams["default"].send_rich_markdown = (  # type: ignore[method-assign]
-                lambda _chat_id, text, reply_markup=None: sent_by_primary.append(text) or 10
+            app._telegrams["default"].send_rich_markdown_parts = (  # type: ignore[method-assign]
+                lambda _chat_id, text, reply_markup=None, **_kwargs: sent_by_primary.append(text)
+                or [10]
             )
-            app._telegrams["worker"].send_rich_markdown = (  # type: ignore[method-assign]
-                lambda _chat_id, text, reply_markup=None: sent_by_worker.append(text) or 20
+            app._telegrams["worker"].send_rich_markdown_parts = (  # type: ignore[method-assign]
+                lambda _chat_id, text, reply_markup=None, **_kwargs: sent_by_worker.append(text)
+                or [20]
             )
 
             view = app._register_turn(session, "turn-worker", "worker")
@@ -543,9 +554,6 @@ class GatewayEventTests(unittest.TestCase):
                 default_workdir=project,
                 cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
                 poll_timeout=1,
-                output_poll_interval=0.1,
-                output_max_bytes=65536,
-                tmux_socket_name="tcg-app-test",
                 enabled_clis=("codex",),
             )
             sent: list[str] = []
@@ -1179,14 +1187,16 @@ class GatewayEventTests(unittest.TestCase):
             view.last_edit = -10.0
 
             sent: list[str] = []
-            app.telegram.send_rich_markdown = (  # type: ignore[method-assign]
-                lambda chat_id, markdown, reply_markup=None: sent.append(markdown) or 99
+            app.telegram.send_rich_markdown_parts = (  # type: ignore[method-assign]
+                lambda chat_id, markdown, reply_markup=None, **_kwargs: sent.append(markdown)
+                or [99]
             )
             edited: list[tuple[int, str]] = []
             app.telegram.edit_rich_markdown = (  # type: ignore[method-assign]
-                lambda chat_id, message_id, markdown, reply_markup=None: edited.append(
+                lambda chat_id, message_id, markdown, reply_markup=None, **_kwargs: edited.append(
                     (message_id, markdown)
                 )
+                or [message_id]
             )
 
             class StopAfterOneIteration:
@@ -1230,15 +1240,15 @@ class GatewayEventTests(unittest.TestCase):
             session = app.sessions.create_headless("pi", project, 1)
             view = app._register_turn(session, "turn-rich")
             calls: list[tuple[str, object]] = []
-            app.telegram.send_rich_markdown = (  # type: ignore[method-assign]
-                lambda chat_id, markdown, reply_markup=None: calls.append(
+            app.telegram.send_rich_markdown_parts = (  # type: ignore[method-assign]
+                lambda chat_id, markdown, reply_markup=None, **_kwargs: calls.append(
                     ("send", (chat_id, markdown, reply_markup))
-                ) or 88
+                ) or [88]
             )
             app.telegram.edit_rich_markdown = (  # type: ignore[method-assign]
-                lambda chat_id, message_id, markdown, reply_markup=None: calls.append(
+                lambda chat_id, message_id, markdown, reply_markup=None, **_kwargs: calls.append(
                     ("edit", (chat_id, message_id, markdown, reply_markup))
-                )
+                ) or [message_id]
             )
             app._publish_running_turn(view, "partial")
             self.assertTrue(view.published)
@@ -1255,12 +1265,12 @@ class GatewayEventTests(unittest.TestCase):
             app = self.make_app(project)
             session = app.sessions.create_headless("pi", project, 1)
             view = app._register_turn(session, "turn-fallback")
-            app.telegram.send_rich_markdown = (  # type: ignore[method-assign]
-                lambda *_args: (_ for _ in ()).throw(TelegramError("unsupported"))
+            app.telegram.send_rich_markdown_parts = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(TelegramError("unsupported"))
             )
             sent: list[str] = []
-            app.telegram.send_markdown = (  # type: ignore[method-assign]
-                lambda _chat_id, markdown: sent.append(markdown) or 9
+            app.telegram.send_markdown_parts = (  # type: ignore[method-assign]
+                lambda _chat_id, markdown, **_kwargs: sent.append(markdown) or [9]
             )
             app._publish_running_turn(view, "**partial**")
             self.assertFalse(view.rich_mode)
@@ -1269,9 +1279,9 @@ class GatewayEventTests(unittest.TestCase):
 
             edited: list[tuple[int, int, str]] = []
             app.telegram.edit_rich_markdown = (  # type: ignore[method-assign]
-                lambda chat_id, message_id, markdown, reply_markup=None: edited.append(
+                lambda chat_id, message_id, markdown, reply_markup=None, **_kwargs: edited.append(
                     (chat_id, message_id, markdown)
-                )
+                ) or [message_id]
             )
             view.status = "completed"
             app._publish_final_turn(view, "| A | B |\n|---|---|\n| 1 | 2 |")
@@ -1284,8 +1294,8 @@ class GatewayEventTests(unittest.TestCase):
             app = self.make_app(project)
             session = app.sessions.create_headless("pi", project, 1)
             view = app._register_turn(session, "turn-limited")
-            app.telegram.send_rich_markdown = (  # type: ignore[method-assign]
-                lambda *_args: (_ for _ in ()).throw(
+            app.telegram.send_rich_markdown_parts = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
                     TelegramError("rate limited", retry_after=5)
                 )
             )
@@ -1459,7 +1469,9 @@ class GatewayEventTests(unittest.TestCase):
                 "text": "/compact",
             }})
             self.assertEqual(compacted, [session.session_id])
-            self.assertIn("已触发上下文压缩", sent[0])
+            self.assertIn("正在压缩", sent[0])
+            self.assertIn("已触发上下文压缩", sent[1])
+            self.assertFalse(app._session_is_busy(session))
 
     def test_compact_rejects_busy_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1807,14 +1819,15 @@ class GatewayEventTests(unittest.TestCase):
             sent: list[str] = []
             app._send = lambda _chat, text: sent.append(text)  # type: ignore[method-assign]
             rich_sent: list[str] = []
-            app.telegram.send_rich_markdown = (  # type: ignore[method-assign]
-                lambda _chat, markdown, reply_markup=None: rich_sent.append(markdown) or 42
+            app.telegram.send_rich_markdown_parts = (  # type: ignore[method-assign]
+                lambda _chat, markdown, reply_markup=None, **_kwargs: rich_sent.append(markdown)
+                or [42]
             )
             edited: list[tuple[int, str]] = []
             app.telegram.edit_rich_markdown = (  # type: ignore[method-assign]
-                lambda _chat, message_id, markdown, reply_markup=None: edited.append(
+                lambda _chat, message_id, markdown, reply_markup=None, **_kwargs: edited.append(
                     (message_id, markdown)
-                )
+                ) or [message_id]
             )
             app._send_to_session(1, session, "change direction")
             self.assertEqual(steered, [("thread-1", "turn-1", "change direction")])
@@ -2197,9 +2210,6 @@ class GatewayEventTests(unittest.TestCase):
             default_workdir=project,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-app-test",
             auto_send_artifacts=mode,
         )
         app = GatewayApp(config)

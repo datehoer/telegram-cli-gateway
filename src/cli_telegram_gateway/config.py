@@ -108,9 +108,6 @@ class Config:
     default_workdir: Path
     cli_commands: dict[str, tuple[str, ...]]
     poll_timeout: int
-    output_poll_interval: float
-    output_max_bytes: int
-    tmux_socket_name: str
     enabled_clis: tuple[str, ...] = ("claude", "codex", "grok", "pi")
     stream_update_interval: float = 10.0
     telegram_max_file_bytes: int = 45 * 1024 * 1024
@@ -260,10 +257,6 @@ class Config:
             ):
                 raise ConfigError("COMMAND_DIR must be inside ALLOWED_WORKDIRS")
 
-        socket_name = values.get("TMUX_SOCKET_NAME", "telegram-cli-gateway").strip()
-        if not socket_name or not all(ch.isalnum() or ch in "-_" for ch in socket_name):
-            raise ConfigError("TMUX_SOCKET_NAME may contain only letters, numbers, '-' and '_'")
-
         local_api_url = _local_api_url(values)
         file_limit = _positive_int(
             values,
@@ -287,9 +280,6 @@ class Config:
             default_workdir=default_workdir,
             cli_commands=commands,
             poll_timeout=_positive_int(values, "TELEGRAM_POLL_TIMEOUT", 10),
-            output_poll_interval=_positive_float(values, "OUTPUT_POLL_INTERVAL", 1.0),
-            output_max_bytes=_positive_int(values, "OUTPUT_MAX_BYTES", 65536),
-            tmux_socket_name=socket_name,
             enabled_clis=enabled_clis,
             stream_update_interval=_positive_float(values, "STREAM_UPDATE_INTERVAL", 10.0),
             telegram_max_file_bytes=file_limit,

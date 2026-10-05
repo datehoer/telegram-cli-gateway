@@ -152,10 +152,12 @@ class GatewayUsageTests(unittest.TestCase):
             project_dir=self.project, bot_token="test", allowed_user_ids=frozenset({1}),
             allow_groups=False, allowed_roots=(self.project,), default_workdir=self.project,
             cli_commands={cli: ("/bin/sh",) for cli in ("codex", "claude", "grok", "pi")},
-            poll_timeout=1, output_poll_interval=0.1, output_max_bytes=65536, tmux_socket_name="unused",
+            poll_timeout=1,
             bot_tokens=(("default", "default:test"), ("worker", "worker:test")),
         )
         self.app = GatewayApp(config)
+        # /status and /context run off the dispatch thread; run them inline here.
+        self.app._run_in_background = lambda _name, target, *args: target(*args)
         self.app._send = Mock()
         self.app.codex.read_rate_limits = Mock(return_value={"rateLimits": {
             "primary": {"usedPercent": 25, "windowDurationMins": 300},
@@ -206,6 +208,7 @@ class GatewayUsageTests(unittest.TestCase):
     def test_snapshot_survives_restart_and_clear_rejects_late_metrics(self) -> None:
         session = self.codex_session()
         self.report_codex_usage()
+        self.app.sessions.flush()  # what a graceful gateway stop does
         reloaded = SessionManager(self.app.config)
         snapshot = reloaded.get(session.session_id).usage
         self.assertEqual(snapshot["context_tokens"], 2000)

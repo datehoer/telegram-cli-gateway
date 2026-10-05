@@ -41,6 +41,7 @@ If these conditions are not met, defer the work and record the concrete trigger 
 
 - Never automatically replay a CLI turn after output or external side effects may have occurred.
 - Treat CLI execution and Telegram delivery as separate outcomes.
+- Telegram updates from every entrance are dispatched one at a time. Run slow, self-contained work (uploads, native status probes, CLI listings, Pi compaction) on a worker thread, and never hold the state lock across network or subprocess waits, so `/interrupt` and other chats are never held up.
 - Persist only the minimum state needed for user-visible recovery. Do not persist token-level streams or duplicate native CLI transcripts.
 - Use atomic file replacement for persistent state and keep collections bounded.
 - Make restart behavior explicit: resume only through a backend's supported native mechanism; otherwise report interruption instead of guessing.

@@ -132,9 +132,39 @@ class ProcessRegressionTests(unittest.TestCase):
                 "type": "content_block_start", "index": 0,
                 "content_block": {"type": "tool_use", "name": "Bash"},
             }}, parts, False)
-            events = backend._parse_event("claude", {"type": "stream_event", "event": {
+            backend._parse_event("claude", {"type": "stream_event", "event": {
                 "type": "content_block_delta", "index": 0,
                 "delta": {"type": "input_json_delta", "partial_json": json.dumps({"command": command})},
             }}, parts, False)
+            events = backend._parse_event("claude", {"type": "stream_event", "event": {
+                "type": "content_block_stop", "index": 0,
+            }}, parts, False)
             commands.extend(events)
         self.assertEqual(commands, [("command", "first"), ("command", "second")])
+
+    def test_tool_json_is_parsed_once_when_its_block_closes(self) -> None:
+        backend = HeadlessBackend({}, lambda *_: None)
+        parts: dict[int, list[str]] = {}
+        payload = json.dumps({"command": "echo " + "x" * 5000})
+        fragments = [payload[offset:offset + 7] for offset in range(0, len(payload), 7)]
+        parsed: list[str] = []
+        original = backend._command_from_tool_json
+
+        def counting(raw: str) -> str | None:
+            parsed.append(raw)
+            return original(raw)
+
+        backend._command_from_tool_json = counting  # type: ignore[method-assign]
+        streamed = []
+        for fragment in fragments:
+            streamed.extend(backend._parse_event("claude", {"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": fragment},
+            }}, parts, False))
+        self.assertEqual(streamed, [])
+        closed = backend._parse_event("claude", {"type": "stream_event", "event": {
+            "type": "content_block_stop", "index": 2,
+        }}, parts, False)
+        self.assertEqual(closed, [("command", "echo " + "x" * 5000)])
+        self.assertEqual(parsed, [payload])
+        self.assertEqual(parts, {})

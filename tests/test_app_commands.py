@@ -55,9 +55,6 @@ class DirectCommandAppTests(unittest.TestCase):
             default_workdir=self.project,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-app-commands-test",
             stream_update_interval=0.01,
             **kwargs,
         )
@@ -337,9 +334,6 @@ class OversizedArtifactTests(unittest.TestCase):
             default_workdir=self.project,
             cli_commands={name: ("/bin/sh",) for name in ("claude", "codex", "grok", "pi")},
             poll_timeout=1,
-            output_poll_interval=0.1,
-            output_max_bytes=65536,
-            tmux_socket_name="tcg-oversize-test",
             telegram_max_file_bytes=limit,
             telegram_local_api_url=local_api_url,
         )

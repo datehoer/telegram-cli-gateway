@@ -14,6 +14,8 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 LOGGER = logging.getLogger("telegram-cli-gateway.models")
@@ -31,6 +33,18 @@ EFFORTS: dict[str, tuple[str, ...]] = {
 }
 
 _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+# Listing spawns the CLI (about 2 s for pi), and the picker needs the catalog
+# again when a button is clicked. Successful listings are reused briefly;
+# /reload clears them so a freshly installed CLI is listed again.
+LISTING_TTL_SECONDS = 600.0
+_listing_lock = threading.Lock()
+_listing_cache: dict[tuple[str, ...], tuple[float, str]] = {}
+
+
+def clear_listing_cache() -> None:
+    with _listing_lock:
+        _listing_cache.clear()
 
 
 def list_efforts(cli: str) -> list[str]:
@@ -51,6 +65,10 @@ def list_models(cli: str, command: tuple[str, ...]) -> list[str]:
 
 
 def _run_listing(command: tuple[str, ...], timeout: float = 20.0) -> str:
+    with _listing_lock:
+        cached = _listing_cache.get(command)
+        if cached and time.monotonic() - cached[0] < LISTING_TTL_SECONDS:
+            return cached[1]
     try:
         result = subprocess.run(
             [*command],
@@ -66,6 +84,9 @@ def _run_listing(command: tuple[str, ...], timeout: float = 20.0) -> str:
         return ""
     if result.stderr:
         LOGGER.debug("%s model listing stderr: %s", command[0], result.stderr.strip()[:400])
+    if result.returncode == 0 and result.stdout.strip():
+        with _listing_lock:
+            _listing_cache[command] = (time.monotonic(), result.stdout)
     return result.stdout
 
 

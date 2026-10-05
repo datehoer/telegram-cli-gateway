@@ -10,6 +10,10 @@ from cli_telegram_gateway import models
 
 
 class ModelCatalogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        models.clear_listing_cache()
+        self.addCleanup(models.clear_listing_cache)
+
     def test_claude_aliases_are_static(self) -> None:
         self.assertEqual(models.list_models("claude", ("claude",)), ["opus", "sonnet", "haiku", "fable"])
 
@@ -81,6 +85,33 @@ class ModelCatalogTests(unittest.TestCase):
 
     def test_listing_failure_returns_empty(self) -> None:
         self.assertEqual(models.list_models("grok", ("/no/such/binary",)), [])
+
+    def test_successful_listing_is_reused_until_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs = Path(temporary) / "runs"
+            script = (
+                f"open({str(runs)!r}, 'a').write('x'); "
+                "print('provider  model'); print('local  model-a')"
+            )
+            command = ("python3", "-c", script)
+            self.assertEqual(models.list_models("pi", command), ["local/model-a"])
+            self.assertEqual(models.list_models("pi", command), ["local/model-a"])
+            self.assertEqual(runs.read_text(), "x")
+            models.clear_listing_cache()
+            self.assertEqual(models.list_models("pi", command), ["local/model-a"])
+            self.assertEqual(runs.read_text(), "xx")
+
+    def test_failed_listing_is_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs = Path(temporary) / "runs"
+            script = (
+                f"open({str(runs)!r}, 'a').write('x'); "
+                "print('provider  model'); print('local  model-a'); raise SystemExit(1)"
+            )
+            command = ("python3", "-c", script)
+            models.list_models("pi", command)
+            models.list_models("pi", command)
+            self.assertEqual(runs.read_text(), "xx")
 
     def test_efforts_per_cli(self) -> None:
         self.assertEqual(models.list_efforts("claude"), ["low", "medium", "high", "xhigh", "max"])

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from cli_telegram_gateway.app import PendingInput, STATE_IDLE, STATE_INTERRUPTED
+from cli_telegram_gateway.app import PendingInput, STATE_FAILED, STATE_IDLE, STATE_INTERRUPTED
 from cli_telegram_gateway.codex_backend import CodexBackendError
 import test_app
 
@@ -41,6 +41,124 @@ class LifecycleRegressionTests(unittest.TestCase):
         if cli == "codex":
             self.app._codex_active_turns["thread-1"] = "turn-1"
         return session
+
+    def codex_error(self, *, retry: bool = False) -> dict:
+        return {
+            "threadId": "thread-1", "turnId": "turn-1", "willRetry": retry,
+            "error": {"message": "Selected model is at capacity.", "codexErrorInfo": "serverOverloaded"},
+        }
+
+    def test_codex_error_waits_for_completion_and_releases_failed_turn(self) -> None:
+        session = self.running("codex")
+        self.app._on_codex_notification("error", self.codex_error())
+        view = self.app._turns[(session.session_id, "turn-1")]
+        self.assertEqual(view.status, "running")
+        self.assertEqual(self.app.sessions.get_in_flight(session.session_id), "turn-1")
+        self.assertTrue(self.app._session_is_busy(session))
+        self.assertIn("Selected model is at capacity.", self.app._render_turn(view, view.started_at)[0])
+
+        self.app._on_codex_notification("turn/completed", {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "failed", "error": self.codex_error()["error"]},
+        })
+        self.assertEqual(view.status, "failed")
+        self.assertEqual(view.error, "Selected model is at capacity.")
+        self.assertEqual(self.app._session_states[session.session_id], STATE_FAILED)
+        self.assertFalse(self.app._session_is_busy(session))
+        self.assertIsNone(self.app.sessions.get_in_flight(session.session_id))
+        self.app.codex.steer_turn = lambda *_: self.fail("must not steer a finished turn")
+        started = []
+        self.app.codex.start_turn = lambda *_a, **_kw: started.append(True) or "turn-2"
+        self.app._send_to_session(1, session, "next")
+        self.assertEqual(started, [True])
+        self.assertEqual(self.app.sessions.get_in_flight(session.session_id), "turn-2")
+
+    def test_codex_retry_error_keeps_accepting_output_and_success(self) -> None:
+        session = self.running("codex")
+        self.app._on_codex_notification("error", self.codex_error(retry=True))
+        view = self.app._turns[(session.session_id, "turn-1")]
+        rendered, _ = self.app._render_turn(view, view.started_at)
+        self.assertEqual(view.status, "running")
+        self.assertIn("重试", rendered)
+        self.assertNotIn((session.session_id, "turn-1"), self.app._finished_turns)
+        self.app._on_codex_notification("item/agentMessage/delta", {
+            "threadId": "thread-1", "turnId": "turn-1", "delta": "recovered answer",
+        })
+        self.assertNotIn("at capacity", self.app._render_turn(view, view.started_at)[0])
+        self.app._on_codex_notification("turn/completed", {
+            "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"},
+        })
+        rendered, answer = self.app._render_turn(view, view.started_at)
+        self.assertEqual(answer, "recovered answer")
+        self.assertEqual(view.status, "completed")
+        self.assertNotIn("at capacity", rendered)
+        self.assertFalse(self.app._session_is_busy(session))
+
+    def test_codex_error_then_disconnect_preserves_recovery(self) -> None:
+        session = self.running("codex")
+        self.app._on_codex_notification("error", self.codex_error())
+        self.app._on_codex_disconnect()
+        view = self.app._turns[(session.session_id, "turn-1")]
+        self.assertEqual(view.status, "interrupted")
+        self.assertTrue(view.resumable)
+        self.assertEqual(self.app.sessions.get_in_flight(session.session_id), "turn-1")
+        self.assertFalse(self.app._session_is_busy(session))
+
+    def test_codex_failed_completion_drains_queue_once_and_ignores_late_events(self) -> None:
+        session = self.running("codex")
+        self.app._enqueue(session, PendingInput(1, "queued next", bot_key="worker"))
+        started = []
+        successor_started = threading.Event()
+
+        def start(*_args, **_kwargs):
+            started.append(True)
+            return "turn-2"
+
+        self.app.codex.start_turn = start
+        original_drain = self.app._start_next_queued
+
+        def drain(selected):
+            original_drain(selected)
+            successor_started.set()
+
+        self.app._start_next_queued = drain
+        completion = {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "failed", "error": self.codex_error()["error"]},
+        }
+        self.app._on_codex_notification("error", self.codex_error())
+        self.assertEqual(started, [])
+        self.app._on_codex_notification("turn/completed", completion)
+        self.assertTrue(successor_started.wait(2))
+        self.app._on_codex_notification("turn/completed", completion)
+        self.app._on_codex_notification("error", self.codex_error())
+        self.assertEqual(started, [True])
+        self.assertEqual(self.app.sessions.get_in_flight(session.session_id), "turn-2")
+        self.assertTrue(self.app._session_is_busy(session))
+        self.assertEqual(self.app._turns[(session.session_id, "turn-2")].bot_key, "worker")
+
+    def test_codex_failed_events_before_start_response_release_claim(self) -> None:
+        session = self.session("codex")
+
+        def start(*_args, **_kwargs):
+            self.app._on_codex_notification("turn/started", {
+                "threadId": "thread-1", "turn": {"id": "turn-1"},
+            })
+            self.app._on_codex_notification("error", self.codex_error())
+            self.app._on_codex_notification("turn/completed", {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "failed", "error": self.codex_error()["error"]},
+            })
+            return "turn-1"
+
+        self.app.codex.start_turn = start
+        with self.app._bot_scope("worker"):
+            self.app._start_session_turn(1, session, "go")
+        view = self.app._turns[(session.session_id, "turn-1")]
+        self.assertEqual(view.bot_key, "worker")
+        self.assertEqual(view.status, "failed")
+        self.assertFalse(self.app._session_is_busy(session))
+        self.assertIsNone(self.app.sessions.get_in_flight(session.session_id))
 
     def test_headless_interrupt_callback_before_return_releases_busy(self) -> None:
         session = self.running()
