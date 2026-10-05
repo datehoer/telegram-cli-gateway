@@ -15,6 +15,7 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -43,12 +44,19 @@ MAX_PUBLISH_RETRY_SECONDS = 30.0
 MAX_AUTO_SENT_ARTIFACTS = 3
 PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Telegram sendPhoto 上限
 
-# 客户端把超过 4096 字符的长文本拆成多条消息（无 media_group_id 等分组标记），
-# 这些片段在同一个 getUpdates 批次里连续到达。这里把它们拼回一条输入，否则
-# 后半段会变成 steer（追加）或排队。
-TEXT_FRAGMENT_MAX_CHARS = 4000
-TEXT_FRAGMENT_MAX_PARTS = 12
-TEXT_FRAGMENT_MAX_TOTAL_CHARS = 50_000
+# 客户端把超过 4096 字符（按 UTF-16 计）的长文本拆成多条消息，没有 media_group_id
+# 之类的分组标记。Telegram Desktop 在 2048~4096 之间挑段落/换行/空格断开，Android
+# 在 4096 处硬切；服务端会去掉每段首尾的空白，片段也常常分几个 getUpdates 批次到达。
+# 这里把它们拼回一条输入，否则后半段会变成 steer（追加）或排队。
+TELEGRAM_TEXT_MAX_CHARS = 4096
+TEXT_FRAGMENT_MIN_CHARS = 2000
+TEXT_FRAGMENT_MAX_PARTS = 24
+# 拼好的文本经 argv 交给 claude/grok/pi，Linux 单个参数上限 128 KiB。
+TEXT_FRAGMENT_MAX_TOTAL_BYTES = 100_000
+# 批次末尾像未完的片段时，轮询线程先等后续片段，安静这么久或到总上限才分发。
+TEXT_FRAGMENT_POLL_SECONDS = 0.25
+TEXT_FRAGMENT_QUIET_SECONDS = 1.5
+TEXT_FRAGMENT_MAX_WAIT_SECONDS = 10.0
 
 # 会话状态（展示用，事件驱动；busy 判定仍是运行逻辑的权威）
 STATE_IDLE = "idle"
@@ -181,6 +189,24 @@ def _command_help_section(commands: tuple[DirectCommand, ...]) -> str:
     lines.append("")
     lines.append("这些命令直接在本机执行，不调用 AI，也不进入会话上下文。")
     return "\n".join(lines)
+
+
+def _utf16_len(text: str) -> int:
+    """Telegram 按 UTF-16 码元计文本长度，emoji 等算两个。"""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _fragment_separator(previous: str, following: str, multiline: bool) -> str:
+    """补回断点处被服务端去掉的空白。
+
+    恰好 4096 的片段是硬切（Android），断点可能落在词中间，原样相接；其余是客户端
+    在空白处断开的（Desktop 优先段落和换行），多行文本补换行，单行文本补空格。
+    """
+    if previous[-1:].isspace() or following[:1].isspace():
+        return ""
+    if _utf16_len(previous) >= TELEGRAM_TEXT_MAX_CHARS:
+        return ""
+    return "\n" if multiline else " "
 
 
 class GatewayApp:
@@ -3391,46 +3417,52 @@ class GatewayApp:
     def _coalesce_text_fragments(
         self, updates: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """把同一批次里被客户端拆开的长文本片段拼回一条更新。
+        """把被客户端拆开的长文本片段拼回一条更新。
 
-        客户端把超过 4096 字符的文本拆成多条普通消息，没有 media_group_id 之类
-        的分组标记，但会在同一个 getUpdates 批次里按顺序到达：除最后一段外每段
-        都达到 TEXT_FRAGMENT_MAX_CHARS。只合并这种保守模式，避免把用户连续发送的
-        若干条普通消息误当成一条。
+        客户端把超长文本拆成多条普通消息，没有 media_group_id 之类的分组标记：
+        片段按顺序到达，除最后一段外每段都不短于 TEXT_FRAGMENT_MIN_CHARS。只合并
+        这种保守模式，避免把用户连续发送的若干条普通消息误当成一条。跨批次到达
+        的片段由 _await_text_fragments 先收进同一批。
         """
         merged: list[dict[str, Any]] = []
         index = 0
         while index < len(updates):
             update = updates[index]
             first = self._fragment_message(update)
-            if first is None or len(first["text"]) < TEXT_FRAGMENT_MAX_CHARS:
+            if first is None or not self._may_be_continued(first):
                 merged.append(update)
                 index += 1
                 continue
             group = [update]
-            total = len(first["text"])
+            total = len(first["text"].encode())
             last = first
             index += 1
             while (
                 len(group) < TEXT_FRAGMENT_MAX_PARTS
-                and len(last["text"]) >= TEXT_FRAGMENT_MAX_CHARS
+                and self._may_be_continued(last)
                 and index < len(updates)
             ):
                 candidate = self._fragment_message(updates[index])
                 if candidate is None or not self._same_fragment_run(last, candidate):
                     break
-                if total + len(candidate["text"]) > TEXT_FRAGMENT_MAX_TOTAL_CHARS:
+                size = len(candidate["text"].encode())
+                if total + size > TEXT_FRAGMENT_MAX_TOTAL_BYTES:
                     break
                 group.append(updates[index])
-                total += len(candidate["text"])
+                total += size
                 last = candidate
                 index += 1
             merged.append(self._stitch_text_fragments(group) if len(group) > 1 else update)
         return merged
 
     @staticmethod
+    def _may_be_continued(message: dict[str, Any]) -> bool:
+        """客户端拆出的非末段都超过 2048（Desktop 只在后半段找断点），更短的就是末段。"""
+        return _utf16_len(message["text"]) >= TEXT_FRAGMENT_MIN_CHARS
+
+    @staticmethod
     def _fragment_message(update: dict[str, Any]) -> dict[str, Any] | None:
-        """仅纯文本消息参与片段合并；附件、相册都不属于长文本拆分。"""
+        """仅纯文本消息参与片段合并；附件、相册、转发都不属于长文本拆分。"""
         message = update.get("message")
         if not isinstance(message, dict):
             return None
@@ -3439,6 +3471,7 @@ class GatewayApp:
             for key in (
                 "caption",
                 "document",
+                "forward_origin",
                 "media",
                 "media_group_id",
                 "photo",
@@ -3490,9 +3523,42 @@ class GatewayApp:
 
     @staticmethod
     def _stitch_text_fragments(group: list[dict[str, Any]]) -> dict[str, Any]:
-        first = dict(group[0]["message"])
-        first["text"] = "".join(part["message"]["text"] for part in group)
+        # 拼接后 entities 的偏移不再对应原文，直接丢掉。
+        first = {key: value for key, value in group[0]["message"].items() if key != "entities"}
+        parts = [part["message"]["text"] for part in group]
+        multiline = any("\n" in part for part in parts)
+        text = parts[0]
+        for previous, following in pairwise(parts):
+            text += _fragment_separator(previous, following, multiline) + following
+        first["text"] = text
         return {"update_id": group[-1].get("update_id"), "message": first}
+
+    def _await_text_fragments(
+        self, telegram: TelegramClient, offset: int | None, updates: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """批次末尾像未完的长文本片段时，等后续片段进入同一批再分发。
+
+        客户端逐条发送片段，Bot API 收到第一条就结束长轮询，后续片段落在下一批。
+        这里用同一个 offset 重新拉取：已拿到的 update 不会被确认，等待中途重启也
+        不会丢；片段停止增长、末段变短或等满上限后，交给 _coalesce_text_fragments。
+        """
+        started = last_growth = time.monotonic()
+        while updates:
+            tail = self._fragment_message(updates[-1])
+            if tail is None or not self._may_be_continued(tail):
+                break
+            now = time.monotonic()
+            if (
+                now - last_growth >= TEXT_FRAGMENT_QUIET_SECONDS
+                or now - started >= TEXT_FRAGMENT_MAX_WAIT_SECONDS
+                or self.stop_event.wait(TEXT_FRAGMENT_POLL_SECONDS)
+            ):
+                break
+            refreshed = telegram.get_updates(offset, 0)
+            if len(refreshed) > len(updates):
+                updates = refreshed
+                last_growth = time.monotonic()
+        return updates
 
     def handle_update(self, update: dict[str, Any]) -> None:
         callback = update.get("callback_query")
@@ -3612,8 +3678,9 @@ class GatewayApp:
         offset = self.sessions.get_telegram_offset(bot_key)
         while not self.stop_event.is_set():
             try:
+                updates = telegram.get_updates(offset, self.config.poll_timeout)
                 batch = self._coalesce_updates(
-                    telegram.get_updates(offset, self.config.poll_timeout)
+                    self._await_text_fragments(telegram, offset, updates)
                 )
                 for update in self._coalesce_text_fragments(batch):
                     update_id = update.get("update_id")

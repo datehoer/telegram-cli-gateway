@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from cli_telegram_gateway.app import (
     BOT_COMMANDS,
@@ -39,6 +40,22 @@ def run_background_inline(app: GatewayApp) -> None:
     app._run_in_background = (  # type: ignore[method-assign]
         lambda _name, target, *args: target(*args)
     )
+
+
+def text_update(
+    update_id: int, message_id: int, text: str, date: int = 1700, **extra: Any
+) -> dict[str, Any]:
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": message_id,
+            "from": {"id": 1},
+            "chat": {"id": 1, "type": "private"},
+            "date": date,
+            "text": text,
+            **extra,
+        },
+    }
 
 
 class GatewayEventTests(unittest.TestCase):
@@ -837,6 +854,161 @@ class GatewayEventTests(unittest.TestCase):
             for update in app._coalesce_text_fragments(updates):
                 app.handle_update(update)
             self.assertEqual(turns, ["x" * 4096 + "last part"])
+
+    def test_desktop_split_parts_restore_the_trimmed_line_breaks(self) -> None:
+        # Telegram Desktop 在 2048~4096 之间按段落/换行断开，服务端去掉断点处的空白，
+        # 所以非末段常常远短于 4000。
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            head = "\n".join(f"const value{n} = {n};" for n in range(120))
+            css = ".card{color:red}" * 190
+            parts = [head, css, "tail();"]
+            self.assertTrue(all(2048 < len(part) < 4000 for part in parts[:2]))
+            updates = [
+                text_update(90 + index, 900 + index, part)
+                for index, part in enumerate(parts)
+            ]
+            coalesced = app._coalesce_text_fragments(updates)
+            self.assertEqual(len(coalesced), 1)
+            self.assertEqual(coalesced[0]["update_id"], 92)
+            self.assertEqual(coalesced[0]["message"]["text"], f"{head}\n{css}\ntail();")
+
+    def test_single_line_split_parts_are_joined_with_a_space(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            prose = " ".join(["word"] * 600)
+            updates = [
+                text_update(100, 1000, prose, entities=[{"type": "bold", "offset": 0, "length": 4}]),
+                text_update(101, 1001, "the end."),
+            ]
+            coalesced = app._coalesce_text_fragments(updates)
+            self.assertEqual(len(coalesced), 1)
+            self.assertEqual(coalesced[0]["message"]["text"], prose + " the end.")
+            # 拼接后原 entities 的偏移已失效。
+            self.assertNotIn("entities", coalesced[0]["message"])
+
+    def test_hard_cut_is_measured_in_utf16_units(self) -> None:
+        # 2048 个 emoji 正好是 4096 个 UTF-16 码元：客户端在这里硬切，不能补空白。
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            emoji = "😀" * 2048
+            updates = [text_update(110, 1100, emoji), text_update(111, 1101, "tail")]
+            coalesced = app._coalesce_text_fragments(updates)
+            self.assertEqual(len(coalesced), 1)
+            self.assertEqual(coalesced[0]["message"]["text"], emoji + "tail")
+
+    def test_forwarded_long_messages_are_not_stitched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            origin = {"type": "hidden_user", "sender_user_name": "someone", "date": 1600}
+            updates = [
+                text_update(120, 1200, "f" * 3000, forward_origin=origin),
+                text_update(121, 1201, "g" * 3000, forward_origin=origin),
+            ]
+            self.assertEqual(app._coalesce_text_fragments(updates), updates)
+
+    def test_stitched_text_stays_below_the_argv_limit(self) -> None:
+        # claude -p / pi 的 prompt 走 argv，单个参数不能超过 128 KiB。
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            updates = [
+                text_update(130 + index, 1300 + index, "汉" * 4096) for index in range(10)
+            ]
+            coalesced = app._coalesce_text_fragments(updates)
+            self.assertEqual(len(coalesced), 2)
+            first = coalesced[0]["message"]["text"]
+            self.assertEqual(first, "汉" * 4096 * 8)
+            self.assertLess(len(first.encode()), 128 * 1024)
+            self.assertEqual(coalesced[1]["message"]["text"], "汉" * 4096 * 2)
+
+    def test_poll_waits_for_split_text_from_later_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            head = "\n".join(f"line {n};" for n in range(300))
+            middle = "x" * 3000
+            parts = [
+                text_update(70, 600, head),
+                text_update(71, 601, middle),
+                text_update(72, 602, "done"),
+            ]
+            # 长轮询先只返回第一段，之后的重拉陆续多出后续片段。
+            responses = [parts[:1], parts[:1], parts[:2], parts[:3]]
+            calls: list[tuple[int | None, int]] = []
+
+            def fake_get_updates(offset: int | None, timeout: int) -> list[dict[str, Any]]:
+                calls.append((offset, timeout))
+                if responses:
+                    return responses.pop(0)
+                app.stop_event.set()
+                return []
+
+            dispatched: list[dict[str, Any]] = []
+            app.telegram.get_updates = fake_get_updates  # type: ignore[method-assign]
+            app._dispatch_update = (  # type: ignore[method-assign]
+                lambda _bot_key, update: dispatched.append(update)
+            )
+            with mock.patch("cli_telegram_gateway.app.TEXT_FRAGMENT_POLL_SECONDS", 0.001):
+                app._poll_bot("default")
+
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0]["update_id"], 72)
+            self.assertEqual(dispatched[0]["message"]["text"], f"{head}\n{middle}\ndone")
+            # 等待时一直用原 offset 重拉，片段在分发前不会被确认。
+            self.assertEqual(calls, [(None, 1), (None, 0), (None, 0), (None, 0), (73, 1)])
+            self.assertEqual(app.sessions.get_telegram_offset("default"), 73)
+
+    def test_poll_dispatches_a_lone_long_message_after_the_quiet_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            lone = text_update(80, 700, "y" * 2500)
+            calls: list[tuple[int | None, int]] = []
+
+            def fake_get_updates(offset: int | None, timeout: int) -> list[dict[str, Any]]:
+                calls.append((offset, timeout))
+                if offset == 81:
+                    app.stop_event.set()
+                    return []
+                return [lone]
+
+            dispatched: list[dict[str, Any]] = []
+            app.telegram.get_updates = fake_get_updates  # type: ignore[method-assign]
+            app._dispatch_update = (  # type: ignore[method-assign]
+                lambda _bot_key, update: dispatched.append(update)
+            )
+            started = time.monotonic()
+            with (
+                mock.patch("cli_telegram_gateway.app.TEXT_FRAGMENT_POLL_SECONDS", 0.005),
+                mock.patch("cli_telegram_gateway.app.TEXT_FRAGMENT_QUIET_SECONDS", 0.05),
+            ):
+                app._poll_bot("default")
+
+            self.assertEqual(dispatched, [lone])
+            self.assertGreaterEqual(time.monotonic() - started, 0.05)
+            self.assertIn((None, 0), calls)
+            self.assertEqual(calls[-1], (81, 1))
+
+    def test_poll_does_not_wait_after_ordinary_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            short = text_update(85, 750, "hello")
+            calls: list[tuple[int | None, int]] = []
+
+            def fake_get_updates(offset: int | None, timeout: int) -> list[dict[str, Any]]:
+                calls.append((offset, timeout))
+                if offset == 86:
+                    app.stop_event.set()
+                    return []
+                return [short]
+
+            dispatched: list[dict[str, Any]] = []
+            app.telegram.get_updates = fake_get_updates  # type: ignore[method-assign]
+            app._dispatch_update = (  # type: ignore[method-assign]
+                lambda _bot_key, update: dispatched.append(update)
+            )
+            app._poll_bot("default")
+
+            self.assertEqual(dispatched, [short])
+            self.assertEqual(calls, [(None, 1), (86, 1)])
 
     def test_media_group_forwards_all_attachments_in_one_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
