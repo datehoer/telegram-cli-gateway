@@ -18,7 +18,7 @@ class ClaudeHistoryTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name) / "claude-config"
         self.cwd = str(Path(temporary.name) / "project.with space_中文")
-        self.external_id = "a60c2e0c-c19e-4a53-a8e4-15a4073e28ec"
+        self.external_id = "00000000-0000-4000-8000-000000000001"
         directory = self.root / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", self.cwd)
         directory.mkdir(parents=True)
         self.path = directory / f"{self.external_id}.jsonl"

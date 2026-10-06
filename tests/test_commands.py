@@ -387,12 +387,12 @@ class BundledExampleTests(unittest.TestCase):
 class RawArgsTests(unittest.TestCase):
     """直接命令不做 shell 分词。
 
-    Cookie、JSON、rpdid=|(u)|Yl)JYlJ0J'u~Yu~mJ~Rk 这类内容里的引号是数据不是
+    Cookie、JSON、rpdid=example'cookie-marker 这类内容里的引号是数据不是
     语法，shlex 会直接报 "No closing quotation"。网关必须把原文交给扩展。
     """
 
     COOKIE_WITH_APOSTROPHE = (
-        "rpdid=|(u)|Yl)JYlJ0J'u~Yu~mJ~Rk; SESSDATA=abc%2Cdef; bili_jct=xyz"
+        "rpdid=example'cookie-marker; SESSDATA=abc%2Cdef; bili_jct=xyz"
     )
 
     def setUp(self) -> None:

@@ -141,7 +141,7 @@ Full field reference, plugin contract, and security boundary: [`extensions/READM
 /tgstats
 /status
 /context
-/rename codex-a8d1 main-project
+/rename codex-abcd main-project
 /back
 /interrupt
 /resume
