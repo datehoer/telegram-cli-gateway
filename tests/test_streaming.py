@@ -100,26 +100,60 @@ class LongTaskStreamingTests(unittest.TestCase):
         self.assertIn("旧版输出", answer)
         self.assertIn("没有 itemId", answer)
 
-    def test_long_reply_without_phases_stays_one_message(self) -> None:
-        # Headless CLIs stream the answer itself; reading records would repeat it.
-        session = self.app.sessions.create_headless("claude", Path(self.temporary.name), 1)
+    def headless_turn(self, cli: str) -> tuple[Any, Any]:
+        session = self.app.sessions.create_headless(cli, Path(self.temporary.name), 1)
         self.app.sessions.switch(1, session.session_id)
-        view = self.app._register_turn(session, "turn-claude")
+        view = self.app._register_turn(session, "turn-headless")
         view.live = True
+        return session, view
+
+    def headless(self, session: Any, view: Any, kind: str, data: Any = None) -> None:
+        self.app._on_headless_event(session.session_id, "turn-headless", kind, data)
+        rendered, _answer = self.app._render_turn(view, time.monotonic())
+        if view.status == "running":
+            self.app._publish_running_turn(view, rendered)
+        else:
+            self.app._publish_final_turn(view, rendered, with_artifacts=False)
+            self.app._resolve_stale(view)
+
+    def test_long_reply_without_phases_stays_one_message(self) -> None:
+        # Pi and Grok stream the answer itself; reading records would repeat it.
+        session, view = self.headless_turn("pi")
         source = "".join(f"第 {i:03d} 段：" + "回答内容" * 20 + "\n\n" for i in range(40))
         for start in range(0, len(source), 400):
-            self.app._on_headless_event(session.session_id, "turn-claude", "delta", source[start:start + 400])
-            rendered, _answer = self.app._render_turn(view, time.monotonic())
-            self.app._publish_running_turn(view, rendered)
-        self.app._on_headless_event(session.session_id, "turn-claude", "completed", None)
-        rendered, _answer = self.app._render_turn(view, time.monotonic())
-        self.app._publish_final_turn(view, rendered, with_artifacts=False)
-        self.app._resolve_stale(view)
+            self.headless(session, view, "delta", source[start:start + 400])
+        self.headless(session, view, "completed")
         self.assertEqual(list(self.messages), [view.message_id])
         body = self.messages[view.message_id]
         for i in range(40):
             self.assertEqual(body.count(f"第 {i:03d} 段："), 1)
         self.assertNotIn("运行记录", body)
+
+    def test_claude_narration_becomes_a_record_and_the_result_gets_its_own_card(self) -> None:
+        session, view = self.headless_turn("claude")
+        self.headless(session, view, "message_delta", {"id": "m1", "delta": "先检查日期。"})
+        self.headless(session, view, "command", "date -u")
+        summary = "摘要 → https://pages.example/p/abc"
+        self.headless(session, view, "message_delta", {"id": "m2", "delta": summary})
+        self.headless(session, view, "message_completed", {"id": "m2", "phase": "final_answer", "text": summary})
+        self.headless(session, view, "completed")
+        record_id, final_id = sorted(self.messages)
+        self.assertIn("运行记录", self.messages[record_id])
+        self.assertIn("先检查日期", self.messages[record_id])
+        self.assertNotIn(summary, self.messages[record_id])
+        self.assertIn(summary, self.messages[final_id])
+        self.assertNotIn("先检查日期", self.messages[final_id])
+        sends = [payload for method, payload in self.calls if method == "sendRichMessage"]
+        self.assertEqual([bool(payload.get("disable_notification")) for payload in sends], [True, False])
+
+    def test_claude_reply_without_narration_stays_one_message(self) -> None:
+        session, view = self.headless_turn("claude")
+        self.headless(session, view, "message_delta", {"id": "m1", "delta": "简短回答"})
+        self.headless(session, view, "message_completed", {"id": "m1", "phase": "final_answer", "text": "简短回答"})
+        self.headless(session, view, "completed")
+        self.assertEqual(list(self.messages), [view.message_id])
+        self.assertIn("简短回答", self.messages[view.message_id])
+        self.assertNotIn("运行记录", self.messages[view.message_id])
 
     def test_only_latest_segment_is_edited_and_history_survives_completion(self) -> None:
         source = "\n".join(f"步骤-{i:03d}：" + "内容" * 15 for i in range(150))

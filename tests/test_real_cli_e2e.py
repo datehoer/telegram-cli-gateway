@@ -58,11 +58,17 @@ class RealCliEndToEndTests(unittest.TestCase):
             with self.subTest(cli=cli), tempfile.TemporaryDirectory(dir=self.e2e_root) as cwd:
                 finished = threading.Event()
                 answer: list[str] = []
+                finals: list[str] = []
                 errors: list[str] = []
 
                 def on_event(_session_id: str, _turn_id: str, kind: str, data: Any) -> None:
                     if kind == "delta" and isinstance(data, str):
                         answer.append(data)
+                    elif kind == "message_delta" and isinstance(data, dict):
+                        answer.append(str(data.get("delta") or ""))
+                    elif kind == "message_completed" and isinstance(data, dict):
+                        if data.get("phase") == "final_answer":
+                            finals.append(str(data.get("text") or ""))
                     elif kind == "error":
                         errors.append(str(data))
                         finished.set()
@@ -87,6 +93,9 @@ class RealCliEndToEndTests(unittest.TestCase):
                     self.assertTrue(finished.wait(180), f"{cli} turn timed out")
                     self.assertEqual(errors, [])
                     self.assertIn(f"{cli.upper()}_E2E_OK", "".join(answer))
+                    if cli == "claude":
+                        # Claude's terminal result names its last message as the answer.
+                        self.assertIn("CLAUDE_E2E_OK", "".join(finals))
 
                     deadline = time.monotonic() + 5
                     while backend.is_active(session_id) and time.monotonic() < deadline:

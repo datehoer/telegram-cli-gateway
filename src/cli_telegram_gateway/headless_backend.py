@@ -372,6 +372,7 @@ class HeadlessBackend:
         terminal_result: tuple[str, Any] | None = None
         emitted_text = False
         tool_json_parts: dict[int, list[str]] = {}
+        message: dict[str, str] = {}
         try:
             if process.stdout:
                 for raw_line in process.stdout:
@@ -385,9 +386,9 @@ class HeadlessBackend:
                         continue
                     if not isinstance(value, dict):
                         continue
-                    events = self._parse_event(session.cli, value, tool_json_parts, emitted_text)
+                    events = self._parse_event(session.cli, value, tool_json_parts, emitted_text, message)
                     for kind, data in events:
-                        if kind == "delta" and data:
+                        if (kind == "delta" and data) or (kind == "message_delta" and data["delta"]):
                             emitted_text = True
                         if kind == "retrying":
                             # Pi may retry a provider failure internally. Its preceding
@@ -440,11 +441,14 @@ class HeadlessBackend:
         value: dict[str, Any],
         tool_json_parts: dict[int, list[str]],
         emitted_text: bool,
+        message: dict[str, str] | None = None,
     ) -> list[tuple[str, Any]]:
         usage = headless_usage(cli, value)
         events: list[tuple[str, Any]] = [("usage", usage)] if usage else []
         if cli in {"claude", "grok"}:
-            return events + self._parse_anthropic_event(value, tool_json_parts, emitted_text)
+            # Only Claude's result has been verified to repeat just its last message.
+            tracked = message if cli == "claude" else None
+            return events + self._parse_anthropic_event(value, tool_json_parts, emitted_text, tracked)
         return events + self._parse_pi_event(value, emitted_text)
 
     def _parse_anthropic_event(
@@ -452,6 +456,7 @@ class HeadlessBackend:
         value: dict[str, Any],
         tool_json_parts: dict[int, list[str]],
         emitted_text: bool,
+        message: dict[str, str] | None = None,
     ) -> list[tuple[str, Any]]:
         output: list[tuple[str, Any]] = []
         value_type = value.get("type")
@@ -461,12 +466,19 @@ class HeadlessBackend:
                 return output
             event_type = event.get("type")
             index = event.get("index") if isinstance(event.get("index"), int) else 0
-            if event_type == "content_block_delta":
+            if event_type == "message_start" and message is not None:
+                started = event.get("message")
+                if isinstance(started, dict) and isinstance(started.get("id"), str):
+                    message["id"] = started["id"]
+            elif event_type == "content_block_delta":
                 delta = event.get("delta")
                 if isinstance(delta, dict) and delta.get("type") == "text_delta":
                     text = delta.get("text")
                     if isinstance(text, str):
-                        output.append(("delta", text))
+                        if message and message.get("id"):
+                            output.append(("message_delta", {"id": message["id"], "delta": text}))
+                        else:
+                            output.append(("delta", text))
                 elif isinstance(delta, dict) and delta.get("type") == "input_json_delta":
                     partial = delta.get("partial_json")
                     if isinstance(partial, str):
@@ -504,7 +516,13 @@ class HeadlessBackend:
                 output.append(("error", self._anthropic_error_detail(value)))
             else:
                 result = value.get("result")
-                if not emitted_text and isinstance(result, str) and result:
+                if message and message.get("id") and isinstance(result, str) and result:
+                    # The result repeats only the last message: that is the final answer,
+                    # and every earlier message was narration around tool calls.
+                    output.append(("message_completed", {
+                        "id": message["id"], "phase": "final_answer", "text": result,
+                    }))
+                elif not emitted_text and isinstance(result, str) and result:
                     output.append(("delta", result))
                 output.append(("completed", None))
         return output

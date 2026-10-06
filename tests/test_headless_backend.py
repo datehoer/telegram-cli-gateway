@@ -66,6 +66,47 @@ class HeadlessParserTests(unittest.TestCase):
         self.assertEqual(text, [("delta", "hello")])
         self.assertEqual(tool, [("command", "pwd")])
 
+    def test_claude_result_marks_only_the_last_message_final(self) -> None:
+        def text(value: str) -> dict[str, object]:
+            return {"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": value},
+            }}
+
+        def start(message_id: str) -> dict[str, object]:
+            return {"type": "stream_event", "event": {"type": "message_start", "message": {"id": message_id}}}
+
+        stream = [
+            start("msg_1"), text("先查日期。"),
+            start("msg_2"), text("今天是 10 月 6 日"),
+            {"type": "result", "subtype": "success", "is_error": False, "result": "今天是 10 月 6 日"},
+        ]
+
+        def parse(cli: str, values: list[dict[str, object]]) -> list[tuple[str, object]]:
+            events: list[tuple[str, object]] = []
+            parts: dict[int, list[str]] = {}
+            message: dict[str, str] = {}
+            emitted = False
+            for value in values:
+                for kind, data in self.backend._parse_event(cli, value, parts, emitted, message):
+                    events.append((kind, data))
+                    emitted = emitted or kind in {"delta", "message_delta"}
+            return events
+
+        self.assertEqual(parse("claude", stream), [
+            ("message_delta", {"id": "msg_1", "delta": "先查日期。"}),
+            ("message_delta", {"id": "msg_2", "delta": "今天是 10 月 6 日"}),
+            ("message_completed", {"id": "msg_2", "phase": "final_answer", "text": "今天是 10 月 6 日"}),
+            ("completed", None),
+        ])
+        # Grok's result has not been verified to repeat only its last message.
+        self.assertEqual(parse("grok", stream), [
+            ("delta", "先查日期。"),
+            ("delta", "今天是 10 月 6 日"),
+            ("completed", None),
+        ])
+        # Without partial messages the result is still the only visible answer.
+        self.assertEqual(parse("claude", stream[-1:]), [("delta", "今天是 10 月 6 日"), ("completed", None)])
+
     def test_grok_result_returns_errors_list_detail(self) -> None:
         events = self.backend._parse_anthropic_event(
             {
