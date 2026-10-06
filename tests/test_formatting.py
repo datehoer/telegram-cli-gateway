@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from cli_telegram_gateway.formatting import markdown_to_telegram_html, split_markdown
+from cli_telegram_gateway.formatting import markdown_to_telegram_html, split_markdown, stream_segment
 
 
 class TelegramMarkdownTests(unittest.TestCase):
@@ -38,6 +38,34 @@ class TelegramMarkdownTests(unittest.TestCase):
         for chunk in chunks:
             rendered = markdown_to_telegram_html(chunk)
             self.assertEqual(rendered.count("<pre>"), rendered.count("</pre>"))
+
+    def test_stream_segments_preserve_source_and_code_indentation(self) -> None:
+        source = "intro\n\n```python\n" + "    print('你好 😀')\n" * 200 + "```\n\ntail"
+        offset = 0
+        recovered = []
+        chunks = []
+        while offset < len(source):
+            chunk, end = stream_segment(source, offset, 150)
+            self.assertGreater(end, offset)
+            self.assertLessEqual(len(chunk.encode("utf-16-le")) // 2, 150)
+            recovered.append(source[offset:end])
+            chunks.append(chunk)
+            rendered = markdown_to_telegram_html(chunk)
+            self.assertEqual(rendered.count("<pre>"), rendered.count("</pre>"))
+            offset = end
+        self.assertEqual("".join(recovered), source)
+        self.assertTrue(any(chunk.startswith("```python\n    ") for chunk in chunks[1:]))
+
+    def test_stream_segment_counts_emoji_as_two_units(self) -> None:
+        source = "😀" * 2000
+        chunk, end = stream_segment(source)
+        self.assertLessEqual(len(chunk.encode("utf-16-le")) // 2, 1500)
+        self.assertEqual(chunk, source[:end])
+        self.assertLess(end, 1000)
+
+    def test_empty_tail_does_not_reopen_an_unclosed_code_block(self) -> None:
+        source = "```text\nhello"
+        self.assertEqual(stream_segment(source, len(source)), ("", len(source)))
 
 
 if __name__ == "__main__":

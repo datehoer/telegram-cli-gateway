@@ -2123,13 +2123,17 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(view.message_id, 41)
             self.assertEqual(view.stale_message_ids, [])
             self.assertEqual(rich_sent, [])
-            self.assertEqual(len(edited), 1)
-            self.assertEqual(edited[0][0], 41)
-            self.assertIn("已追加 1 次", edited[0][1])
+            self.assertEqual(edited, [])
+            self.assertEqual(list(view.steer_notices), [(1, 0)])
+            app._publish_steer_notice(view)
+            self.assertIn("CLI 已接收", rich_sent[0])
+            self.assertIsNone(view.message_id)
+            self.assertEqual(view.stale_message_ids, [41])
+            self.assertEqual(list(view.steer_notices), [])
 
             app._publish_running_turn(view, "latest update")
-            self.assertEqual([item[0] for item in edited], [41, 41])
-            self.assertEqual(view.message_id, 41)
+            self.assertEqual(edited, [])
+            self.assertEqual(rich_sent[-1], "latest update")
 
     def test_codex_turn_started_reuses_running_view_instead_of_second_card(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

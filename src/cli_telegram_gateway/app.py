@@ -30,7 +30,7 @@ from .commands import (
     load_direct_commands,
 )
 from .config import Config, ConfigError
-from .formatting import harden_rich_markdown, split_markdown, split_rich_markdown
+from .formatting import harden_rich_markdown, split_markdown, split_rich_markdown, stream_segment
 from .headless_backend import HeadlessBackend, HeadlessBackendError
 from .models import clear_listing_cache, list_efforts, list_models
 from .sessions import CliSession, SessionError, SessionManager
@@ -41,6 +41,7 @@ from .usage import codex_usage, context_lines, quota_lines, usage_lines
 LOGGER = logging.getLogger("telegram-cli-gateway")
 MAX_PENDING_INPUTS_PER_SESSION = 20
 MAX_PUBLISH_RETRY_SECONDS = 30.0
+STREAM_SEGMENT_UNITS = 1500
 MAX_AUTO_SENT_ARTIFACTS = 3
 PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Telegram sendPhoto 上限
 
@@ -153,12 +154,25 @@ BUILTIN_COMMANDS = frozenset(name for name, _description in BOT_COMMANDS)
 
 
 @dataclass
+class AssistantMessage:
+    phase: str | None = None
+    parts: list[str] = field(default_factory=list)
+    completed: bool = False
+
+
+@dataclass
 class TurnView:
     session: CliSession
     turn_id: str
     bot_key: str = "default"
     started_at: float = field(default_factory=time.monotonic)
     parts: list[str] = field(default_factory=list)
+    assistant_messages: dict[str, AssistantMessage] = field(default_factory=dict)
+    progress_offset: int = 0
+    progress_page: int = 1
+    progress_closed: bool = False
+    steer_notices: deque[tuple[int, int]] = field(default_factory=deque)
+    revision: int = 0
     command: str = ""
     command_output: str = ""
     status: str = "running"
@@ -1824,6 +1838,7 @@ class GatewayApp:
                     if active_turn and active_turn != "starting"
                     else None
                 )
+                steer_boundary = len(self._turn_progress(active_view)) if active_view else 0
             # Steering keeps the active turn's immutable reply route. A message
             # from another Bot must therefore become its own queued turn, or its
             # answer would appear only in the Bot that started the active turn.
@@ -1838,9 +1853,15 @@ class GatewayApp:
                         view = self._turns.get((session.session_id, active_turn))
                         if view:
                             view.steered += 1
+                            view.steer_notices.append((view.steered, steer_boundary))
+                            view.revision += 1
                             view.dirty = True
-                    if view:
-                        self._refresh_running_turn(view)
+                    if view is None:
+                        # The publisher may have finished while turn/steer replied.
+                        self._run_in_background(
+                            "steer-ack", self._send, chat_id,
+                            f"[{session.session_id}] 已追加要求，CLI 已接收。", bot_key,
+                        )
                     return
                 except CodexBackendError as exc:
                     if exc.ambiguous:
@@ -2163,6 +2184,26 @@ class GatewayApp:
                 view.parts.append(data)
                 if data:
                     view.notice = ""
+            elif kind in {"message_started", "message_delta", "message_completed"} and isinstance(data, dict):
+                item_id = data.get("id")
+                if not isinstance(item_id, str):
+                    return False
+                message = view.assistant_messages.setdefault(item_id, AssistantMessage())
+                phase = data.get("phase")
+                if isinstance(phase, str) and phase in {"commentary", "final_answer"}:
+                    message.phase = phase
+                if not message.completed:
+                    if kind == "message_delta" and isinstance(data.get("delta"), str):
+                        message.parts.append(data["delta"])
+                    elif kind in {"message_started", "message_completed"} and isinstance(data.get("text"), str):
+                        # Completion carries the authoritative text and may be the
+                        # only visible event after a reconnect. Never append it twice.
+                        if data["text"]:
+                            message.parts = [data["text"]]
+                    if kind == "message_completed":
+                        message.completed = True
+                if message.parts:
+                    view.notice = ""
             elif kind == "thinking":
                 # Reasoning is not user-visible output. Do not retain or publish it.
                 pass
@@ -2206,6 +2247,7 @@ class GatewayApp:
                     view.resumable = True
                     self._set_session_state(session.session_id, STATE_INTERRUPTED)
             view.dirty = True
+            view.revision += 1
             if kind in {"completed", "error", "interrupted"}:
                 self._finished_turns.append((session.session_id, turn_id))
             return True
@@ -2347,11 +2389,18 @@ class GatewayApp:
                 self._finish_turn(session, thread_id, turn_id)
             return
         if method == "item/agentMessage/delta":
-            self._update_turn(session, turn_id, "delta", params.get("delta"))
+            if isinstance(params.get("itemId"), str):
+                self._update_turn(session, turn_id, "message_delta", {
+                    "id": params["itemId"], "delta": params.get("delta"),
+                })
+            else:
+                self._update_turn(session, turn_id, "delta", params.get("delta"))
         elif method == "item/started":
             item = params.get("item")
             if isinstance(item, dict) and item.get("type") == "commandExecution":
                 self._update_turn(session, turn_id, "command", item.get("command"))
+            elif isinstance(item, dict) and item.get("type") == "agentMessage":
+                self._update_turn(session, turn_id, "message_started", item)
         elif method == "item/commandExecution/outputDelta":
             self._update_turn(session, turn_id, "command_output", params.get("delta"))
         elif method == "item/completed":
@@ -2360,6 +2409,8 @@ class GatewayApp:
                 output = item.get("aggregatedOutput") or item.get("output")
                 if output:
                     self._update_turn(session, turn_id, "command_output", output)
+            elif isinstance(item, dict) and item.get("type") == "agentMessage":
+                self._update_turn(session, turn_id, "message_completed", item)
         elif method == "turn/completed":
             turn = params.get("turn")
             status = turn.get("status") if isinstance(turn, dict) else None
@@ -2422,7 +2473,42 @@ class GatewayApp:
         except CodexBackendError:
             LOGGER.exception("could not decline unsupported Codex request")
 
-    def _render_turn(self, view: TurnView, now: float, background: bool = False) -> tuple[str, str]:
+    def _turn_progress(self, view: TurnView) -> str:
+        with self._state_lock:
+            bodies = ["".join(view.parts)] if view.parts else []
+            bodies.extend(
+                "".join(message.parts) for message in view.assistant_messages.values()
+                if message.phase != "final_answer" and message.parts
+            )
+        return "\n\n".join(bodies)
+
+    def _turn_answer(self, view: TurnView) -> str:
+        with self._state_lock:
+            final = [
+                "".join(message.parts) for message in view.assistant_messages.values()
+                if message.phase == "final_answer" and message.parts
+            ]
+            if final:
+                return "\n\n".join(final).strip()
+            # Providers without MessagePhase retain their existing answer behavior.
+            unknown = ["".join(view.parts)] if view.parts else []
+            unknown.extend(
+                "".join(message.parts) for message in view.assistant_messages.values()
+                if message.phase is None and message.parts
+            )
+        return "\n\n".join(unknown).strip()
+
+    def _turn_has_phases(self, view: TurnView) -> bool:
+        # Without native phases the streamed text is the answer itself. Sealing it
+        # into reading segments would post the reply twice: as records and again
+        # as the final card.
+        with self._state_lock:
+            return any(message.phase is not None for message in view.assistant_messages.values())
+
+    def _render_turn(
+        self, view: TurnView, now: float, background: bool = False,
+        *, record_text: str | None = None,
+    ) -> tuple[str, str]:
         elapsed = max(0, int(now - view.started_at))
         label = {
             "running": "运行中",
@@ -2432,32 +2518,52 @@ class GatewayApp:
         }.get(view.status, view.status)
         if background and view.status == "running":
             label = "后台运行中"
+        if record_text is not None:
+            label = f"运行记录 · 第 {view.progress_page} 段"
         status = f"[{view.session.session_id}] · {label} {elapsed}秒"
         if view.steered:
             status += f" · 已追加 {view.steered} 次"
         model_label = view.model_label or "CLI default"
         effort_label = view.effort_label or "CLI default"
         header = f"model: {model_label} · effort: {effort_label}\n{status}"
-        answer = "".join(view.parts).strip()
+        answer = self._turn_answer(view)
         sections = [header]
-        if view.status == "running" and not background:
-            if answer:
-                sections.append(("…" if len(answer) > 27000 else "") + answer[-27000:])
-            if view.command:
+        if record_text is not None:
+            if record_text.strip():
+                sections.append(record_text.strip("\n"))
+            return "\n\n".join(sections), answer
+        if view.status == "running":
+            with self._state_lock:
+                has_final = any(
+                    message.phase == "final_answer" and message.parts
+                    for message in view.assistant_messages.values()
+                )
+            if has_final or view.progress_closed or not self._turn_has_phases(view):
+                body = ("…" if len(answer) > 27000 else "") + answer[-27000:]
+            else:
+                body, _end = stream_segment(
+                    self._turn_progress(view), view.progress_offset, STREAM_SEGMENT_UNITS
+                )
+                if body.strip():
+                    sections[0] += f" · 第 {view.progress_page} 段"
+            if body.strip():
+                sections.append(body.strip("\n"))
+            if view.command and not background:
                 command = view.command[-700:].replace("```", "` ` `")
                 sections.append(f"当前命令：\n```text\n{command}\n```")
-            if view.command_output:
+            if view.command_output and not background:
                 output = view.command_output[-500:].replace("```", "` ` `")
                 sections.append(f"命令输出：\n```text\n{output}\n```")
-        elif view.status == "running" and background and answer:
-            sections.append(("…" if len(answer) > 27000 else "") + answer[-27000:])
         elif answer:
             sections.append(answer)
         elif view.status == "completed":
-            sections.append(
-                "⚠️ 模型已结束，但没有返回可见回答。"
-                "为避免重复执行操作，网关未自动重试。"
-            )
+            if self._turn_progress(view).strip():
+                sections.append("任务已结束，过程输出见运行记录；CLI 没有提供单独的最终回答。")
+            else:
+                sections.append(
+                    "⚠️ 模型已结束，但没有返回可见回答。"
+                    "为避免重复执行操作，网关未自动重试。"
+                )
         if view.status == "interrupted" and view.resumable:
             sections.append("⚠️ 任务被中断。回复 /resume 继续，或 /cancel 放弃。")
         if view.status == "running" and view.notice:
@@ -2500,35 +2606,6 @@ class GatewayApp:
                 view.session.session_id,
                 view.bot_key,
             )
-
-    def _refresh_running_turn(self, view: TurnView) -> None:
-        if view.status != "running":
-            return
-        if view.message_id is None or view.message_id <= 0:
-            view.dirty = True
-            return
-        now = time.monotonic()
-        rendered, _ = self._render_turn(view, now)
-        try:
-            with self._publish_lock:
-                self._publish_running_turn(view, rendered)
-        except TelegramError as exc:
-            with self._state_lock:
-                delay = self._schedule_publish_retry(view, exc, now)
-            LOGGER.warning(
-                "could not refresh Telegram message for %s after steering; "
-                "retrying in %.1fs: %s",
-                view.session.session_id,
-                delay,
-                exc,
-            )
-            return
-        with self._state_lock:
-            view.last_edit = now
-            view.publish_failures = 0
-            view.next_publish_at = 0.0
-            view.dirty = False
-            view.published = True
 
     def _pin_turn(self, view: TurnView, now: float) -> bool:
         """把当前 session 的运行进度钉到一条新的底部消息上并开始直播。
@@ -2635,15 +2712,18 @@ class GatewayApp:
         *,
         rich: bool,
         max_chunks: int | None = None,
+        silent: bool = False,
     ) -> list[int]:
         client = self._telegram(view.bot_key)
         send = client.send_rich_markdown_parts if rich else client.send_markdown_parts
         try:
+            options = {"disable_notification": True} if silent else {}
             ids = send(
                 view.session.chat_id,
                 rendered,
                 reply_markup=reply_markup,
                 max_chunks=max_chunks,
+                **options,
             )
         except TelegramError as exc:
             self._apply_published_ids(view, exc.message_ids)
@@ -2676,14 +2756,88 @@ class GatewayApp:
         return [item for item in ids if isinstance(item, int) and item > 0]
 
     def _publish_running_turn(self, view: TurnView, rendered: str) -> None:
-        # Stream by editing one persistent message in place. Telegram Rich Message
+        with self._state_lock:
+            progress = self._turn_progress(view)
+            has_final = any(
+                message.phase == "final_answer" and message.parts
+                for message in view.assistant_messages.values()
+            )
+        if not view.progress_closed and self._turn_has_phases(view):
+            if has_final:
+                self._seal_progress(view, progress)
+                view.progress_closed = True
+                # The caller may have rendered progress just before the final answer
+                # arrived; that snapshot must not become the notifying final card.
+                rendered, _answer = self._render_turn(view, time.monotonic())
+            else:
+                rolled = False
+                while view.progress_offset < len(progress):
+                    chunk, end = stream_segment(progress, view.progress_offset, STREAM_SEGMENT_UNITS)
+                    if end == len(progress):
+                        break
+                    self._archive_progress_segment(view, chunk, end)
+                    rolled = True
+                if rolled:
+                    rendered, _answer = self._render_turn(view, time.monotonic())
+        self._publish_stream_card(view, rendered, silent=not has_final)
+
+    def _archive_progress_segment(self, view: TurnView, chunk: str, end: int) -> None:
+        rendered, _answer = self._render_turn(view, time.monotonic(), record_text=chunk)
+        self._publish_stream_card(view, rendered)
+        # Advance only after Telegram confirms publication. Historical segments
+        # stay bound to the session but must never enter duplicate-card cleanup.
+        with self._state_lock:
+            view.progress_offset = end
+            view.progress_page += 1
+            view.message_id = None
+            view.message_ids = []
+            view.published = False
+
+    def _seal_progress(self, view: TurnView, progress: str) -> None:
+        while view.progress_offset < len(progress):
+            chunk, end = stream_segment(progress, view.progress_offset, STREAM_SEGMENT_UNITS)
+            self._archive_progress_segment(view, chunk, end)
+
+    def _publish_steer_notice(self, view: TurnView) -> None:
+        with self._state_lock:
+            number, boundary = view.steer_notices[0]
+            progress = self._turn_progress(view)
+        if not view.progress_closed and self._turn_has_phases(view):
+            self._seal_progress(view, progress[:boundary])
+        text = f"[{view.session.session_id}] 已追加第 {number} 次要求，CLI 已接收。\n后续进展会显示在这条消息下方。"
+        client = self._telegram(view.bot_key)
+        try:
+            ids = client.send_rich_markdown_parts(
+                view.session.chat_id, text, max_chunks=1, disable_notification=True,
+            )
+        except TelegramError as exc:
+            if exc.retry_after is not None or not exc.fallback_allowed:
+                raise
+            ids = client.send_markdown_parts(
+                view.session.chat_id, text, max_chunks=1, disable_notification=True,
+            )
+        if not ids:
+            raise TelegramError("steer acknowledgement returned no message ID", fallback_allowed=False)
+        for message_id in ids:
+            self.sessions.bind_message(view.session.chat_id, message_id, view.session.session_id, view.bot_key)
+        with self._state_lock:
+            view.steer_notices.popleft()
+            # If there was only a command/status card, or a final was already
+            # streaming, retire that duplicate so the next update follows the ack.
+            if view.message_id is not None:
+                self._abandon_view_cards(view)
+            view.published = False
+            view.dirty = True
+
+    def _publish_stream_card(self, view: TurnView, rendered: str, *, silent: bool = True) -> None:
+        # Edit just the active segment. Telegram Rich Message
         # Drafts cannot be finalized or removed by the gateway once interrupted,
         # leaving an eternal "loading" bubble in the chat, so they are not used.
         rendered = self._one_card_text(rendered, view.rich_mode)
         if view.rich_mode:
             try:
                 if view.message_id is None:
-                    ids = self._send_turn_cards(view, rendered, rich=True, max_chunks=1)
+                    ids = self._send_turn_cards(view, rendered, rich=True, max_chunks=1, silent=silent)
                     if ids:
                         self._apply_published_ids(view, ids)
                     else:
@@ -2703,7 +2857,7 @@ class GatewayApp:
                 )
                 rendered = self._one_card_text(rendered, False)
         if view.message_id is None:
-            ids = self._send_turn_cards(view, rendered, rich=False, max_chunks=1)
+            ids = self._send_turn_cards(view, rendered, rich=False, max_chunks=1, silent=silent)
             if ids:
                 self._apply_published_ids(view, ids)
             else:
@@ -2730,8 +2884,13 @@ class GatewayApp:
             auto_send = with_artifacts
         if not allow_new_messages and (view.message_id is None or view.message_id <= 0):
             return False
+        if allow_new_messages and not view.progress_closed and self._turn_has_phases(view):
+            with self._state_lock:
+                progress = self._turn_progress(view)
+            self._seal_progress(view, progress)
+            view.progress_closed = True
         if with_artifacts:
-            view.artifacts = self._find_artifacts(view.session, "".join(view.parts))
+            view.artifacts = self._find_artifacts(view.session, self._turn_answer(view))
             markup = self._artifact_markup(view)
         else:
             view.artifacts = []
@@ -3183,7 +3342,9 @@ class GatewayApp:
                     if now < view.next_publish_at:
                         continue
                     is_current = self._is_view_current(view)
-                    if view.status == "running":
+                    if is_current and view.steer_notices:
+                        action = "steer_notice"
+                    elif view.status == "running":
                         if is_current and not view.live:
                             action = "pin"
                         elif not is_current and view.live:
@@ -3214,6 +3375,7 @@ class GatewayApp:
                             continue
                         published_status = view.status
                         rendered, _answer = self._render_turn(view, now)
+                    published_revision = view.revision
                 try:
                     with self._publish_lock:
                         with self._state_lock:
@@ -3221,7 +3383,9 @@ class GatewayApp:
                                 continue
                             if self._is_view_current(view) != is_current:
                                 continue
-                        if action == "pin":
+                        if action == "steer_notice":
+                            self._publish_steer_notice(view)
+                        elif action == "pin":
                             if not self._pin_turn(view, now):
                                 continue
                         elif action == "background":
@@ -3258,10 +3422,18 @@ class GatewayApp:
                     view.last_edit = now
                     view.publish_failures = 0
                     view.next_publish_at = 0.0
+                    if action == "steer_notice":
+                        continue
                     if action is None and view.status != published_status:
                         # A terminal event arrived while Telegram was publishing the
                         # running snapshot. Keep the view so the next pass replaces
                         # that stale message with the terminal status.
+                        view.dirty = True
+                        continue
+                    if view.revision != published_revision:
+                        # Output or an accepted steer arrived during the network
+                        # call. Preserve it for the next publication, including
+                        # acknowledgements racing with a terminal answer.
                         view.dirty = True
                         continue
                     finished = (

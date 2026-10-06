@@ -242,6 +242,7 @@ class TelegramClient:
         markdown: str,
         reply_markup: dict[str, Any] | None = None,
         max_chunks: int | None = None,
+        disable_notification: bool = False,
     ) -> list[int]:
         chunks = split_markdown(markdown)
         if max_chunks is not None:
@@ -256,6 +257,8 @@ class TelegramClient:
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
                 }
+                if disable_notification:
+                    payload["disable_notification"] = True
                 if reply_markup is not None and index == len(chunks) - 1:
                     payload["reply_markup"] = reply_markup
                 try:
@@ -293,6 +296,7 @@ class TelegramClient:
         markdown: str,
         reply_markup: dict[str, Any] | None = None,
         max_chunks: int | None = None,
+        disable_notification: bool = False,
     ) -> list[int]:
         chunks = split_rich_markdown(markdown)
         if max_chunks is not None:
@@ -304,6 +308,8 @@ class TelegramClient:
                     "chat_id": chat_id,
                     "rich_message": {"markdown": chunk},
                 }
+                if disable_notification:
+                    payload["disable_notification"] = True
                 if reply_markup is not None and index == len(chunks) - 1:
                     payload["reply_markup"] = reply_markup
                 result = self._call("sendRichMessage", payload)

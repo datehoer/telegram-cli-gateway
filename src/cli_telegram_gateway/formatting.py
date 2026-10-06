@@ -10,6 +10,51 @@ FENCE_MARKER_RE = re.compile(r"```([A-Za-z0-9_+.-]*)[^\n]*")
 INLINE_TOKEN_RE = re.compile(r"`([^`\n]+)`|\[([^\]\n]+)\]\(([^\s)]+)\)")
 
 
+def stream_segment(text: str, start: int = 0, limit: int = 1500) -> tuple[str, int]:
+    """Return one short, fenced Markdown segment and its raw source cursor.
+
+    The cursor counts Python characters, whereas the budget counts UTF-16 units.
+    Added code fences must never count toward the consumed source text.
+    """
+    if limit < 32:
+        raise ValueError("stream segment limit must be at least 32")
+    start = min(max(0, start), len(text))
+    if start == len(text):
+        return "", start
+    language: str | None = None
+    for marker in FENCE_MARKER_RE.finditer(text, 0, start):
+        language = None if language is not None else marker.group(1)[:64]
+    prefix = f"```{language}\n" if language is not None else ""
+    # Reserve room for a closing fence, including when the source opens one.
+    budget = limit - len(prefix.encode("utf-16-le")) // 2 - 4
+    end = start
+    units = 0
+    while end < len(text):
+        size = 2 if ord(text[end]) > 0xFFFF else 1
+        if units + size > budget:
+            break
+        units += size
+        end += 1
+    if end < len(text):
+        paragraph = text.rfind("\n\n", start, end)
+        newline = text.rfind("\n", start, end)
+        cut = paragraph + 2 if paragraph >= start + (end - start) // 2 else newline + 1
+        if cut >= start + (end - start) // 2:
+            end = cut
+        # Do not cut a fence marker or its language name in two.
+        for marker in FENCE_MARKER_RE.finditer(text, start):
+            if marker.start() >= end:
+                break
+            if marker.start() < end < marker.end() and marker.start() > start:
+                end = marker.start()
+                break
+    raw = text[start:end]
+    for marker in FENCE_MARKER_RE.finditer(raw):
+        language = None if language is not None else marker.group(1)[:64]
+    suffix = "\n```" if language is not None else ""
+    return prefix + raw + suffix, end
+
+
 def _safe_link(url: str) -> str | None:
     try:
         scheme = urlsplit(url).scheme.lower()
