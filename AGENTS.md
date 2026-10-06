@@ -155,3 +155,7 @@ run past `timeout_seconds` is terminated. There is no sandbox and none should be
 When proposing the next step, start from the current working loop and identify the smallest missing behavior that users can exercise immediately. State why it belongs in the gateway, what failure it fixes, and what is deliberately left out.
 
 When evidence later contradicts these instructions, update this file explicitly as part of the same change. Do not silently grow the architecture around an obsolete assumption.
+
+## Media generation phases
+
+When the user prioritizes proving a generation pipeline, produce and deliver the complete draft set first, with known defects marked. Do not let repeated per-shot quality re-renders delay that first complete delivery. Start a quality pass only when it is part of the current user priority or has a stated bounded iteration budget.
