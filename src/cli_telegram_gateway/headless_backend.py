@@ -31,6 +31,110 @@ class HeadlessBackendError(RuntimeError):
 EventHandler = Callable[[str, str, str, Any], None]
 
 
+class _TurnInput:
+    """The stream-json stdin of one Claude process.
+
+    Every user message carries a UUID, and Claude reports its command_lifecycle:
+    queued when read, started when a turn takes it, then a final state. Claude reads
+    a message sent mid-turn at the next tool boundary, or answers it in a follow-up
+    turn of the same process. Input stays open until a result leaves none of our
+    messages waiting. Claude still finishes everything it has read after stdin
+    closes, so closing never drops a written message.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._lock = threading.Lock()
+        self._closed = False
+        # None until the init event says whether lifecycle events are reported.
+        self._tracked: bool | None = None
+        self._idle = False
+        self._waiting: set[str] = set()
+        self._accepted: set[str] = set()
+        self._changed = threading.Condition(self._lock)
+
+    def send(self, text: str, *, steer: bool = False) -> str | None:
+        """Write one user message; return its ID, or None when input is closed."""
+        message_id = str(uuid.uuid4())
+        line = json.dumps({
+            "type": "user",
+            "uuid": message_id,
+            "message": {"role": "user", "content": text},
+        }, ensure_ascii=False)
+        with self._lock:
+            # Without lifecycle events a steer could never be confirmed.
+            if self._closed or (steer and self._tracked is False):
+                return None
+            try:
+                self._stream.write(line + "\n")
+                self._stream.flush()
+            except (OSError, ValueError):
+                # A broken pipe means Claude exited and never read the message.
+                self._closed = True
+                return None
+            self._waiting.add(message_id)
+        return message_id
+
+    def wait_accepted(self, message_id: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._changed:
+            while message_id not in self._accepted and message_id in self._waiting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._changed.wait(remaining)
+            return message_id in self._accepted
+
+    def on_init(self, capabilities: Any) -> None:
+        with self._lock:
+            self._tracked = isinstance(capabilities, list) and "msg_lifecycle_v1" in capabilities
+
+    def on_lifecycle(self, message_id: str, state: str) -> None:
+        with self._changed:
+            self._accepted.add(message_id)
+            if state != "queued":
+                self._waiting.discard(message_id)
+            if state == "started":
+                self._idle = False
+            self._changed.notify_all()
+            stream = self._close_if_idle_locked()
+        self._close_stream(stream)
+
+    def on_result(self) -> None:
+        with self._lock:
+            self._idle = True
+            stream = self._close_if_idle_locked()
+        self._close_stream(stream)
+
+    def close(self) -> None:
+        with self._lock:
+            stream = self._close_locked()
+        self._close_stream(stream)
+
+    def _close_if_idle_locked(self) -> Any:
+        # An early result (Claude reporting background tasks orphaned by the
+        # previous process) may arrive before our message starts.
+        if not self._idle or (self._tracked and self._waiting):
+            return None
+        return self._close_locked()
+
+    def _close_locked(self) -> Any:
+        self._closed = True
+        stream, self._stream = self._stream, None
+        self._waiting.clear()
+        self._changed.notify_all()
+        return stream
+
+    @staticmethod
+    def _close_stream(stream: Any) -> None:
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
 class HeadlessBackend:
     """Runs Claude, Grok and Pi in their JSON-producing non-interactive modes."""
 
@@ -39,6 +143,7 @@ class HeadlessBackend:
         self.on_event = on_event
         self._lock = threading.RLock()
         self._active: dict[str, subprocess.Popen[str]] = {}
+        self._inputs: dict[str, _TurnInput] = {}
         self._interrupted: set[subprocess.Popen[str]] = set()
 
     def is_active(self, session_id: str) -> bool:
@@ -145,6 +250,7 @@ class HeadlessBackend:
             raise HeadlessBackendError(f"unsupported headless CLI: {session.cli}")
         if not session.external_id:
             raise HeadlessBackendError("headless session has no external session ID")
+        streams_input = session.cli == "claude"
         with self._lock:
             if self.is_active(session.session_id):
                 raise HeadlessBackendError("the previous task is still running")
@@ -153,7 +259,7 @@ class HeadlessBackend:
                 process = subprocess.Popen(
                     command,
                     cwd=session.cwd,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE if streams_input else subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -165,15 +271,44 @@ class HeadlessBackend:
             except OSError as exc:
                 raise HeadlessBackendError(f"could not start {session.cli}: {exc}") from exc
             self._active[session.session_id] = process
+            turn_input = _TurnInput(process.stdin) if streams_input else None
+            if turn_input is not None:
+                self._inputs[session.session_id] = turn_input
 
+        # No steer can precede the prompt: the caller registers the turn only
+        # after this returns. A failed write means Claude exited; the reader
+        # reports that exit.
+        if turn_input is not None and turn_input.send(self._attachment_prompt(text, attachments)) is None:
+            LOGGER.warning("%s exited before reading its prompt", session.cli)
         turn_id = str(uuid.uuid4())
         threading.Thread(
             target=self._read_process,
-            args=(session, turn_id, process),
+            args=(session, turn_id, process, turn_input),
             name=f"{session.cli}-{session.session_id}",
             daemon=True,
         ).start()
         return turn_id
+
+    def steer_turn(
+        self,
+        session_id: str,
+        text: str,
+        attachments: tuple[Attachment, ...] = (),
+    ) -> Callable[[float], bool] | None:
+        """Add a message to the session's running Claude process.
+
+        Returns a function that waits up to the given seconds for Claude to confirm
+        it queued the message, or None when the process takes no more input; the
+        caller then queues the message as a new turn.
+        """
+        with self._lock:
+            turn_input = self._inputs.get(session_id)
+        if turn_input is None:
+            return None
+        message_id = turn_input.send(self._attachment_prompt(text, attachments), steer=True)
+        if message_id is None:
+            return None
+        return lambda timeout: turn_input.wait_accepted(message_id, timeout)
 
     def compact_session(self, session: CliSession, timeout: float = 120) -> str:
         """Run Pi's native manual compaction through a one-shot RPC process.
@@ -300,7 +435,7 @@ class HeadlessBackend:
         external_id = session.external_id or ""
         model_args = ["--model", session.model] if session.model else []
         if session.cli == "claude":
-            prompt = self._attachment_prompt(text, attachments)
+            # The prompt goes to stdin, which stays open for messages sent mid-turn.
             session_args = ["--session-id", external_id] if first_turn else ["--resume", external_id]
             effort_args = ["--effort", session.effort] if session.effort else []
             return [
@@ -308,7 +443,8 @@ class HeadlessBackend:
                 *model_args,
                 *effort_args,
                 "-p",
-                prompt,
+                "--input-format",
+                "stream-json",
                 "--output-format",
                 "stream-json",
                 "--include-partial-messages",
@@ -356,7 +492,11 @@ class HeadlessBackend:
         ]
 
     def _read_process(
-        self, session: CliSession, turn_id: str, process: subprocess.Popen[str]
+        self,
+        session: CliSession,
+        turn_id: str,
+        process: subprocess.Popen[str],
+        turn_input: _TurnInput | None = None,
     ) -> None:
         stderr_parts: list[str] = []
 
@@ -371,9 +511,19 @@ class HeadlessBackend:
         stderr_thread = threading.Thread(target=read_stderr, daemon=True)
         stderr_thread.start()
         terminal_result: tuple[str, Any] | None = None
+        # One Claude process answers each steer that arrived after its last tool
+        # call in a follow-up turn, so every result names a final message. Hold
+        # them until exit, when the turn's narration is known in full.
+        final_messages: list[Any] = []
         emitted_text = False
         tool_json_parts: dict[int, list[str]] = {}
         message: dict[str, str] = {}
+
+        def emit_final_messages() -> None:
+            for data in final_messages:
+                self.on_event(session.session_id, turn_id, "message_completed", data)
+            final_messages.clear()
+
         try:
             if process.stdout:
                 for raw_line in process.stdout:
@@ -391,6 +541,15 @@ class HeadlessBackend:
                     for kind, data in events:
                         if (kind == "delta" and data) or (kind == "message_delta" and data["delta"]):
                             emitted_text = True
+                        if kind in {"input_capabilities", "input_lifecycle"}:
+                            if turn_input is not None and kind == "input_capabilities":
+                                turn_input.on_init(data)
+                            elif turn_input is not None:
+                                turn_input.on_lifecycle(*data)
+                            continue
+                        if kind == "message_completed":
+                            final_messages.append(data)
+                            continue
                         if kind == "retrying":
                             # Pi may retry a provider failure internally. Its preceding
                             # message_end is not terminal when agent_end says willRetry.
@@ -399,6 +558,8 @@ class HeadlessBackend:
                             priority = {"completed": 1, "interrupted": 2, "error": 3}
                             if terminal_result is None or priority[kind] >= priority[terminal_result[0]]:
                                 terminal_result = (kind, data)
+                            if turn_input is not None:
+                                turn_input.on_result()
                         else:
                             if kind == "usage":
                                 data = {**data, "external_id": session.external_id}
@@ -410,6 +571,7 @@ class HeadlessBackend:
                 self._interrupted.discard(process)
                 if self._active.get(session.session_id) is process:
                     self._active.pop(session.session_id, None)
+            emit_final_messages()
             if interrupted:
                 self.on_event(session.session_id, turn_id, "interrupted", return_code)
             elif terminal_result:
@@ -427,12 +589,17 @@ class HeadlessBackend:
                 self.on_event(session.session_id, turn_id, "interrupted", return_code)
         except Exception as exc:
             LOGGER.exception("failed while reading %s JSON stream", session.cli)
+            emit_final_messages()
             self.on_event(session.session_id, turn_id, "error", str(exc))
         finally:
             with self._lock:
                 self._interrupted.discard(process)
                 if self._active.get(session.session_id) is process:
                     self._active.pop(session.session_id, None)
+                if turn_input is not None and self._inputs.get(session.session_id) is turn_input:
+                    self._inputs.pop(session.session_id, None)
+            if turn_input is not None:
+                turn_input.close()
             for stream in (process.stdout, process.stderr):
                 if stream:
                     stream.close()
@@ -462,6 +629,13 @@ class HeadlessBackend:
     ) -> list[tuple[str, Any]]:
         output: list[tuple[str, Any]] = []
         value_type = value.get("type")
+        if value_type == "system" and value.get("subtype") == "init":
+            return [("input_capabilities", value.get("capabilities"))]
+        if value_type == "command_lifecycle":
+            command_uuid, state = value.get("command_uuid"), value.get("state")
+            if isinstance(command_uuid, str) and isinstance(state, str):
+                return [("input_lifecycle", (command_uuid, state))]
+            return output
         if value_type == "stream_event":
             event = value.get("event")
             if not isinstance(event, dict):

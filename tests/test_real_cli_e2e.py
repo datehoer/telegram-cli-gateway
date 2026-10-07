@@ -111,5 +111,65 @@ class RealCliEndToEndTests(unittest.TestCase):
                     backend.close()
 
 
+    def test_claude_real_mid_turn_steer_and_resume(self) -> None:
+        with tempfile.TemporaryDirectory(dir=self.e2e_root) as cwd:
+            finished = threading.Event()
+            tool_started = threading.Event()
+            answer: list[str] = []
+            finals: list[str] = []
+            errors: list[str] = []
+
+            def on_event(_session_id: str, _turn_id: str, kind: str, data: Any) -> None:
+                if kind == "command":
+                    tool_started.set()
+                elif kind == "message_delta" and isinstance(data, dict):
+                    answer.append(str(data.get("delta") or ""))
+                elif kind == "message_completed" and isinstance(data, dict):
+                    if data.get("phase") == "final_answer":
+                        finals.append(str(data.get("text") or ""))
+                elif kind == "error":
+                    errors.append(str(data))
+                    finished.set()
+                elif kind in {"completed", "interrupted"}:
+                    finished.set()
+
+            backend = HeadlessBackend(self.config.cli_commands, on_event)
+            session = CliSession(
+                session_id="claude-steer-e2e",
+                cli="claude",
+                cwd=cwd,
+                tmux_name="",
+                log_path="",
+                chat_id=1,
+                created_at="now",
+                backend="headless-json",
+                external_id=str(uuid.uuid4()),
+                model="haiku",
+            )
+            try:
+                backend.start_turn(
+                    session,
+                    "Run the shell command `sleep 8` with the Bash tool, then reply with one short sentence.",
+                )
+                self.assertTrue(tool_started.wait(120), "Claude never started its tool call")
+                confirm = backend.steer_turn(session.session_id, "Also end your reply with STEER_E2E_OK.")
+                self.assertIsNotNone(confirm)
+                assert confirm is not None
+                self.assertTrue(confirm(30), "Claude did not confirm the added message")
+                self.assertTrue(finished.wait(180), "steered Claude turn timed out")
+                self.assertEqual(errors, [])
+                self.assertIn("STEER_E2E_OK", "\n".join(finals))
+                self.assertFalse(backend.is_active(session.session_id))
+
+                session.turn_count = 1
+                finished.clear()
+                answer.clear()
+                backend.start_turn(session, "Reply with exactly CLAUDE_STEER_RESUME_OK")
+                self.assertTrue(finished.wait(180), "resumed Claude turn timed out")
+                self.assertEqual(errors, [])
+                self.assertIn("CLAUDE_STEER_RESUME_OK", "".join(answer))
+            finally:
+                backend.close()
+
 if __name__ == "__main__":
     unittest.main()

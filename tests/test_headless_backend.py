@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
+import sys
 import unittest
 import subprocess
 import threading
 from pathlib import Path
 
 from cli_telegram_gateway.attachments import Attachment
-from cli_telegram_gateway.headless_backend import HeadlessBackend, HeadlessBackendError
+from cli_telegram_gateway.headless_backend import HeadlessBackend, HeadlessBackendError, _TurnInput
 from cli_telegram_gateway.sessions import CliSession
 
 
@@ -30,6 +33,72 @@ for line in sys.stdin:
         print(json.dumps({"type": "compaction_start", "reason": "manual"}))
         print(json.dumps({"id": "compact", "type": "response", "command": "compact", "success": False, "error": "Nothing to compact (session too small)"}))
         sys.exit(0)
+"""
+
+
+# Speaks Claude's stream-json protocol as observed with Claude Code 2.1.289: every
+# user message gets command_lifecycle events, a message read mid-turn joins the turn
+# at its next tool boundary, and a message read after the last tool call gets a
+# follow-up turn and result. Like Claude it exits only at stdin EOF, so a gateway
+# that never closes input hangs the test instead of passing it.
+FAKE_CLAUDE_SCRIPT = """\
+import json, sys
+mode = sys.argv[1]
+capabilities = ["msg_lifecycle_v1"]
+
+def out(value):
+    print(json.dumps(value), flush=True)
+
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line.strip() else None
+
+def lifecycle(message, state):
+    out({"type": "command_lifecycle", "command_uuid": message["uuid"], "state": state})
+
+def say(message_id, text):
+    out({"type": "stream_event", "event": {"type": "message_start", "message": {"id": message_id}}})
+    out({"type": "stream_event", "event": {
+        "type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}})
+
+def result(text):
+    out({"type": "result", "subtype": "success", "is_error": False, "result": text})
+
+first = read()
+lifecycle(first, "queued")
+if mode == "orphans":
+    # Reports background tasks orphaned by the previous process in a no-op turn.
+    out({"type": "system", "subtype": "init", "capabilities": capabilities})
+    result("")
+out({"type": "system", "subtype": "init", "capabilities": capabilities})
+lifecycle(first, "started")
+prompt = first["message"]["content"]
+if mode in {"tool", "orphans"}:
+    out({"type": "stream_event", "event": {"type": "content_block_start", "index": 1,
+        "content_block": {"type": "tool_use", "name": "Bash", "input": {"command": "sleep 1"}}}})
+    steer = read()
+    lifecycle(steer, "queued")
+    lifecycle(steer, "started")
+    answer = "answered " + prompt + " and " + steer["message"]["content"]
+    say("msg_2", answer)
+    lifecycle(steer, "completed")
+    result(answer)
+    lifecycle(first, "completed")
+else:
+    say("msg_1", "first answer")
+    out({"type": "stream_event", "event": {"type": "content_block_start", "index": 1,
+        "content_block": {"type": "tool_use", "name": "Wait", "input": {"command": "wait"}}}})
+    steer = read()
+    lifecycle(steer, "queued")
+    result("first answer")
+    lifecycle(first, "completed")
+    out({"type": "system", "subtype": "init", "capabilities": capabilities})
+    lifecycle(steer, "started")
+    say("msg_2", "second answer")
+    result("second answer")
+    lifecycle(steer, "completed")
+for _line in sys.stdin:
+    pass
 """
 
 
@@ -361,6 +430,9 @@ for value in values:
         args = backend._build_command(claude, "hi", ())
         self.assertIn(("--model", "sonnet"), zip(args, args[1:]))
         self.assertIn(("--effort", "high"), zip(args, args[1:]))
+        # The prompt goes through stdin so the turn can take messages sent mid-turn.
+        self.assertEqual(args[args.index("--input-format") + 1], "stream-json")
+        self.assertNotIn("hi", args)
 
         grok = CliSession("g1", "grok", "/tmp", "", "", 1, "now", "headless-json", "id", model="grok-4.5", effort="xhigh")
         args = backend._build_command(grok, "hi", ())
@@ -421,6 +493,154 @@ for value in values:
         finally:
             probe.kill()
             probe.wait()
+
+
+class ClaudeTurnInputTests(unittest.TestCase):
+    def make_input(self) -> tuple[_TurnInput, io.StringIO]:
+        stream = io.StringIO()
+        return _TurnInput(stream), stream
+
+    def test_input_closes_after_a_result_leaves_no_message_waiting(self) -> None:
+        turn_input, stream = self.make_input()
+        prompt = turn_input.send("hello")
+        assert prompt is not None
+        self.assertEqual(json.loads(stream.getvalue()), {
+            "type": "user", "uuid": prompt, "message": {"role": "user", "content": "hello"},
+        })
+        turn_input.on_lifecycle(prompt, "queued")
+        turn_input.on_init(["msg_lifecycle_v1"])
+        turn_input.on_lifecycle(prompt, "started")
+        steer = turn_input.send("also this", steer=True)
+        assert steer is not None
+        turn_input.on_lifecycle(steer, "queued")
+        self.assertTrue(turn_input.wait_accepted(steer, 0))
+        # The steer arrived after the last tool call, so Claude answers it in a
+        # follow-up turn of the same process: input must stay open meanwhile.
+        turn_input.on_result()
+        self.assertFalse(stream.closed)
+        turn_input.on_lifecycle(prompt, "completed")
+        turn_input.on_lifecycle(steer, "started")
+        self.assertFalse(stream.closed)
+        turn_input.on_result()
+        self.assertTrue(stream.closed)
+        self.assertIsNone(turn_input.send("too late", steer=True))
+
+    def test_an_orphaned_task_result_before_the_prompt_starts_keeps_input_open(self) -> None:
+        turn_input, stream = self.make_input()
+        prompt = turn_input.send("hello")
+        assert prompt is not None
+        turn_input.on_lifecycle(prompt, "queued")
+        turn_input.on_init(["msg_lifecycle_v1"])
+        turn_input.on_result()
+        self.assertFalse(stream.closed)
+        turn_input.on_lifecycle(prompt, "started")
+        self.assertFalse(stream.closed)
+        self.assertIsNotNone(turn_input.send("mid-turn", steer=True))
+
+    def test_a_cancelled_message_releases_input_after_an_error_result(self) -> None:
+        turn_input, stream = self.make_input()
+        prompt = turn_input.send("hello")
+        assert prompt is not None
+        turn_input.on_init(["msg_lifecycle_v1"])
+        turn_input.on_lifecycle(prompt, "queued")
+        turn_input.on_result()
+        self.assertFalse(stream.closed)
+        turn_input.on_lifecycle(prompt, "cancelled")
+        self.assertTrue(stream.closed)
+
+    def test_without_lifecycle_events_input_closes_at_the_first_result_and_refuses_steers(self) -> None:
+        turn_input, stream = self.make_input()
+        self.assertIsNotNone(turn_input.send("hello"))
+        turn_input.on_init(["interrupt_receipt_v1"])
+        self.assertIsNone(turn_input.send("steer", steer=True))
+        turn_input.on_result()
+        self.assertTrue(stream.closed)
+
+    def test_wait_returns_when_the_process_ends_without_a_receipt(self) -> None:
+        turn_input, _stream = self.make_input()
+        turn_input.on_init(["msg_lifecycle_v1"])
+        steer = turn_input.send("steer", steer=True)
+        assert steer is not None
+        closer = threading.Timer(0.05, turn_input.close)
+        closer.start()
+        try:
+            self.assertFalse(turn_input.wait_accepted(steer, 5))
+        finally:
+            closer.join()
+
+    def test_a_broken_pipe_reports_the_message_unsent(self) -> None:
+        class BrokenStream(io.StringIO):
+            def write(self, _text: str) -> int:
+                raise BrokenPipeError("claude exited")
+
+        turn_input = _TurnInput(BrokenStream())
+        self.assertIsNone(turn_input.send("hello"))
+        self.assertIsNone(turn_input.send("again", steer=True))
+
+
+class ClaudeSteeringProcessTests(unittest.TestCase):
+    def run_turn(self, mode: str) -> tuple[list[tuple[str, object]], bool]:
+        events: list[tuple[str, object]] = []
+        tool_started = threading.Event()
+        finished = threading.Event()
+
+        def on_event(_session_id: str, _turn_id: str, kind: str, data: object) -> None:
+            events.append((kind, data))
+            if kind == "command":
+                tool_started.set()
+            if kind in {"completed", "error", "interrupted"}:
+                finished.set()
+
+        backend = HeadlessBackend(
+            {"claude": (sys.executable, "-c", FAKE_CLAUDE_SCRIPT, mode)}, on_event,
+        )
+        session = CliSession("claude-steer", "claude", "/tmp", "", "", 1, "now", "headless-json", "sess-1")
+        try:
+            backend.start_turn(session, "the prompt")
+            self.assertTrue(tool_started.wait(10), "the fake Claude never reached its tool call")
+            confirm = backend.steer_turn(session.session_id, "the steer")
+            self.assertIsNotNone(confirm)
+            assert confirm is not None
+            accepted = confirm(10)
+            self.assertTrue(finished.wait(10), "the Claude process never exited")
+        finally:
+            backend.close()
+        self.assertFalse(backend.is_active(session.session_id))
+        self.assertIsNone(backend.steer_turn(session.session_id, "after the turn"))
+        return events, accepted
+
+    def test_mid_turn_steer_joins_the_running_turn(self) -> None:
+        events, accepted = self.run_turn("tool")
+        self.assertTrue(accepted)
+        self.assertEqual(events[-2:], [
+            ("message_completed", {
+                "id": "msg_2", "phase": "final_answer", "text": "answered the prompt and the steer",
+            }),
+            ("completed", None),
+        ])
+
+    def test_steer_after_the_last_tool_call_gets_a_follow_up_answer(self) -> None:
+        events, accepted = self.run_turn("late")
+        self.assertTrue(accepted)
+        finals = [data for kind, data in events if kind == "message_completed"]
+        self.assertEqual(finals, [
+            {"id": "msg_1", "phase": "final_answer", "text": "first answer"},
+            {"id": "msg_2", "phase": "final_answer", "text": "second answer"},
+        ])
+        # Final messages wait for the process to exit, so the first answer is not
+        # sealed as the turn's answer while the follow-up is still streaming.
+        kinds = [kind for kind, _data in events]
+        self.assertLess(kinds.index("message_delta"), kinds.index("message_completed"))
+        self.assertGreater(
+            kinds.index("message_completed"),
+            max(index for index, kind in enumerate(kinds) if kind == "message_delta"),
+        )
+        self.assertEqual(kinds[-1], "completed")
+
+    def test_orphaned_task_result_does_not_end_steering(self) -> None:
+        events, accepted = self.run_turn("orphans")
+        self.assertTrue(accepted)
+        self.assertEqual(events[-1], ("completed", None))
 
 
 if __name__ == "__main__":

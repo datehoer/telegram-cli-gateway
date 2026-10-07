@@ -11,6 +11,7 @@ from unittest import mock
 
 from cli_telegram_gateway.app import (
     BOT_COMMANDS,
+    HEADLESS_STEER_CONFIRM_SECONDS,
     HELP_TEXT,
     MAX_PENDING_INPUTS_PER_SESSION,
     RESUME_PROMPT,
@@ -2268,6 +2269,85 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(started_from, [("worker", "next task")])
             self.assertNotIn(session.session_id, app._queues)
+
+    def busy_claude(self, app: GatewayApp, project: Path, bot_key: str = "default") -> tuple[Any, Any, list[str]]:
+        run_background_inline(app)
+        session = app.sessions.create_headless("claude", project, 1)
+        app.headless.is_active = lambda _session_id: True  # type: ignore[method-assign]
+        view = app._register_turn(session, "turn-1", bot_key)
+        app._update_turn(session, "turn-1", "message_delta", {"id": "msg_1", "delta": "Looking at the cut."})
+        sent: list[str] = []
+        app._send = lambda _chat, text, *_args: sent.append(text)  # type: ignore[method-assign]
+        return session, view, sent
+
+    def test_busy_claude_adds_input_to_the_running_process_instead_of_queueing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session, view, sent = self.busy_claude(app, project)
+            steered: list[tuple[str, str]] = []
+            waited: list[float] = []
+
+            def steer_turn(session_id: str, text: str, _attachments: Any = ()) -> Any:
+                steered.append((session_id, text))
+                return lambda timeout: waited.append(timeout) or True
+
+            app.headless.steer_turn = steer_turn  # type: ignore[method-assign]
+            app._send_to_session(1, session, "make the chorus louder")
+
+            self.assertEqual(steered, [(session.session_id, "make the chorus louder")])
+            self.assertEqual(waited, [HEADLESS_STEER_CONFIRM_SECONDS])
+            self.assertNotIn(session.session_id, app._queues)
+            self.assertEqual(sent, [])
+            self.assertEqual(view.steered, 1)
+            self.assertEqual(list(view.steer_notices), [(1, len("Looking at the cut."))])
+
+    def test_claude_input_is_queued_once_the_process_takes_no_more_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session, view, sent = self.busy_claude(app, project)
+            app.headless.steer_turn = lambda *_args: None  # type: ignore[method-assign]
+
+            app._send_to_session(1, session, "next task")
+
+            self.assertEqual([item.text for item in app._queues[session.session_id]], ["next task"])
+            self.assertEqual(sent, [f"{session.label} is running; queued as #1."])
+            self.assertEqual(view.steered, 0)
+
+    def test_unconfirmed_claude_input_is_reported_and_never_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(project)
+            session, view, sent = self.busy_claude(app, project)
+            app.headless.steer_turn = (  # type: ignore[method-assign]
+                lambda *_args: lambda _timeout: False
+            )
+
+            app._send_to_session(1, session, "maybe twice")
+
+            self.assertNotIn(session.session_id, app._queues)
+            self.assertEqual(view.steered, 0)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("was not confirmed", sent[0])
+
+    def test_busy_claude_queues_input_from_another_bot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            app = self.make_app(
+                project,
+                bot_tokens=(("default", "primary:test"), ("worker", "worker:test")),
+            )
+            session, _view, _sent = self.busy_claude(app, project, "default")
+            app.headless.steer_turn = (  # type: ignore[method-assign]
+                lambda *_args: self.fail("input from another Bot must not join this turn")
+            )
+
+            with app._bot_scope("worker"):
+                app._send_to_session(1, session, "next task")
+
+            queued = app._queues[session.session_id]
+            self.assertEqual([(item.text, item.bot_key) for item in queued], [("next task", "worker")])
 
     def test_busy_headless_input_is_queued_and_drained(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

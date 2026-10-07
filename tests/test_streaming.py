@@ -402,6 +402,41 @@ class LongTaskStreamingTests(unittest.TestCase):
         self.assertIn("Answer after the steer.", self.messages[max(self.messages)])
         self.assertNotIn("before the follow-up", self.messages[first_id])
 
+    def test_claude_steer_ack_precedes_its_progress_and_both_answers(self) -> None:
+        session, view = self.headless_turn("claude")
+        test_app.run_background_inline(self.app)
+        self.app.headless.is_active = lambda _session_id: True  # type: ignore[method-assign]
+        self.app.headless.steer_turn = (  # type: ignore[method-assign]
+            lambda *_args: lambda _timeout: True
+        )
+        self.headless(session, view, "message_delta", {"id": "m1", "delta": "Reading the storyboard."})
+        first_id = view.message_id
+        self.app._send_to_session(1, session, "make the chorus louder")
+        self.loop()
+        ack_id = max(self.messages)
+        self.assertIn("The CLI accepted", self.messages[ack_id])
+
+        # Claude answered the original request, then the added one in a follow-up
+        # turn; the backend reports both final messages when the process exits.
+        answers = (("m2", "The first cut is ready."), ("m3", "The chorus is louder now."))
+        for item_id, text in answers:
+            self.app._update_turn(session, "turn-headless", "message_delta", {"id": item_id, "delta": text})
+        for item_id, text in answers:
+            self.app._update_turn(session, "turn-headless", "message_completed", {
+                "id": item_id, "phase": "final_answer", "text": text,
+            })
+        self.app._update_turn(session, "turn-headless", "completed")
+        self.loop(2)
+
+        final_id = max(self.messages)
+        self.assertGreater(final_id, ack_id)
+        self.assertIn("The first cut is ready.", self.messages[final_id])
+        self.assertIn("The chorus is louder now.", self.messages[final_id])
+        self.assertNotIn("Reading the storyboard.", self.messages[final_id])
+        records = [self.messages[key] for key in sorted(self.messages) if ack_id < key < final_id]
+        self.assertTrue(any("Reading the storyboard." in record for record in records))
+        self.assertNotIn("Reading the storyboard.", self.messages[first_id])
+
     def test_output_arriving_during_edit_keeps_the_view_dirty(self) -> None:
         self.message("c", "existing progress")
         self.publish()

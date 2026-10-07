@@ -41,6 +41,9 @@ from .usage import codex_usage, context_lines, quota_lines, usage_lines
 
 LOGGER = logging.getLogger("telegram-cli-gateway")
 MAX_PENDING_INPUTS_PER_SESSION = 20
+# Claude confirms a message within milliseconds mid-turn and in about 1.3 s while it
+# still loads a 28 MB session (measured with Claude Code 2.1.289).
+HEADLESS_STEER_CONFIRM_SECONDS = 30.0
 MAX_PUBLISH_RETRY_SECONDS = 30.0
 STREAM_SEGMENT_UNITS = 1500
 MAX_AUTO_SENT_ARTIFACTS = 3
@@ -1893,19 +1896,7 @@ class GatewayApp:
                     )
                     if returned != active_turn:
                         raise CodexBackendError("turn/steer returned a different turn ID")
-                    with self._state_lock:
-                        view = self._turns.get((session.session_id, active_turn))
-                        if view:
-                            view.steered += 1
-                            view.steer_notices.append((view.steered, steer_boundary))
-                            view.revision += 1
-                            view.dirty = True
-                    if view is None:
-                        # The publisher may have finished while turn/steer replied.
-                        self._run_in_background(
-                            "steer-ack", self._send, chat_id,
-                            tr("[{session}] The CLI accepted the added request.", session=session.session_id), bot_key,
-                        )
+                    self._record_steer(chat_id, session, active_turn, steer_boundary, bot_key)
                     return
                 except CodexBackendError as exc:
                     if exc.ambiguous:
@@ -1915,7 +1906,62 @@ class GatewayApp:
                         ))
                         return
                     LOGGER.warning("Codex steer failed; queued instead: %s", exc)
+        elif session.cli == "claude" and session.backend == "headless-json":
+            with self._state_lock:
+                active_view = next(
+                    (
+                        view for (session_id, _turn_id), view in self._turns.items()
+                        if session_id == session.session_id and view.status == "running"
+                    ),
+                    None,
+                )
+                steer_boundary = len(self._turn_progress(active_view)) if active_view else 0
+            # Same reply-route rule as Codex: input from another Bot becomes its own turn.
+            if active_view and active_view.bot_key == bot_key:
+                confirm = self.headless.steer_turn(session.session_id, text, attachments)
+                if confirm is not None:
+                    # The message is already written, so a failure below must never
+                    # requeue it. Waiting for Claude's receipt stays off the dispatcher.
+                    self._run_in_background(
+                        "steer-confirm", self._confirm_headless_steer, chat_id, session,
+                        active_view.turn_id, steer_boundary, bot_key, confirm,
+                    )
+                    return
         self._start_session_turn(chat_id, session, text, attachments)
+
+    def _confirm_headless_steer(
+        self,
+        chat_id: int,
+        session: CliSession,
+        turn_id: str,
+        steer_boundary: int,
+        bot_key: str,
+        confirm: Callable[[float], bool],
+    ) -> None:
+        if confirm(HEADLESS_STEER_CONFIRM_SECONDS):
+            self._record_steer(chat_id, session, turn_id, steer_boundary, bot_key)
+            return
+        self._send(chat_id, tr(
+            "The added request was not confirmed, so it was not resent to avoid running it twice. "
+            "Check the current task output."
+        ), bot_key)
+
+    def _record_steer(
+        self, chat_id: int, session: CliSession, turn_id: str, steer_boundary: int, bot_key: str
+    ) -> None:
+        with self._state_lock:
+            view = self._turns.get((session.session_id, turn_id))
+            if view:
+                view.steered += 1
+                view.steer_notices.append((view.steered, steer_boundary))
+                view.revision += 1
+                view.dirty = True
+        if view is None:
+            # The publisher may have finished while the CLI confirmed the input.
+            self._run_in_background(
+                "steer-ack", self._send, chat_id,
+                tr("[{session}] The CLI accepted the added request.", session=session.session_id), bot_key,
+            )
 
     def _enqueue(self, session: CliSession, pending: PendingInput) -> int | None:
         with self._state_lock:
