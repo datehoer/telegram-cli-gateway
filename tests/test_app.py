@@ -1028,6 +1028,42 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(calls, [(None, 1), (None, 0), (None, 0), (None, 0), (73, 1)])
             self.assertEqual(app.sessions.get_telegram_offset("default"), 73)
 
+    def test_poll_spaces_re_polls_past_the_bot_api_single_update_window(self) -> None:
+        # telegram-bot-api returns at most one update when getUpdates repeats its offset
+        # less than 0.5 s after the previous call started; parts then never accumulate.
+        with tempfile.TemporaryDirectory() as temporary:
+            app = self.make_app(Path(temporary))
+            parts = [
+                text_update(90, 800, "a" * 3000),
+                text_update(91, 801, "b" * 3000),
+                text_update(92, 802, "end"),
+            ]
+            arrivals = (0.0, 0.3, 0.6)
+            started = time.monotonic()
+            previous: dict[str, Any] = {"offset": "unset", "start": float("-inf")}
+
+            def fake_get_updates(offset: int | None, timeout: int) -> list[dict[str, Any]]:
+                now = time.monotonic() - started
+                limit = 1 if offset == previous["offset"] and now < previous["start"] + 0.5 else 100
+                previous.update(offset=offset, start=now)
+                pending = [
+                    part for part, arrival in zip(parts, arrivals)
+                    if arrival <= now and (offset is None or part["update_id"] >= offset)
+                ]
+                if not pending and offset is not None and offset > parts[-1]["update_id"]:
+                    app.stop_event.set()
+                return pending[:limit]
+
+            dispatched: list[dict[str, Any]] = []
+            app.telegram.get_updates = fake_get_updates  # type: ignore[method-assign]
+            app._dispatch_update = (  # type: ignore[method-assign]
+                lambda _bot_key, update: dispatched.append(update)
+            )
+            app._poll_bot("default")
+
+            self.assertEqual([update["update_id"] for update in dispatched], [92])
+            self.assertEqual(dispatched[0]["message"]["text"], "a" * 3000 + " " + "b" * 3000 + " end")
+
     def test_poll_dispatches_a_lone_long_message_after_the_quiet_window(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app = self.make_app(Path(temporary))

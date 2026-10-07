@@ -74,8 +74,10 @@ TEXT_FRAGMENT_MAX_PARTS = 24
 # The joined text reaches claude/grok/pi through argv; Linux caps one argument at 128 KiB.
 TEXT_FRAGMENT_MAX_TOTAL_BYTES = 100_000
 # When a batch ends like an unfinished part, the poller waits for more parts and dispatches
-# after this much quiet or the total cap.
-TEXT_FRAGMENT_POLL_SECONDS = 0.25
+# after this much quiet or the total cap. The Bot API answers getUpdates with an unchanged
+# offset at most one update when the previous call started under 0.5 s earlier, so faster
+# re-polls only ever see the first part.
+TEXT_FRAGMENT_POLL_SECONDS = 0.75
 TEXT_FRAGMENT_QUIET_SECONDS = 1.5
 TEXT_FRAGMENT_MAX_WAIT_SECONDS = 10.0
 
