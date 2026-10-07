@@ -42,7 +42,7 @@ for line in sys.stdin:
 # follow-up turn and result. Like Claude it exits only at stdin EOF, so a gateway
 # that never closes input hangs the test instead of passing it.
 FAKE_CLAUDE_SCRIPT = """\
-import json, sys
+import json, os, signal, sys
 mode = sys.argv[1]
 capabilities = ["msg_lifecycle_v1"]
 
@@ -66,12 +66,15 @@ def result(text):
 
 first = read()
 lifecycle(first, "queued")
-if mode == "orphans":
+if mode.startswith("orphans"):
     # Reports background tasks orphaned by the previous process in a no-op turn.
     out({"type": "system", "subtype": "init", "capabilities": capabilities})
     result("")
 out({"type": "system", "subtype": "init", "capabilities": capabilities})
 lifecycle(first, "started")
+if mode == "orphans-killed":
+    # A gateway stop or the OOM killer ends the turn before its result.
+    os.kill(os.getpid(), signal.SIGKILL)
 prompt = first["message"]["content"]
 if mode in {"tool", "orphans"}:
     out({"type": "stream_event", "event": {"type": "content_block_start", "index": 1,
@@ -636,6 +639,27 @@ class ClaudeSteeringProcessTests(unittest.TestCase):
             max(index for index, kind in enumerate(kinds) if kind == "message_delta"),
         )
         self.assertEqual(kinds[-1], "completed")
+
+    def test_a_kill_after_the_orphaned_task_result_stays_resumable(self) -> None:
+        events: list[tuple[str, object]] = []
+        finished = threading.Event()
+
+        def on_event(_session_id: str, _turn_id: str, kind: str, data: object) -> None:
+            events.append((kind, data))
+            if kind in {"completed", "error", "interrupted"}:
+                finished.set()
+
+        backend = HeadlessBackend(
+            {"claude": (sys.executable, "-c", FAKE_CLAUDE_SCRIPT, "orphans-killed")}, on_event,
+        )
+        session = CliSession("claude-killed", "claude", "/tmp", "", "", 1, "now", "headless-json", "sess-1")
+        try:
+            backend.start_turn(session, "the prompt")
+            self.assertTrue(finished.wait(10), "the fake Claude never exited")
+        finally:
+            backend.close()
+        # Reported as completed, the turn would lose its recovery record and never resume.
+        self.assertEqual(events[-1], ("interrupted", -9))
 
     def test_orphaned_task_result_does_not_end_steering(self) -> None:
         events, accepted = self.run_turn("orphans")

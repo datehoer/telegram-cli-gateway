@@ -546,6 +546,11 @@ class HeadlessBackend:
                                 turn_input.on_init(data)
                             elif turn_input is not None:
                                 turn_input.on_lifecycle(*data)
+                                if data[1] == "started":
+                                    # A new turn began, so an earlier result (the no-op for
+                                    # orphaned background tasks, or the answer before a
+                                    # follow-up) must not report a later kill as completed.
+                                    terminal_result = None
                             continue
                         if kind == "message_completed":
                             final_messages.append(data)
