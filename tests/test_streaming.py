@@ -155,6 +155,59 @@ class LongTaskStreamingTests(unittest.TestCase):
         self.assertIn("Short answer", self.messages[view.message_id])
         self.assertNotIn("Run log", self.messages[view.message_id])
 
+    def test_claude_narration_rolls_into_records_while_the_turn_runs(self) -> None:
+        session, view = self.headless_turn("claude")
+        for n in range(1, 7):
+            self.headless(session, view, "message_delta", {
+                "id": f"m{n}", "delta": f"Step {n}: " + "checking the render pipeline. " * 30,
+            })
+            self.headless(session, view, "message_completed", {"id": f"m{n}", "phase": "commentary"})
+            self.headless(session, view, "command", f"tool {n}")
+        records = [body for body in self.messages.values() if "Run log" in body]
+        self.assertGreaterEqual(len(records), 2)
+        self.assertNotIn("Run log", self.messages[view.message_id])
+        self.assertIn("Step 6:", self.messages[view.message_id])
+
+        # The reply may be the answer until the turn ends, so it streams in the live card only.
+        answer = "Final report: " + "the cut is ready. " * 200
+        self.headless(session, view, "message_delta", {"id": "m7", "delta": answer})
+        self.assertIn("Final report:", self.messages[view.message_id])
+        self.assertFalse(any("Final report:" in body for body in self.messages.values() if "Run log" in body))
+
+        self.headless(session, view, "message_completed", {"id": "m7", "phase": "final_answer", "text": answer})
+        self.headless(session, view, "completed")
+        bodies = [self.messages[key] for key in sorted(self.messages)]
+        self.assertEqual(sum(body.count("Final report:") for body in bodies), 1)
+        for n in range(1, 7):
+            self.assertEqual(sum(body.count(f"Step {n}:") for body in bodies), 1)
+        self.assertIn("Final report:", bodies[-1])
+        self.assertNotIn("Run log", bodies[-1])
+
+    def test_claude_reply_text_never_rolls_into_a_record(self) -> None:
+        # After a short narration, the next 1,500-unit segment would end inside the
+        # reply, which has no line break to cut at and may still be the answer.
+        session, view = self.headless_turn("claude")
+        self.headless(session, view, "message_delta", {"id": "m1", "delta": "Short narration before the tool."})
+        self.headless(session, view, "message_completed", {"id": "m1", "phase": "commentary"})
+        reply = "Reply word " * 300
+        self.headless(session, view, "message_delta", {"id": "m2", "delta": reply})
+        self.assertFalse(any("Reply word" in body for body in self.messages.values() if "Run log" in body))
+        self.headless(session, view, "message_completed", {"id": "m2", "phase": "final_answer", "text": reply})
+        self.headless(session, view, "completed")
+        bodies = [self.messages[key] for key in sorted(self.messages)]
+        self.assertEqual(sum(body.count("Reply word") for body in bodies), 300)
+
+    def test_interrupted_claude_reply_stays_on_its_card_once(self) -> None:
+        session, view = self.headless_turn("claude")
+        self.headless(session, view, "message_delta", {"id": "m1", "delta": "Planning the edit. " * 100})
+        self.headless(session, view, "message_completed", {"id": "m1", "phase": "commentary"})
+        self.headless(session, view, "message_delta", {"id": "m2", "delta": "Partial reply before the stop."})
+        self.headless(session, view, "interrupted", -15)
+        bodies = [self.messages[key] for key in sorted(self.messages)]
+        self.assertEqual(sum(body.count("Partial reply before the stop.") for body in bodies), 1)
+        self.assertIn("Partial reply before the stop.", bodies[-1])
+        self.assertTrue(any("Planning the edit." in body and "Run log" in body for body in bodies))
+
     def test_only_latest_segment_is_edited_and_history_survives_completion(self) -> None:
         source = "\n".join(f"step-{i:03d}: " + "content " * 3 for i in range(150))
         self.message("c", source)

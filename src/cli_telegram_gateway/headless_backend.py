@@ -513,7 +513,8 @@ class HeadlessBackend:
         terminal_result: tuple[str, Any] | None = None
         # One Claude process answers each steer that arrived after its last tool
         # call in a follow-up turn, so every result names a final message. Hold
-        # them until exit, when the turn's narration is known in full.
+        # them until exit, when the turn's narration is known in full. Narration
+        # (a message ending in a tool call) is reported as soon as it ends.
         final_messages: list[Any] = []
         emitted_text = False
         tool_json_parts: dict[int, list[str]] = {}
@@ -552,7 +553,7 @@ class HeadlessBackend:
                                     # follow-up) must not report a later kill as completed.
                                     terminal_result = None
                             continue
-                        if kind == "message_completed":
+                        if kind == "message_completed" and data.get("phase") == "final_answer":
                             final_messages.append(data)
                             continue
                         if kind == "retrying":
@@ -643,7 +644,9 @@ class HeadlessBackend:
             return output
         if value_type == "stream_event":
             event = value.get("event")
-            if not isinstance(event, dict):
+            # Claude Code 2.1.289 streams only the main agent. A subagent's events would
+            # move the tracked message and tag or freeze the wrong one, so skip them.
+            if not isinstance(event, dict) or value.get("parent_tool_use_id"):
                 return output
             event_type = event.get("type")
             index = event.get("index") if isinstance(event.get("index"), int) else 0
@@ -667,6 +670,12 @@ class HeadlessBackend:
                         # growing buffer on every fragment cost quadratic CPU on this reader
                         # thread (about 2 s for a 256 KiB Write).
                         tool_json_parts.setdefault(index, []).append(partial)
+            elif event_type == "message_delta" and message and message.get("id"):
+                delta = event.get("delta")
+                if isinstance(delta, dict) and delta.get("stop_reason") == "tool_use":
+                    # A message that ends in a tool call is narration, never the answer,
+                    # so it can become a reading record while the turn still runs.
+                    output.append(("message_completed", {"id": message["id"], "phase": "commentary"}))
             elif event_type == "content_block_stop":
                 parts = tool_json_parts.pop(index, None)
                 if parts:

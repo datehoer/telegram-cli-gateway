@@ -179,6 +179,81 @@ class HeadlessParserTests(unittest.TestCase):
         # Without partial messages the result is still the only visible answer.
         self.assertEqual(parse("claude", stream[-1:]), [("delta", "It is October 6."), ("completed", None)])
 
+    def test_claude_message_ending_in_a_tool_call_is_narration(self) -> None:
+        def start(message_id: str) -> dict[str, object]:
+            return {"type": "stream_event", "event": {"type": "message_start", "message": {"id": message_id}}}
+
+        def text(value: str) -> dict[str, object]:
+            return {"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": value},
+            }}
+
+        def stop(reason: str) -> dict[str, object]:
+            return {"type": "stream_event", "event": {"type": "message_delta", "delta": {"stop_reason": reason}}}
+
+        stream = [
+            start("msg_1"), text("Checking the files."), stop("tool_use"),
+            start("msg_2"), text("Done."), stop("end_turn"),
+            {"type": "result", "subtype": "success", "is_error": False, "result": "Done."},
+        ]
+
+        def parse(cli: str) -> list[tuple[str, object]]:
+            events: list[tuple[str, object]] = []
+            parts: dict[int, list[str]] = {}
+            message: dict[str, str] = {}
+            for value in stream:
+                events.extend(self.backend._parse_event(cli, value, parts, bool(events), message))
+            return events
+
+        self.assertEqual(parse("claude"), [
+            ("message_delta", {"id": "msg_1", "delta": "Checking the files."}),
+            ("message_completed", {"id": "msg_1", "phase": "commentary"}),
+            ("message_delta", {"id": "msg_2", "delta": "Done."}),
+            ("message_completed", {"id": "msg_2", "phase": "final_answer", "text": "Done."}),
+            ("completed", None),
+        ])
+        # Grok streams the answer itself and gets no phases.
+        self.assertNotIn("message_completed", [kind for kind, _data in parse("grok")])
+
+        # A subagent's stream events must not move the tracked main message.
+        def sub(value: dict[str, object]) -> dict[str, object]:
+            return {**value, "parent_tool_use_id": "toolu_agent"}
+
+        stream[2:2] = [sub(start("sub_1")), sub(text("subagent text")), sub(stop("tool_use"))]
+        events = parse("claude")
+        self.assertEqual(events[:2], [
+            ("message_delta", {"id": "msg_1", "delta": "Checking the files."}),
+            ("message_completed", {"id": "msg_1", "phase": "commentary"}),
+        ])
+        self.assertNotIn("sub_1", repr(events))
+
+    def test_claude_narration_is_reported_before_the_process_exits(self) -> None:
+        events: list[tuple[str, object]] = []
+        backend = HeadlessBackend({}, lambda _sid, _tid, kind, data: events.append((kind, data)))
+        script = """
+import json
+for value in [
+    {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1"}}},
+    {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Looking."}}},
+    {"type": "stream_event", "event": {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}},
+    {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m2"}}},
+    {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Done."}}},
+    {"type": "result", "subtype": "success", "is_error": False, "result": "Done."},
+]:
+    print(json.dumps(value))
+"""
+        process = subprocess.Popen(["python3", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        session = CliSession("claude-test", "claude", "/tmp", "", "", 1, "now", "headless-json", "id")
+        backend._read_process(session, "turn", process)
+        kinds = [(kind, data.get("id") if isinstance(data, dict) else None) for kind, data in events]
+        # Narration arrives in stream order; only the answer waits for the exit.
+        self.assertEqual(kinds, [
+            ("message_delta", "m1"), ("message_completed", "m1"), ("message_delta", "m2"),
+            ("message_completed", "m2"), ("completed", None),
+        ])
+        self.assertEqual(events[1][1], {"id": "m1", "phase": "commentary"})
+        self.assertEqual(events[3][1], {"id": "m2", "phase": "final_answer", "text": "Done."})
+
     def test_grok_result_returns_errors_list_detail(self) -> None:
         events = self.backend._parse_anthropic_event(
             {

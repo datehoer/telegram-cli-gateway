@@ -2586,13 +2586,25 @@ class GatewayApp:
             LOGGER.exception("could not decline unsupported Codex request")
 
     def _turn_progress(self, view: TurnView) -> str:
+        return self._turn_progress_boundary(view)[0]
+
+    def _turn_progress_boundary(self, view: TurnView) -> tuple[str, int]:
+        """Progress text and the length of its prefix that may become reading records.
+
+        A message without a phase may still turn out to be the answer: Claude names it
+        narration only when the message ends in a tool call. Sealing stops before it so
+        the answer is never posted twice.
+        """
         with self._state_lock:
             bodies = ["".join(view.parts)] if view.parts else []
-            bodies.extend(
-                "".join(message.parts) for message in view.assistant_messages.values()
-                if message.phase != "final_answer" and message.parts
-            )
-        return "\n\n".join(bodies)
+            sealable = len(bodies)
+            for message in view.assistant_messages.values():
+                if message.phase == "final_answer" or not message.parts:
+                    continue
+                bodies.append("".join(message.parts))
+                if message.phase is not None and sealable == len(bodies) - 1:
+                    sealable = len(bodies)
+        return "\n\n".join(bodies), len("\n\n".join(bodies[:sealable]))
 
     def _turn_answer(self, view: TurnView) -> str:
         with self._state_lock:
@@ -2653,9 +2665,14 @@ class GatewayApp:
             if has_final or view.progress_closed or not self._turn_has_phases(view):
                 body = ("…" if len(answer) > 27000 else "") + answer[-27000:]
             else:
-                body, _end = stream_segment(
-                    self._turn_progress(view), view.progress_offset, STREAM_SEGMENT_UNITS
-                )
+                progress, sealable = self._turn_progress_boundary(view)
+                if sealable < len(progress):
+                    # A message that may be the answer is still streaming; it stays in
+                    # the live card with everything after the last record.
+                    live = progress[view.progress_offset:]
+                    body = ("…" if len(live) > 27000 else "") + live[-27000:]
+                else:
+                    body, _end = stream_segment(progress, view.progress_offset, STREAM_SEGMENT_UNITS)
                 if body.strip():
                     sections[0] += tr(" · part {page}", page=view.progress_page)
             if body.strip():
@@ -2870,7 +2887,7 @@ class GatewayApp:
 
     def _publish_running_turn(self, view: TurnView, rendered: str) -> None:
         with self._state_lock:
-            progress = self._turn_progress(view)
+            progress, sealable = self._turn_progress_boundary(view)
             has_final = any(
                 message.phase == "final_answer" and message.parts
                 for message in view.assistant_messages.values()
@@ -2884,9 +2901,11 @@ class GatewayApp:
                 rendered, _answer = self._render_turn(view, time.monotonic())
             else:
                 rolled = False
-                while view.progress_offset < len(progress):
+                while view.progress_offset < sealable:
                     chunk, end = stream_segment(progress, view.progress_offset, STREAM_SEGMENT_UNITS)
-                    if end == len(progress):
+                    # The last segment stays live, and so does any text of a message
+                    # that may still be the answer.
+                    if end == len(progress) or end > sealable:
                         break
                     self._archive_progress_segment(view, chunk, end)
                     rolled = True
@@ -2914,9 +2933,9 @@ class GatewayApp:
     def _publish_steer_notice(self, view: TurnView) -> None:
         with self._state_lock:
             number, boundary = view.steer_notices[0]
-            progress = self._turn_progress(view)
+            progress, sealable = self._turn_progress_boundary(view)
         if not view.progress_closed and self._turn_has_phases(view):
-            self._seal_progress(view, progress[:boundary])
+            self._seal_progress(view, progress[:min(boundary, sealable)])
         text = tr(
             "[{session}] The CLI accepted added request #{number}.\nFurther progress appears below this message.",
             session=view.session.session_id, number=number,
@@ -3002,8 +3021,14 @@ class GatewayApp:
             return False
         if allow_new_messages and not view.progress_closed and self._turn_has_phases(view):
             with self._state_lock:
-                progress = self._turn_progress(view)
-            self._seal_progress(view, progress)
+                progress, sealable = self._turn_progress_boundary(view)
+                has_final = any(
+                    message.phase == "final_answer" and message.parts
+                    for message in view.assistant_messages.values()
+                )
+            # Without a named answer, a message still without a phase is the answer
+            # (an interrupted reply, say): it goes on the final card, not into records.
+            self._seal_progress(view, progress if has_final else progress[:sealable])
             view.progress_closed = True
         if with_artifacts:
             view.artifacts = self._find_artifacts(view.session, self._turn_answer(view))
