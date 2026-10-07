@@ -13,13 +13,14 @@ from collections.abc import Callable
 from typing import Any
 
 from .attachments import Attachment
+from .i18n import tr
 from .sessions import CliSession
 from .usage import claude_context_window, claude_quota_lines, headless_usage
 
 
 LOGGER = logging.getLogger("telegram-cli-gateway.headless")
 
-# pi 只把这几种图片的 @file 作为图像附带，其余 @file 一律按 UTF-8 文本整段内联。
+# Pi attaches an @file as an image only for these types; any other @file is inlined as UTF-8 text.
 PI_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 
 
@@ -66,7 +67,7 @@ class HeadlessBackend:
                 stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0,
             )
         except OSError as exc:
-            raise HeadlessBackendError("无法启动 Claude 原生状态查询") from exc
+            raise HeadlessBackendError(tr("Could not start the native Claude status query")) from exc
         selector = selectors.DefaultSelector()
         assert process.stdin is not None and process.stdout is not None
         selector.register(process.stdout, selectors.EVENT_READ)
@@ -77,7 +78,7 @@ class HeadlessBackend:
         def request(subtype: str, **options: Any) -> dict[str, Any]:
             nonlocal buffer, bytes_read
             if time.monotonic() >= deadline:
-                raise HeadlessBackendError("Claude 原生状态查询超时")
+                raise HeadlessBackendError(tr("The native Claude status query timed out"))
             request_id = str(uuid.uuid4())
             process.stdin.write(json.dumps({
                 "type": "control_request", "request_id": request_id,
@@ -98,17 +99,17 @@ class HeadlessBackend:
                         continue
                     payload = response.get("response")
                     if response.get("subtype") != "success" or not isinstance(payload, dict):
-                        raise HeadlessBackendError("Claude 原生状态接口未返回有效数据")
+                        raise HeadlessBackendError(tr("The native Claude status query returned no valid data"))
                     return payload
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not selector.select(remaining):
-                    raise HeadlessBackendError("Claude 原生状态查询超时")
+                    raise HeadlessBackendError(tr("The native Claude status query timed out"))
                 chunk = os.read(process.stdout.fileno(), 65536)
                 if not chunk:
-                    raise HeadlessBackendError("Claude 原生状态查询已退出")
+                    raise HeadlessBackendError(tr("The native Claude status query exited"))
                 bytes_read += len(chunk)
                 if bytes_read > 2 * 1024 * 1024:
-                    raise HeadlessBackendError("Claude 原生状态响应超过限制")
+                    raise HeadlessBackendError(tr("The native Claude status response exceeded the size limit"))
                 buffer += chunk
 
         try:
@@ -124,10 +125,10 @@ class HeadlessBackend:
                     # option maps to this and avoids scanning unrelated history.
                     result["quota_lines"] = claude_quota_lines(request("get_usage", skip_behaviors=True))
                 except (HeadlessBackendError, OSError):
-                    result["quota_lines"] = ["账户额度：暂时无法查询，请稍后重试。"]
+                    result["quota_lines"] = [tr("Account quota: temporarily unavailable; try again later.")]
             return result
         except OSError as exc:
-            raise HeadlessBackendError("Claude 原生状态查询连接失败") from exc
+            raise HeadlessBackendError(tr("Could not connect to the native Claude status query")) from exc
         finally:
             self._terminate_process(process)
             selector.close()
@@ -175,10 +176,11 @@ class HeadlessBackend:
         return turn_id
 
     def compact_session(self, session: CliSession, timeout: float = 120) -> str:
-        """通过一次性 RPC 进程触发 Pi 的原生手动压缩（compact 命令），返回结果摘要。
+        """Run Pi's native manual compaction through a one-shot RPC process.
 
-        Pi 的 RPC 模式读 stdin 上的 JSON 命令并输出 JSON 事件；发完 compact 后
-        进程会自己退出。这里用超时兜底，避免意外挂住。
+        Pi's RPC mode reads JSON commands on stdin and writes JSON events; after a
+        compact command the process exits by itself. The timeout guards against hangs.
+        Returns a short result summary.
         """
         if session.cli != "pi":
             raise HeadlessBackendError("compact is only supported for pi")
@@ -227,8 +229,8 @@ class HeadlessBackend:
             assert process.stdin is not None and process.stdout is not None
             process.stdin.write(compact_request + "\n")
             process.stdin.flush()
-            # 保持 stdin 打开：pi 在 stdin 关闭时触发 shutdown，会中止进行中的压缩。
-            # 等 compaction_end / compact 响应出现后再退出。
+            # Keep stdin open: Pi shuts down when stdin closes, which aborts a running
+            # compaction. Leave only after compaction_end or the compact response.
             result_text = ""
             while True:
                 raw_line = process.stdout.readline()
@@ -246,9 +248,9 @@ class HeadlessBackend:
                 value_type = value.get("type")
                 if value_type == "compaction_end":
                     if value.get("errorMessage"):
-                        return f"压缩未执行：{value['errorMessage']}"
+                        return tr("Compaction did not run: {reason}", reason=value["errorMessage"])
                     if value.get("aborted"):
-                        return "压缩已中止。"
+                        return tr("Compaction aborted.")
                     self.on_event(session.session_id, "compact", "usage", {
                         "context_tokens": None, "external_id": session.external_id,
                     })
@@ -256,22 +258,21 @@ class HeadlessBackend:
                     if summary:
                         result_text = str(summary)[:600]
                     else:
-                        return "已触发上下文压缩。"
+                        return tr("Context compaction started.")
                 elif value_type == "response" and value.get("id") == "compact":
                     if not value.get("success"):
-                        return f"压缩未执行：{value.get('error') or 'compaction failed'}"
+                        return tr("Compaction did not run: {reason}", reason=value.get("error") or "compaction failed")
                     self.on_event(session.session_id, "compact", "usage", {
                         "context_tokens": None, "external_id": session.external_id,
                     })
                     if result_text:
-                        return f"压缩完成。摘要：{result_text}"
-                    return "已触发上下文压缩。"
+                        return tr("Compaction finished. Summary: {summary}", summary=result_text)
+                    return tr("Context compaction started.")
             return_code = process.wait(timeout=5)
             if timed_out.is_set():
-                raise HeadlessBackendError("Pi 上下文压缩超时，已停止压缩进程")
+                raise HeadlessBackendError(tr("Pi context compaction timed out; the compaction process was stopped"))
             raise HeadlessBackendError(
-                f"{session.cli} RPC 未返回 compact 结果"
-                f"（exit {return_code}）"
+                tr("{cli} RPC returned no compact result (exit {code})", cli=session.cli, code=return_code)
             )
         finally:
             watchdog.cancel()
@@ -289,7 +290,7 @@ class HeadlessBackend:
         if not attachments:
             return text
         listed = "\n".join(f"- {item.name}: {item.path}" for item in attachments)
-        return f"{text}\n\n用户同时上传了以下本地文件，请按请求读取或查看：\n{listed}"
+        return f"{text}\n\nThe user also uploaded these local files; read or view them as the request needs:\n{listed}"
 
     def _build_command(
         self, session: CliSession, text: str, attachments: tuple[Attachment, ...]
@@ -336,7 +337,7 @@ class HeadlessBackend:
                 *session_args,
             ]
         session_args = ["--session-id", external_id] if first_turn else ["--session", external_id]
-        # 音频、视频、压缩包这类二进制文件内联后会塞满上下文，和 claude/grok 一样只给路径。
+        # Inlined audio, video or archives would flood the context, so like Claude and Grok they get paths.
         images = tuple(item for item in attachments if item.mime_type in PI_IMAGE_TYPES)
         others = tuple(item for item in attachments if item.mime_type not in PI_IMAGE_TYPES)
         file_args = [f"@{item.path}" for item in images]
@@ -418,10 +419,11 @@ class HeadlessBackend:
             elif return_code == 0:
                 self.on_event(session.session_id, turn_id, "completed", None)
             else:
-                # 非零退出且没有明确的 error 事件：可能是被信号杀死（网关重启/关机
-                # 连累、OOM）或 CLI 异常退出。CLI 的退出码约定不统一（例如 pi 把
-                # SIGTERM 转成 143 而不是负值），所以不按符号判断，统一视为可恢复
-                # 的中断：不清 in_flight，留给恢复机制决定是否续跑。
+                # A nonzero exit without an error event: killed by a signal (gateway
+                # restart or shutdown, OOM) or an abnormal CLI exit. Exit-code conventions
+                # differ (Pi maps SIGTERM to 143, not a negative value), so the sign is not
+                # trusted. Treat it as a recoverable interruption: keep in_flight and let
+                # recovery decide whether to continue.
                 self.on_event(session.session_id, turn_id, "interrupted", return_code)
         except Exception as exc:
             LOGGER.exception("failed while reading %s JSON stream", session.cli)

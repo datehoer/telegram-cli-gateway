@@ -76,6 +76,7 @@ If these conditions are not met, defer the work and record the concrete trigger 
 - Avoid speculative registries, plugin systems, generic workflow engines, event buses, dependency injection frameworks, and distributed components.
 - Avoid broad configuration surfaces. Add a setting only when users need to choose between valid behaviors.
 - Keep user-facing Telegram messages concise and actionable.
+- Write user-facing text in English and pass it through `tr()` (mark constants with `N_()`), with its Chinese in `i18n.py`; `tests/test_i18n.py` fails on a missing or stale entry. `GATEWAY_LANGUAGE` picks the language. Logs, comments and prompts sent to CLIs are English only. Bundled extensions follow `TG_LANGUAGE` the same way.
 - Comments should explain non-obvious constraints or failure semantics, not restate the code.
 - Temporary compatibility code must be labeled by its concrete removal condition.
 

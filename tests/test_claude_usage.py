@@ -61,14 +61,14 @@ class ClaudeHistoryTests(unittest.TestCase):
         self.assertEqual(snapshot["output_tokens"], 70)
         self.assertEqual(snapshot["reported_at"], "2026-09-30T12:34:56+00:00")
         text = "\n".join(context_lines(snapshot))
-        self.assertIn("历史记录", text)
+        self.assertIn("history", text)
         self.assertIn("2026-09-30T12:34:56", text)
         self.assertNotIn("private transcript", json.dumps(snapshot))
         # Billing/result updates do not make historical occupancy look fresh.
         self.assertEqual(merge_usage(snapshot, {"output_tokens": 90})["reported_at"], snapshot["reported_at"])
-        live = merge_usage(snapshot, {"context_tokens": 200, "context_basis": "最近请求输入"})
+        live = merge_usage(snapshot, {"context_tokens": 200, "context_basis": "request_input"})
         self.assertNotIn("reported_at", live)
-        self.assertNotIn("历史记录", "\n".join(context_lines(live)))
+        self.assertNotIn("history", "\n".join(context_lines(live)))
 
     def test_rewound_branch_uses_its_parent_chain(self) -> None:
         self.write(

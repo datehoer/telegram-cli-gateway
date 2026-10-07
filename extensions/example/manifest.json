@@ -1,10 +1,17 @@
 {
   "schema_version": 1,
   "id": "example",
-  "name": "示例直连命令",
+  "name": "Example direct command",
   "command": "example",
-  "usage": "/example <任意文本>",
-  "description": "示例扩展：回显参数、演示进度行、输出一个产物文件路径",
+  "usage": "/example <any text>",
+  "description": "Example extension: echoes its arguments, shows progress lines and prints an artifact path",
+  "i18n": {
+    "zh": {
+      "name": "示例直连命令",
+      "usage": "/example <任意文本>",
+      "description": "示例扩展：回显参数、演示进度行、输出一个产物文件路径"
+    }
+  },
   "exec": ["python3", "main.py"],
   "cwd": "/srv/projects/artifacts",
   "timeout_seconds": 60,

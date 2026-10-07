@@ -1,12 +1,16 @@
-"""直连命令扩展（Direct Command）。
+"""Direct command extensions.
 
-一个扩展 = 一个目录 + 一个 ``manifest.json`` + 一个可执行的 ``exec`` 数组。
-命中命令时由网关直接 spawn 本地进程，不经过任何 AI CLI，也不产生会话上下文。
+An extension is a directory with a ``manifest.json`` and an executable ``exec`` array.
+When its command is invoked, the gateway spawns the local process directly: no AI CLI
+runs and no session context is created.
 
-设计边界（见 AGENTS.md「Direct Command Extensions」一节）：
-- 没有插件间通信、没有热重载、没有插件自持持久状态、没有插件自定义 Telegram UI。
-- 进程以网关账号权限运行；装什么扩展由部署者自己审查，网关不做安全沙箱。
-- 插件只通过环境变量 + argv 收参数，通过 stdout 回结果，通过约定的进度行回进度。
+Boundaries (see "Direct Command Extensions" in AGENTS.md):
+- No inter-extension communication, hot reload, extension-owned persistent state or
+  extension-defined Telegram UI.
+- Processes run with the gateway account's permissions; whoever installs an extension
+  reviews it. The gateway is not a sandbox.
+- Extensions receive input through environment variables and argv, return results on
+  stdout, and report progress through the agreed progress lines.
 """
 
 from __future__ import annotations
@@ -26,13 +30,14 @@ from collections.abc import Callable
 from typing import Any
 
 from .config import Config
+from .i18n import LANGUAGES, current_language, tr
 
 SCHEMA_VERSION = 1
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 MANIFEST_NAME = "manifest.json"
 
-# 进度行约定：插件在 stdout 输出「@@PROGRESS <文本>」，网关原地刷新进度卡片。
-# 其余 stdout 全部缓冲到最后一次性发出。
+# Progress lines: an extension prints "@@PROGRESS <text>" on stdout and the gateway
+# updates the card in place. All other stdout is buffered and sent at the end.
 PROGRESS_PREFIX = "@@PROGRESS"
 
 MIN_TIMEOUT_SECONDS = 1
@@ -40,34 +45,35 @@ MAX_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
 DEFAULT_MAX_OUTPUT_BYTES = 16384
 MAX_OUTPUT_BYTES_LIMIT = 1024 * 1024
-# exec 里唯一支持的替换：{extension_dir} → manifest 所在目录的绝对路径。
-# 它让「脚本放在扩展目录、工作目录在别处」这种常见组合不需要写死绝对路径。
+# The only substitution in exec: {extension_dir} becomes the manifest's absolute
+# directory, so a script beside the manifest can run with a cwd elsewhere.
 EXTENSION_DIR_TOKEN = "{extension_dir}"
-# stdout 按行留尾；渲染时再按 max_output_bytes 截断。多留几倍是为了不让进度行
-# 被大量普通输出挤掉，同时避免长时间下载把网关内存吃光。
+# Keep the tail of stdout by line and cut it to max_output_bytes when rendering. The
+# margin keeps progress lines from being crowded out without letting long downloads
+# exhaust gateway memory.
 OUTPUT_LINE_BUFFER = 4000
 STDERR_LINE_BUFFER = 200
 KILL_GRACE_SECONDS = 5.0
 
 
 class CommandError(RuntimeError):
-    """命令无法执行（命令不存在、参数非法、重复执行）。"""
+    """The command cannot run (unknown command, invalid arguments, already running)."""
 
 
 class CommandManifestError(ValueError):
-    """manifest.json 不合法；调用方跳过该扩展并告警。"""
+    """manifest.json is invalid; the caller skips the extension with a warning."""
 
 
 class CommandDisabled(CommandManifestError):
-    """manifest 里 enabled=false：这是正常状态，不告警。"""
+    """The manifest sets enabled=false: a normal state that needs no warning."""
 
 
 def _require(mapping: dict[str, Any], key: str, kind: type, default: Any = None) -> Any:
     value = mapping.get(key, default)
     if value is None:
-        raise CommandManifestError(f"缺少字段 {key}")
+        raise CommandManifestError(f"missing field {key}")
     if not isinstance(value, kind):
-        raise CommandManifestError(f"字段 {key} 类型应为 {kind.__name__}")
+        raise CommandManifestError(f"field {key} must be of type {kind.__name__}")
     return value
 
 
@@ -76,7 +82,7 @@ def _optional_str(mapping: dict[str, Any], key: str) -> str:
     if value is None:
         return ""
     if not isinstance(value, str):
-        raise CommandManifestError(f"字段 {key} 类型应为字符串")
+        raise CommandManifestError(f"field {key} must be a string")
     return value.strip()
 
 
@@ -85,15 +91,15 @@ def _bounded_int(
 ) -> int:
     raw = mapping.get(key, default)
     if isinstance(raw, bool) or not isinstance(raw, int):
-        raise CommandManifestError(f"字段 {key} 类型应为整数")
+        raise CommandManifestError(f"field {key} must be an integer")
     if not low <= raw <= high:
-        raise CommandManifestError(f"字段 {key} 必须在 {low}..{high} 之间")
+        raise CommandManifestError(f"field {key} must be between {low} and {high}")
     return raw
 
 
 @dataclass(frozen=True)
 class DirectCommand:
-    """一个已校验的直连命令定义。"""
+    """A validated direct command definition."""
 
     id: str
     name: str
@@ -105,6 +111,8 @@ class DirectCommand:
     manifest_path: Path
     timeout_seconds: int
     max_output_bytes: int
+    # Optional display text per language from the manifest's "i18n" object.
+    translations: dict[str, dict[str, str]] = field(default_factory=dict, hash=False, compare=False)
 
     @property
     def directory(self) -> Path:
@@ -116,11 +124,11 @@ class DirectCommand:
         )
 
     def spawn_argv(self) -> tuple[str, ...]:
-        """实际传给 Popen 的 argv。
+        """The argv passed to Popen.
 
-        cwd 可能与扩展目录不同，所以相对路径不能直接交给子进程。
-        带路径分隔符的相对 argv 元素按扩展目录解析；裸命令名（如 python3）
-        仍然交给 PATH 查找。
+        The cwd may differ from the extension directory, so relative paths cannot go to
+        the child as they are. Relative argv items with a path separator resolve against
+        the extension directory; bare command names (such as python3) still use PATH.
         """
         resolved: list[str] = []
         for item in self.resolved_argv():
@@ -133,47 +141,56 @@ class DirectCommand:
                 resolved.append(item)
         return tuple(resolved)
 
+    def _display(self, key: str) -> str:
+        return self.translations.get(current_language(), {}).get(key) or getattr(self, key)
+
+    def display_name(self) -> str:
+        return self._display("name")
+
+    def display_description(self) -> str:
+        return self._display("description")
+
     def usage_text(self) -> str:
-        return self.usage or f"/{self.command}"
+        return self._display("usage") or f"/{self.command}"
 
     def help_line(self) -> str:
-        description = self.description or self.name
+        description = self.display_description() or self.display_name()
         return f"{self.usage_text()}  {description}"
 
 
 def parse_manifest(manifest_path: Path, config: Config) -> DirectCommand:
-    """校验单个 manifest；任何不合规都抛 CommandManifestError。"""
+    """Validate one manifest; any violation raises CommandManifestError."""
     try:
         raw_text = manifest_path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise CommandManifestError(f"无法读取 {manifest_path.name}: {exc}") from exc
+        raise CommandManifestError(f"cannot read {manifest_path.name}: {exc}") from exc
     try:
         payload = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise CommandManifestError(f"{manifest_path.name} 不是合法 JSON: {exc}") from exc
+        raise CommandManifestError(f"{manifest_path.name} is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict):
-        raise CommandManifestError(f"{manifest_path.name} 顶层必须是对象")
+        raise CommandManifestError(f"{manifest_path.name} must contain a JSON object")
 
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise CommandManifestError(
-            f"schema_version 必须是 {SCHEMA_VERSION}，实际为 {payload.get('schema_version')!r}"
+            f"schema_version must be {SCHEMA_VERSION}, got {payload.get('schema_version')!r}"
         )
     if payload.get("enabled", True) is False:
         raise CommandDisabled("enabled=false")
 
     command_id = _optional_str(payload, "id")
     if not COMMAND_NAME_RE.match(command_id):
-        raise CommandManifestError("字段 id 必须匹配 ^[a-z][a-z0-9_]{0,31}$")
+        raise CommandManifestError("field id must match ^[a-z][a-z0-9_]{0,31}$")
     command = _optional_str(payload, "command")
     if not COMMAND_NAME_RE.match(command):
-        raise CommandManifestError("字段 command 必须匹配 ^[a-z][a-z0-9_]{0,31}$")
+        raise CommandManifestError("field command must match ^[a-z][a-z0-9_]{0,31}$")
 
     raw_exec = _require(payload, "exec", list)
     if not raw_exec:
-        raise CommandManifestError("字段 exec 不能为空")
+        raise CommandManifestError("field exec must not be empty")
     for index, item in enumerate(raw_exec):
         if not isinstance(item, str) or not item.strip():
-            raise CommandManifestError(f"exec[{index}] 必须是非空字符串")
+            raise CommandManifestError(f"exec[{index}] must be a non-empty string")
 
     directory = manifest_path.parent
     raw_cwd = payload.get("cwd")
@@ -181,17 +198,31 @@ def parse_manifest(manifest_path: Path, config: Config) -> DirectCommand:
         cwd = config.default_workdir
     else:
         if not isinstance(raw_cwd, str):
-            raise CommandManifestError("字段 cwd 类型应为字符串")
+            raise CommandManifestError("field cwd must be a string")
         candidate = Path(raw_cwd).expanduser()
         if not candidate.is_absolute():
             candidate = directory / candidate
         cwd = candidate.resolve()
         if not cwd.is_dir():
-            raise CommandManifestError(f"cwd 目录不存在: {cwd}")
+            raise CommandManifestError(f"cwd does not exist: {cwd}")
     if not any(cwd == root or cwd.is_relative_to(root) for root in config.allowed_roots):
         raise CommandManifestError(
-            f"cwd 必须位于 ALLOWED_WORKDIRS 内，否则产物无法回传: {cwd}"
+            f"cwd must be inside ALLOWED_WORKDIRS, or its artifacts cannot be sent: {cwd}"
         )
+
+    raw_i18n = payload.get("i18n", {})
+    if not isinstance(raw_i18n, dict):
+        raise CommandManifestError("field i18n must be an object")
+    translations: dict[str, dict[str, str]] = {}
+    for language, fields in raw_i18n.items():
+        if language not in LANGUAGES or not isinstance(fields, dict):
+            raise CommandManifestError(f"i18n.{language} must be an object for one of {', '.join(LANGUAGES)}")
+        unknown = set(fields) - {"name", "usage", "description"}
+        if unknown:
+            raise CommandManifestError(f"i18n.{language} has unsupported fields: {', '.join(sorted(unknown))}")
+        translations[language] = {
+            key: value for key in ("name", "usage", "description") if (value := _optional_str(fields, key))
+        }
 
     return DirectCommand(
         id=command_id,
@@ -210,6 +241,7 @@ def parse_manifest(manifest_path: Path, config: Config) -> DirectCommand:
             payload, "max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES,
             1, MAX_OUTPUT_BYTES_LIMIT,
         ),
+        translations=translations,
     )
 
 
@@ -219,9 +251,10 @@ def load_direct_commands(
     reserved: frozenset[str] | set[str] = frozenset(),
     warn: Callable[[str], None] | None = None,
 ) -> dict[str, DirectCommand]:
-    """扫描所有扩展目录，返回 command -> DirectCommand。
+    """Scan every extension directory and return command -> DirectCommand.
 
-    单个扩展出错只跳过它自己并告警，不影响网关启动，也不影响其他扩展。
+    A broken extension is skipped with a warning; gateway startup and the other
+    extensions are unaffected.
     """
     emit = warn or (lambda _message: None)
     loaded: dict[str, DirectCommand] = {}
@@ -234,17 +267,17 @@ def load_direct_commands(
             except CommandDisabled:
                 continue
             except CommandManifestError as exc:
-                emit(f"扩展命令已跳过 {manifest_path}: {exc}")
+                emit(f"skipped extension command {manifest_path}: {exc}")
                 continue
             if command.command in reserved:
                 emit(
-                    f"扩展命令已跳过 {manifest_path}: 命令名 /{command.command} 与内置命令冲突"
+                    f"skipped extension command {manifest_path}: /{command.command} clashes with a built-in command"
                 )
                 continue
             if command.command in loaded:
                 emit(
-                    f"扩展命令已跳过 {manifest_path}: 命令名 /{command.command} "
-                    f"已被 {loaded[command.command].manifest_path} 占用"
+                    f"skipped extension command {manifest_path}: /{command.command} "
+                    f"is already taken by {loaded[command.command].manifest_path}"
                 )
                 continue
             loaded[command.command] = command
@@ -253,7 +286,7 @@ def load_direct_commands(
 
 @dataclass
 class DirectCommandRun:
-    """一次命令执行的可见状态。发布逻辑由 GatewayApp 的状态循环驱动。"""
+    """Visible state of one command run; GatewayApp's status loop publishes it."""
 
     command: DirectCommand
     chat_id: int
@@ -277,8 +310,8 @@ class DirectCommandRun:
     next_publish_at: float = 0.0
     publish_failures: int = 0
     auto_sent: list[str] = field(default_factory=list)
-    # 路径 → artifact token。卡片每 10 秒原地刷新一次，复用 token 可以避免把
-    # sessions 的 artifact 表刷满（那张表只保留 500 条）。
+    # Path -> artifact token. The card refreshes in place every 10 seconds; reusing
+    # tokens keeps the sessions artifact table (500 entries) from filling up.
     artifact_tokens: dict[str, str] = field(default_factory=dict)
     process: subprocess.Popen[str] | None = None
 
@@ -299,7 +332,8 @@ class DirectCommandRun:
 
 
 class DirectCommandRunner:
-    """执行直连命令并保存可见状态；进度由 GatewayApp 的状态循环发布。"""
+    """Run direct commands and keep their visible state; GatewayApp's status loop
+    publishes progress."""
 
     def __init__(
         self, config: Config, commands: dict[str, DirectCommand] | None = None
@@ -347,7 +381,7 @@ class DirectCommandRunner:
     ) -> DirectCommandRun:
         command = self.commands.get(command_name)
         if command is None:
-            raise CommandError(f"没有名为 /{command_name} 的扩展命令")
+            raise CommandError(tr("There is no extension command named /{command}", command=command_name))
         with self._lock:
             if any(
                 run.command.command == command_name
@@ -356,9 +390,9 @@ class DirectCommandRunner:
                 and run.status == "running"
                 for run in self._runs.values()
             ):
-                raise CommandError(f"/{command_name} 正在运行，请等它结束或先 /interrupt")
+                raise CommandError(tr("/{command} is already running; wait for it or /interrupt it first", command=command_name))
             if self._stopping:
-                raise CommandError("网关正在退出")
+                raise CommandError(tr("The gateway is shutting down"))
 
             run = DirectCommandRun(
                 command=command,
@@ -375,17 +409,18 @@ class DirectCommandRunner:
         except OSError as exc:
             with self._lock:
                 run.status = "failed"
-                run.error_lines.append(f"无法启动命令: {exc}")
-            raise CommandError(f"无法启动 /{command_name}: {exc}") from exc
+                run.error_lines.append(tr("Could not start the command: {error}", error=exc))
+            raise CommandError(tr("Could not start /{command}: {error}", command=command_name, error=exc)) from exc
         return run
 
     def _spawn(self, run: DirectCommandRun) -> None:
         command = run.command
         env = os.environ.copy()
-        # 让 Python 写的插件默认行缓冲；否则进度行会卡在子进程缓冲区里。
+        # Line-buffer Python extensions by default, or progress lines stall in the child's buffer.
         env["PYTHONUNBUFFERED"] = "1"
-        # 网关自己的配置不一定会出现在扩展进程的环境里（systemd 只给 .env 覆盖的
-        # 那几行），扩展却需要知道发送上限这类值。显式透传带前缀的变量。
+        # The gateway's settings are not necessarily in the extension's environment
+        # (systemd only sets the lines .env overrides), yet extensions need values such
+        # as the send limit. Pass them explicitly.
         for key in ("TELEGRAM_MAX_FILE_BYTES",):
             if key not in env:
                 env[key] = str(getattr(self.config, "telegram_max_file_bytes", ""))
@@ -395,13 +430,14 @@ class DirectCommandRunner:
                 "TG_COMMAND": command.command,
                 "TG_COMMAND_NAME": command.name,
                 "TG_ARGS_JSON": json.dumps(run.args, ensure_ascii=False),
-                # 未经任何分词的原始文本，Cookie / JSON / 引号都保持原样。
+                # The raw text without any tokenizing: cookies, JSON and quotes stay intact.
                 "TG_RAW_ARGS": run.raw_args,
                 "TG_ARGV0": run.args[0] if run.args else "",
                 "TG_CHAT_ID": str(run.chat_id),
                 "TG_USER_ID": str(run.user_id),
                 "TG_WORKDIR": str(command.cwd),
                 "TG_MANIFEST_DIR": str(command.directory),
+                "TG_LANGUAGE": current_language(),
             }
         )
         process = subprocess.Popen(
@@ -437,7 +473,7 @@ class DirectCommandRunner:
         timer.daemon = True
         with self._lock:
             if run.status != "running":
-                # 进程在定时器注册前就结束了，不要再持有它。
+                # The process ended before the timer was registered; don't keep it.
                 timer.cancel()
                 return
             self._timers[run.turn_id] = timer
@@ -459,7 +495,7 @@ class DirectCommandRunner:
                     with self._lock:
                         run.output_lines.append(line + "\n")
                         run.dirty = True
-            except (OSError, ValueError):  # 进程被杀死时管道会先关闭
+            except (OSError, ValueError):  # the pipe closes first when the process is killed
                 pass
         try:
             returncode = process.wait()
@@ -477,7 +513,7 @@ class DirectCommandRunner:
                     if not run.timed_out:
                         detail = run.error_text()
                         run.error_lines.append(
-                            f"命令退出码 {returncode}" + (f"\n{detail}" if detail else "")
+                            tr("Command exit code {code}", code=returncode) + (f"\n{detail}" if detail else "")
                         )
             run.dirty = True
 
@@ -505,13 +541,14 @@ class DirectCommandRunner:
                 return
             run.timed_out = True
             run.error_lines.append(
-                f"执行超过 {run.command.timeout_seconds} 秒，已终止\n"
+                tr("Stopped after running longer than {seconds} seconds", seconds=run.command.timeout_seconds) + "\n"
             )
             run.dirty = True
         self._terminate(run, mark_interrupted=True)
 
     def _terminate(self, run: DirectCommandRun, *, mark_interrupted: bool) -> None:
-        """终止进程组；状态先落定，避免读取线程把终止误报成命令失败。"""
+        """Terminate the process group; settle the state first so the reader thread
+        does not report the termination as a command failure."""
         with self._lock:
             process = run.process
             if mark_interrupted:

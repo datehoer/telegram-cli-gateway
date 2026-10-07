@@ -40,7 +40,7 @@ class UsageParsingTests(unittest.TestCase):
         self.assertEqual(codex_usage(None), {})
         snapshot = codex_usage({"last": {"totalTokens": True}, "modelContextWindow": -1})
         self.assertEqual(snapshot, {})
-        self.assertIn("等待 CLI", "\n".join(context_lines(snapshot)))
+        self.assertIn("waiting for the CLI", "\n".join(context_lines(snapshot)))
         self.assertNotIn("0.0%", "\n".join(context_lines(snapshot)))
 
     def test_anthropic_cached_input_counts_toward_context_and_result_does_not(self) -> None:
@@ -83,7 +83,7 @@ class UsageParsingTests(unittest.TestCase):
         }}
         snapshot = headless_usage("pi", value)
         self.assertEqual(snapshot["context_tokens"], 1000)
-        self.assertIn("无法计算占比", "\n".join(context_lines(snapshot)))
+        self.assertIn("the share is unknown", "\n".join(context_lines(snapshot)))
         value["message"]["usage"]["totalTokens"] = 1100
         self.assertEqual(headless_usage("pi", value)["context_tokens"], 1100)
 
@@ -107,8 +107,8 @@ class UsageParsingTests(unittest.TestCase):
             "secondary": {"usedPercent": 35, "windowDurationMins": 10080},
         }})
         text = "\n".join(lines)
-        self.assertIn("5小时额度：剩余 100%", text)
-        self.assertIn("7天额度：剩余 65%", text)
+        self.assertIn("5-hour quota: 100% left", text)
+        self.assertIn("7-day quota: 65% left", text)
         self.assertIn("UTC", text)
 
     def test_multibucket_quota_credits_and_explicit_spend_restriction(self) -> None:
@@ -120,17 +120,17 @@ class UsageParsingTests(unittest.TestCase):
             },
         }))
         self.assertIn("12.50", text)
-        self.assertIn("剩余 0%", text)
-        self.assertIn("支出限制", text)
-        self.assertIn("当前不允许", text)
-        self.assertEqual(text.count("账户额度 ·"), 2)
+        self.assertIn("0% left", text)
+        self.assertIn("spend limit", text)
+        self.assertIn("can't be used right now", text)
+        self.assertEqual(text.count("Account quota ·"), 2)
 
     def test_missing_malformed_and_nonfinite_quota_fields_do_not_imply_allowance(self) -> None:
         for value in (None, {}, {"rateLimits": {"primary": {"usedPercent": float("nan")}, "credits": {"balance": "NaN"}}}):
             with self.subTest(value=value):
                 text = "\n".join(quota_lines(value))
-                self.assertIn("未返回", text)
-                self.assertNotIn("剩余", text)
+                self.assertIn("returned no", text)
+                self.assertNotIn("% left", text)
 
     def test_codex_quota_request_is_read_only_and_bounded(self) -> None:
         server = CodexAppServer(("codex",), lambda *_: None, lambda *_: None)
@@ -165,7 +165,7 @@ class GatewayUsageTests(unittest.TestCase):
         self.app.codex.start_turn = Mock(side_effect=AssertionError("status must not run inference"))
         self.app.headless.start_turn = Mock(side_effect=AssertionError("status must not run inference"))
         self.app.headless.read_claude_diagnostics = Mock(return_value={
-            "context": {}, "quota_lines": ["账户额度：Claude 未返回额度数据。"],
+            "context": {}, "quota_lines": ["Account quota: Claude returned no quota data."],
         })
 
     def codex_session(self, thread_id: str = "thread-a", bot_key: str = "default"):
@@ -187,7 +187,7 @@ class GatewayUsageTests(unittest.TestCase):
         view.started_at = time.monotonic() - 10
         self.app._handle_command(1, "status", "")
         text = self.app._send.call_args.args[1]
-        for expected in ("运行中", "排队 1", "已运行 10秒", "20.0%", "900,000", "剩余 75%"):
+        for expected in ("Running", "1 queued", "running for 10 s", "20.0%", "900,000", "75% left"):
             self.assertIn(expected, text)
         self.app.codex.read_rate_limits.assert_called_once()
         self.app.codex.start_turn.assert_not_called()
@@ -242,7 +242,7 @@ class GatewayUsageTests(unittest.TestCase):
         text = self.app._send.call_args.args[1]
         self.assertIn(session.session_id, text)
         self.assertIn("20.0%", text)
-        self.assertIn("暂时无法查询", text)
+        self.assertIn("temporarily unavailable", text)
 
     def test_headless_reports_missing_capabilities_and_no_session_prompts_creation(self) -> None:
         self.app._handle_command(1, "status", "")
@@ -250,8 +250,8 @@ class GatewayUsageTests(unittest.TestCase):
         self.app.sessions.create_headless("grok", self.project, 1)
         self.app._handle_command(1, "status", "")
         text = self.app._send.call_args.args[1]
-        self.assertIn("等待 CLI", text)
-        self.assertIn("未提供额度查询", text)
+        self.assertIn("waiting for the CLI", text)
+        self.assertIn("offers no quota query", text)
         self.app.codex.read_rate_limits.assert_not_called()
 
     def test_claude_status_and_context_backfill_native_history_without_a_model_turn(self) -> None:
@@ -270,7 +270,7 @@ class GatewayUsageTests(unittest.TestCase):
             self.app._handle_command(1, command, "")
             text = self.app._send.call_args.args[1]
             self.assertIn("1,002 tokens", text)
-            self.assertIn("历史记录", text)
+            self.assertIn("history", text)
             self.assertIn("2026-09-30T12:00:00", text)
             self.assertNotIn("private native history", text)
         snapshot = SessionManager(self.app.config).get(session.session_id).usage
@@ -281,7 +281,7 @@ class GatewayUsageTests(unittest.TestCase):
         self.app.codex.read_rate_limits.assert_not_called()
         self.app.sessions.rotate_external_id(session.session_id)
         self.app._handle_command(1, "context", "")
-        self.assertIn("等待 CLI", self.app._send.call_args.args[1])
+        self.assertIn("waiting for the CLI", self.app._send.call_args.args[1])
 
     def test_claude_history_does_not_overwrite_live_reports_compaction_or_clear(self) -> None:
         session = self.app.sessions.create_headless("claude", self.project, 1)
@@ -309,11 +309,11 @@ class GatewayUsageTests(unittest.TestCase):
         session = self.app.sessions.create_headless("claude", self.project, 1)
         self.app.sessions.update_usage(session.session_id, session.external_id, {
             "model": "claude-model", "context_tokens": 291667,
-            "reported_at": "2026-09-30T12:00:00Z", "context_basis": "最近成功请求输入 · 历史记录",
+            "reported_at": "2026-09-30T12:00:00Z", "context_basis": "history",
         })
         self.app.headless.read_claude_diagnostics.return_value = {
             "context": {"model": "claude-model", "context_window": 1000000},
-            "quota_lines": ["账户额度 · Claude（max）", "7天额度：剩余 98%（已用 2%）"],
+            "quota_lines": ["Account quota · Claude (max)", "7-day quota: 98% left (2% used)"],
         }
         for command in ("status", "context"):
             self.app._handle_command(1, command, "")
@@ -325,7 +325,7 @@ class GatewayUsageTests(unittest.TestCase):
             self.assertIn("29.2%", text)
             self.assertIn("708,333", text)
             self.assertIn("2026-09-30T12:00:00", text)
-            self.assertEqual("剩余 98%" in text, command == "status")
+            self.assertEqual("98% left" in text, command == "status")
         saved = SessionManager(self.app.config).get(session.session_id).usage
         self.assertEqual(saved["context_window"], 1000000)
         self.assertNotIn("quota_lines", saved)
@@ -341,8 +341,8 @@ class GatewayUsageTests(unittest.TestCase):
         self.app._handle_command(1, "status", "")
         text = self.app._send.call_args.args[1]
         self.assertIn("1,000 / 10,000", text)
-        self.assertIn("原生窗口查询暂时不可用", text)
-        self.assertIn("账户额度：暂时无法查询", text)
+        self.assertIn("native Claude context query is unavailable", text)
+        self.assertIn("Account quota: temporarily unavailable", text)
 
     def test_claude_window_query_rejects_a_concurrent_model_change(self) -> None:
         session = self.app.sessions.create_headless("claude", self.project, 1)
@@ -422,8 +422,8 @@ class GatewayUsageTests(unittest.TestCase):
         self.app.sessions.set_model(session.session_id, "new-model")
         self.app._handle_command(1, "status", "")
         text = self.app._send.call_args.args[1]
-        self.assertIn("模型：new-model", text)
-        self.assertIn("当前任务模型：old-model", text)
+        self.assertIn("Model: new-model", text)
+        self.assertIn("Current task model: old-model", text)
 
     def test_commands_are_registered_in_menu_help_and_reserved_for_extensions(self) -> None:
         from cli_telegram_gateway.app import BUILTIN_COMMANDS

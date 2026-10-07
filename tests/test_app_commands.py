@@ -106,11 +106,11 @@ class DirectCommandAppTests(unittest.TestCase):
         app._handle_command(1, "demo", "hello world")
 
         run = next(iter(app.direct_commands.runs()))
-        # 直接命令不做 shell 分词：整行原文是一个参数，扩展自己拆词。
+        # Direct commands skip shell tokenizing: the whole line is one argument and the extension splits it.
         self.assertEqual(run.args, ["hello world"])
         self.assertEqual(run.raw_args, "hello world")
         self.assertEqual(len(self.cards), 1, "the first card must be sent immediately")
-        self.assertIn("运行中", self.cards[0][1])
+        self.assertIn("Running", self.cards[0][1])
         self.assertIn("/demo · demo extension", self.cards[0][1])
 
         self.wait_for_status(run)
@@ -153,7 +153,7 @@ class DirectCommandAppTests(unittest.TestCase):
         markup = app._direct_artifact_markup(run)
         self.assertIsNotNone(markup)
         button = markup["inline_keyboard"][0][0]  # type: ignore[index]
-        self.assertIn("发送文件：result.txt", button["text"])
+        self.assertIn("Send file: result.txt", button["text"])
         self.assertTrue(button["callback_data"].startswith("file:"))
         self.assertEqual(run.auto_sent, [], "AUTO_SEND_ARTIFACTS defaults to off")
 
@@ -161,7 +161,7 @@ class DirectCommandAppTests(unittest.TestCase):
         write_extension(self.project, "demo", "print('ok')\n")
         app = self.make_app()
         app._handle_command(1, "nope", "")
-        self.assertTrue(any("未知命令" in text for text in self.sent))
+        self.assertTrue(any("Unknown command" in text for text in self.sent))
         view = app._commands_view()
         self.assertIn("/demo", view)
         self.assertIn("/demo <text>", view)
@@ -207,13 +207,13 @@ class DirectCommandAppTests(unittest.TestCase):
         run = next(iter(app.direct_commands.runs()))
         time.sleep(0.2)
 
-        # 会话空闲：/interrupt 不应只回一句“没有正在运行的任务”。
+        # With the session idle, /interrupt must not just answer "no task is running".
         self.assertFalse(app._interrupt_session_turn(session))
         app._interrupt_session(session)
         self.wait_for_status(run)
         self.assertEqual(run.status, "interrupted")
         self.pump(app)
-        self.assertIn("已中断", self.edits[-1][1])
+        self.assertIn("Interrupted", self.edits[-1][1])
 
     def test_a_session_turn_still_wins_over_the_command_fallback(self) -> None:
         write_extension(self.project, "demo", "import time\ntime.sleep(30)\n")
@@ -227,7 +227,7 @@ class DirectCommandAppTests(unittest.TestCase):
         app._handle_command(1, "demo", "")
         run = next(iter(app.direct_commands.runs()))
         try:
-            # 会话有 in-flight 记录时 /interrupt 只针对那个 turn，不能顺手杀命令。
+            # With an in-flight record, /interrupt targets only that turn and must not kill the command.
             app._interrupt_session(session)
             self.assertEqual(calls, [session.session_id])
             self.assertEqual(run.status, "running")
@@ -270,7 +270,7 @@ class DirectCommandAppTests(unittest.TestCase):
         app = self.make_app()
         app._handle_command(1, "demo", "")
         app._handle_command(1, "demo", "")
-        self.assertTrue(any("正在运行" in text for text in self.sent))
+        self.assertTrue(any("is already running" in text for text in self.sent))
         for run in app.direct_commands.runs():
             app.direct_commands.interrupt(run.turn_id)
 
@@ -287,13 +287,13 @@ class DirectCommandAppTests(unittest.TestCase):
         write_extension(self.project, "demo", "print('ok')\n")
         app = self.make_app()
         app._handle_command(1, "help", "")
-        self.assertTrue(any("直连命令扩展" in text for text in self.sent))
+        self.assertTrue(any("Direct command extensions" in text for text in self.sent))
         self.assertTrue(any("/demo <text>" in text for text in self.sent))
 
     def test_help_text_without_commands_says_so(self) -> None:
         app = self.make_app()
         app._handle_command(1, "help", "")
-        self.assertTrue(any("当前未安装直连命令扩展" in text for text in self.sent))
+        self.assertTrue(any("No direct command extensions are installed" in text for text in self.sent))
 
     def test_command_dir_from_config_is_also_scanned(self) -> None:
         external = self.project / "external-commands"
@@ -317,7 +317,7 @@ class DirectCommandAppTests(unittest.TestCase):
 
 
 class OversizedArtifactTests(unittest.TestCase):
-    """超过 Bot API 上传上限的产物：能给路径，不能当文件发。"""
+    """An artifact over the Bot API upload limit can be returned as a path but not sent as a file."""
 
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -358,7 +358,7 @@ class OversizedArtifactTests(unittest.TestCase):
         markup = app._artifact_markup(view)
         buttons = markup["inline_keyboard"]  # type: ignore[index]
         self.assertEqual(buttons[0][0]["callback_data"].split(":")[0], "sendpath")
-        self.assertIn("路径", buttons[0][0]["text"])
+        self.assertIn("Send path", buttons[0][0]["text"])
         self.assertEqual(buttons[1][0]["callback_data"].split(":")[0], "video")
 
     def test_oversized_artifacts_are_never_auto_sent(self) -> None:
@@ -403,7 +403,7 @@ class OversizedArtifactTests(unittest.TestCase):
         self.assertEqual(uploads, [])
         self.assertEqual(len(sent), 1)
         self.assertIn(str(big), sent[0])
-        self.assertIn("超过 Telegram 发送上限", sent[0])
+        self.assertIn("exceeds Telegram's send limit", sent[0])
 
     def test_smaller_default_limit_still_allows_45mb_uploads(self) -> None:
         app = self.make_app(limit=45 * 1024 * 1024)

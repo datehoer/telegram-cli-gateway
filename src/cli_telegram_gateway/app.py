@@ -32,6 +32,7 @@ from .commands import (
 from .config import Config, ConfigError
 from .formatting import harden_rich_markdown, split_markdown, split_rich_markdown, stream_segment
 from .headless_backend import HeadlessBackend, HeadlessBackendError
+from .i18n import N_, join_items, set_language, tr
 from .models import clear_listing_cache, list_efforts, list_models
 from .sessions import CliSession, SessionError, SessionManager
 from .telegram import TelegramClient, TelegramError
@@ -43,11 +44,13 @@ MAX_PENDING_INPUTS_PER_SESSION = 20
 MAX_PUBLISH_RETRY_SECONDS = 30.0
 STREAM_SEGMENT_UNITS = 1500
 MAX_AUTO_SENT_ARTIFACTS = 3
-PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Telegram sendPhoto 上限
+PHOTO_UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Telegram sendPhoto limit
 
-# 收到的文件按客户端的发送方式落在不同字段（WAV/MP3 常是 audio），全部转交给 CLI。
-# 值是缺 mime_type 时的类型：video_note 没有这个字段，voice 几乎总是 OGG/Opus。
-# GIF 的 animation 为兼容旧客户端同时带 document，所以 document 排第一；贴纸不转交。
+# Incoming files land in different fields depending on how the client sent them
+# (WAV/MP3 are often audio); all of them go to the CLI. Values are the type to use
+# when mime_type is missing: video_note has no such field and voice is almost always
+# OGG/Opus. A GIF animation also carries a document for old clients, so document comes
+# first. Stickers are not forwarded.
 TELEGRAM_FILE_FIELDS = {
     "document": "application/octet-stream",
     "audio": "application/octet-stream",
@@ -57,21 +60,23 @@ TELEGRAM_FILE_FIELDS = {
     "video_note": "video/mp4",
 }
 
-# 客户端把超过 4096 字符（按 UTF-16 计）的长文本拆成多条消息，没有 media_group_id
-# 之类的分组标记。Telegram Desktop 在 2048~4096 之间挑段落/换行/空格断开，Android
-# 在 4096 处硬切；服务端会去掉每段首尾的空白，片段也常常分几个 getUpdates 批次到达。
-# 这里把它们拼回一条输入，否则后半段会变成 steer（追加）或排队。
+# Clients split text over 4096 UTF-16 units into several messages with no grouping
+# marker such as media_group_id. Telegram Desktop breaks between 2048 and 4096 at a
+# paragraph, newline or space; Android cuts hard at 4096. The server strips whitespace
+# around each part, and parts often arrive in separate getUpdates batches. They are
+# joined back into one input, or the later parts would become a steer or a queued turn.
 TELEGRAM_TEXT_MAX_CHARS = 4096
 TEXT_FRAGMENT_MIN_CHARS = 2000
 TEXT_FRAGMENT_MAX_PARTS = 24
-# 拼好的文本经 argv 交给 claude/grok/pi，Linux 单个参数上限 128 KiB。
+# The joined text reaches claude/grok/pi through argv; Linux caps one argument at 128 KiB.
 TEXT_FRAGMENT_MAX_TOTAL_BYTES = 100_000
-# 批次末尾像未完的片段时，轮询线程先等后续片段，安静这么久或到总上限才分发。
+# When a batch ends like an unfinished part, the poller waits for more parts and dispatches
+# after this much quiet or the total cap.
 TEXT_FRAGMENT_POLL_SECONDS = 0.25
 TEXT_FRAGMENT_QUIET_SECONDS = 1.5
 TEXT_FRAGMENT_MAX_WAIT_SECONDS = 10.0
 
-# 会话状态（展示用，事件驱动；busy 判定仍是运行逻辑的权威）
+# Session state for display, driven by events; the busy check stays authoritative for logic.
 STATE_IDLE = "idle"
 STATE_WORKING = "working"
 STATE_BLOCKED = "blocked"
@@ -79,75 +84,76 @@ STATE_FAILED = "failed"
 STATE_INTERRUPTED = "interrupted"
 
 STATE_LABELS = {
-    STATE_WORKING: "🟡 运行中",
-    STATE_BLOCKED: "🔴 等待",
-    STATE_FAILED: "⚫ 上次失败",
-    STATE_INTERRUPTED: "🔴 已中断待恢复",
-    STATE_IDLE: "🟢 空闲",
+    STATE_WORKING: N_("🟡 Running"),
+    STATE_BLOCKED: N_("🔴 Waiting"),
+    STATE_FAILED: N_("⚫ Last run failed"),
+    STATE_INTERRUPTED: N_("🔴 Interrupted, awaiting recovery"),
+    STATE_IDLE: N_("🟢 Idle"),
 }
 
-# 恢复时作为新的用户输入发给 CLI（headless 后端按 turn_count 自动进入 resume 模式）
+# Sent to the CLI as new user input on recovery (headless backends resume by turn_count).
 RESUME_PROMPT = (
-    "【任务恢复】你上次的任务因网关重启或进程被中断而未完成。"
-    "请先查看之前的上下文，继续完成未完成的工作；"
-    "如果任务实际上已经完成，请直接说明结果，不要重复执行已完成或可能产生副作用的步骤。"
+    "[Task recovery] Your previous task did not finish because the gateway restarted or "
+    "the process was interrupted. Review the earlier context first, then continue the "
+    "unfinished work. If the task actually finished, state the result directly and do not "
+    "repeat steps that already ran or may have side effects."
 )
 
-HELP_TEXT = """远程 CLI 网关
+HELP_TEXT = N_("""Remote CLI gateway
 
-/new [cli] [目录]  新建会话；无参数时点选 CLI
-/use <会话ID|cli>  切换；该 CLI 无会话时自动新建
-/back               回到上一个会话
-/sessions           查看会话列表
-/tasks              查看当前任务与等待队列
-/tgstats            查看 Telegram 写入与限流统计
-/where              查看当前会话和目录
-/status             查看 CLI 状态、上下文用量与账户额度
-/context            查看上下文用量与剩余空间
-/interrupt          中断当前任务
-/resume [会话]      继续上次被中断的任务
-/cancel [会话]      放弃上次被中断的任务
-/compact            压缩当前会话上下文（Codex、Pi）
-/clear              当前会话开新对话，清空上下文
-/reload [current|all] 重载当前会话或全部 CLI
-/stop [会话ID|cli]  停止会话
-/rename [会话] 名称  重命名会话
-/archive [会话]     归档会话
-/delete [会话]      删除会话（需确认）
-/model [名称]       查看或切换当前会话模型
-/effort [级别]      查看或切换推理力度
-/send <文本>        显式发送给当前 CLI
-/commands           列出直连命令扩展
-/help               查看帮助
+/new [cli] [dir]       New session; without arguments, pick a CLI
+/use <session-id|cli>  Switch; creates a session if that CLI has none
+/back                  Return to the previous session
+/sessions              List sessions
+/tasks                 Show running tasks and queues
+/tgstats               Show Telegram write and rate-limit stats
+/where                 Show the current session and directory
+/status                Show CLI status, context usage and account quota
+/context               Show context usage and space left
+/interrupt             Interrupt the current task
+/resume [session]      Continue the last interrupted task
+/cancel [session]      Give up the last interrupted task
+/compact               Compact the current session's context (Codex, Pi)
+/clear                 Start a new conversation and clear the context
+/reload [current|all]  Reload the current session's CLI or all CLIs
+/stop [session-id|cli] Stop a session
+/rename [session] <name>  Rename a session
+/archive [session]     Archive a session
+/delete [session]      Delete a session (asks to confirm)
+/model [name]          Show or switch the current session's model
+/effort [level]        Show or switch the reasoning effort
+/send <text>           Send text to the current CLI explicitly
+/commands              List direct command extensions
+/help                  Show this help
 
-支持的 CLI：claude、codex、grok、pi。
-普通文本、文件和图片会直接交给当前会话。所有 CLI 均已启用免审批模式。
-直连命令扩展（/commands 查看）不调用 AI，也不占用会话上下文。"""
+CLIs enabled for this bot: {clis}.
+Plain text, files and images go straight to the current session. All CLIs run without approval prompts.
+{extensions}""")
 
 BOT_COMMANDS = (
-    ("new", "新建 CLI 会话"),
-    ("use", "切换 CLI 或会话"),
-    ("back", "返回上一个会话"),
-    ("sessions", "列出会话"),
-    ("tasks", "查看任务队列"),
-    ("tgstats", "查看 Telegram API 统计"),
-    ("where", "显示当前会话"),
-    ("status", "查看 CLI 状态与额度"),
-    ("context", "查看上下文用量"),
-    ("interrupt", "中断当前任务"),
-    ("resume", "继续上次被中断的任务"),
-    ("cancel", "放弃上次被中断的任务"),
-    ("compact", "压缩当前会话上下文"),
-    ("clear", "当前会话开新对话"),
-    ("reload", "重载 CLI 后端"),
-    ("stop", "停止会话"),
-    ("rename", "重命名会话"),
-    ("archive", "归档会话"),
-    ("delete", "删除会话"),
-    ("model", "切换当前会话模型"),
-    ("effort", "切换推理力度"),
-    ("commands", "列出直连命令扩展"),
-    ("help", "显示帮助"),
+    ("new", N_("Create a CLI session")),
+    ("use", N_("Switch CLI or session")),
+    ("back", N_("Return to the previous session")),
+    ("sessions", N_("List sessions")),
+    ("tasks", N_("Show the task queue")),
+    ("tgstats", N_("Show Telegram API stats")),
+    ("where", N_("Show the current session")),
+    ("status", N_("Show CLI status and quota")),
+    ("context", N_("Show context usage")),
+    ("interrupt", N_("Interrupt the current task")),
+    ("resume", N_("Continue the last interrupted task")),
+    ("cancel", N_("Give up the last interrupted task")),
+    ("compact", N_("Compact the session context")),
+    ("clear", N_("Start a new conversation")),
+    ("reload", N_("Reload CLI backends")),
+    ("stop", N_("Stop a session")),
+    ("rename", N_("Rename a session")),
+    ("archive", N_("Archive a session")),
+    ("delete", N_("Delete a session")),
+    ("model", N_("Switch the session model")),
+    ("effort", N_("Switch the reasoning effort")),
+    ("commands", N_("List direct command extensions")),
+    ("help", N_("Show help")),
 )
 
 BUILTIN_COMMANDS = frozenset(name for name, _description in BOT_COMMANDS)
@@ -209,21 +215,21 @@ class PendingInput:
 
 def _command_help_section(commands: tuple[DirectCommand, ...]) -> str:
     if not commands:
-        return "当前未安装直连命令扩展。把扩展目录放进 extensions/ 或配置 COMMAND_DIR。"
-    lines = ["直连命令扩展", ""]
+        return tr("No direct command extensions are installed. Put an extension directory in extensions/ or set COMMAND_DIR.")
+    lines = [tr("Direct command extensions"), ""]
     lines.extend(command.help_line() for command in commands)
     lines.append("")
-    lines.append("这些命令直接在本机执行，不调用 AI，也不进入会话上下文。")
+    lines.append(tr("These commands run on this machine without calling an AI or entering session context."))
     return "\n".join(lines)
 
 
 def _utf16_len(text: str) -> int:
-    """Telegram 按 UTF-16 码元计文本长度，emoji 等算两个。"""
+    """Telegram measures text in UTF-16 code units; emoji and similar count as two."""
     return len(text.encode("utf-16-le")) // 2
 
 
 def _file_field(message: dict[str, Any]) -> str | None:
-    """消息里携带单个文件的字段名；照片（多尺寸列表）单独处理。"""
+    """The message field that carries a single file; photos (a list of sizes) are handled apart."""
     return next(
         (field for field in TELEGRAM_FILE_FIELDS if isinstance(message.get(field), dict)),
         None,
@@ -231,10 +237,11 @@ def _file_field(message: dict[str, Any]) -> str | None:
 
 
 def _fragment_separator(previous: str, following: str, multiline: bool) -> str:
-    """补回断点处被服务端去掉的空白。
+    """Restore the whitespace the server stripped at a split point.
 
-    恰好 4096 的片段是硬切（Android），断点可能落在词中间，原样相接；其余是客户端
-    在空白处断开的（Desktop 优先段落和换行），多行文本补换行，单行文本补空格。
+    A part of exactly 4096 units is a hard cut (Android) that may fall mid-word, so it is
+    joined as is. Other parts were split at whitespace by the client (Desktop prefers
+    paragraphs and newlines): multi-line text gets a newline back, single-line text a space.
     """
     if previous[-1:].isspace() or following[:1].isspace():
         return ""
@@ -246,6 +253,7 @@ def _fragment_separator(previous: str, following: str, multiline: bool) -> str:
 class GatewayApp:
     def __init__(self, config: Config):
         self.config = config
+        set_language(config.language)
         self._telegrams: dict[str, TelegramClient] = {}
         for bot_key, token in config.telegram_bots:
             metrics_name = (
@@ -355,13 +363,13 @@ class GatewayApp:
         if session.model:
             return session.model
         configured = self.config.default_model_for(session.cli)
-        return f"{configured}（网关默认）" if configured else "CLI 默认"
+        return tr("{value} (gateway default)", value=configured) if configured else tr("CLI default")
 
     def _effort_display(self, session: CliSession) -> str:
         if session.effort:
             return session.effort
         configured = self.config.default_effort_for(session.cli)
-        return f"{configured}（网关默认）" if configured else "CLI 默认"
+        return tr("{value} (gateway default)", value=configured) if configured else tr("CLI default")
 
     def _model_header_label(self, session: CliSession) -> str:
         if session.model:
@@ -418,54 +426,51 @@ class GatewayApp:
             key=lambda item: (-item[1], item[0]),
         )[:5]
         lines = [
-            f"Telegram 写入统计（UTC {snapshot['utc_day']}）",
-            (
-                "今日成功写入："
-                f"新消息 {today['new_messages']} · "
-                f"编辑 {today['message_edits']} · "
-                f"其他 {today['other_writes']}"
+            tr("Telegram write stats (UTC {day})", day=snapshot["utc_day"]),
+            tr(
+                "Successful writes today: {new} new messages · {edits} edits · {other} other",
+                new=today["new_messages"], edits=today["message_edits"], other=today["other_writes"],
             ),
-            (
-                f"今日请求：成功 {today['successful_requests']} · "
-                f"失败 {today['failed_requests']} · "
-                f"429 {today['rate_limited']} · "
-                f"本地延后 {today['local_deferrals']}"
+            tr(
+                "Requests today: {ok} succeeded · {failed} failed · {limited} rate-limited (429) · {deferred} deferred locally",
+                ok=today["successful_requests"], failed=today["failed_requests"],
+                limited=today["rate_limited"], deferred=today["local_deferrals"],
             ),
-            (
-                "近 7 天成功写入："
-                f"新消息 {recent['new_messages']} · "
-                f"编辑 {recent['message_edits']} · "
-                f"其他 {recent['other_writes']} · "
-                f"429 {recent['rate_limited']}"
+            tr(
+                "Successful writes, last 7 days: {new} new messages · {edits} edits · {other} other · {limited} rate-limited (429)",
+                new=recent["new_messages"], edits=recent["message_edits"],
+                other=recent["other_writes"], limited=recent["rate_limited"],
             ),
-            f"当前 flood wait：{snapshot['flood_wait_seconds']} 秒",
+            tr("Current flood wait: {seconds} s", seconds=snapshot["flood_wait_seconds"]),
         ]
         if ranked_methods:
-            lines.append(
-                "今日方法：" + " · ".join(
-                    f"{method} {count}" for method, count in ranked_methods
-                )
-            )
-        lines.append("仅统计 gateway 的实际写调用，不代表 Telegram 官方每日额度。")
+            lines.append(tr(
+                "Methods today: {methods}",
+                methods=" · ".join(f"{method} {count}" for method, count in ranked_methods),
+            ))
+        lines.append(tr("Counts only the gateway's own write calls; this is not Telegram's official daily quota."))
         return "\n".join(lines)
 
     def _current_or_reply(self, chat_id: int) -> CliSession | None:
         session = self._current_session(chat_id)
         if not session:
-            self._send(chat_id, "当前没有活动会话。使用 /new 选择并创建一个。")
+            self._send(chat_id, tr("No active session. Use /new to pick a CLI and create one."))
             return None
         if session.cli not in self.config.enabled_clis:
-            self._send(chat_id, f"此 Bot 未启用 {session.cli}，请新建已启用的 CLI 会话。")
+            self._send(chat_id, tr("{cli} is not enabled for this bot; create a session with an enabled CLI.", cli=session.cli))
             return None
         if not self.sessions.is_alive(session):
-            self._send(chat_id, f"会话 {session.session_id} 已经退出，请创建或切换到其他会话。")
+            self._send(chat_id, tr("Session {session} has exited; create or switch to another session.", session=session.session_id))
             return None
         return session
 
     def _new_session(self, chat_id: int, cli: str, requested_cwd: str | None) -> None:
         cli = cli.lower()
         if cli not in self.config.enabled_clis:
-            self._send(chat_id, f"此 Bot 未启用 {cli}。可选：{', '.join(self.config.enabled_clis)}")
+            self._send(chat_id, tr(
+                "{cli} is not enabled for this bot. Available: {clis}",
+                cli=cli, clis=join_items(self.config.enabled_clis),
+            ))
             return
         try:
             cwd = self.config.resolve_workdir(requested_cwd)
@@ -486,13 +491,16 @@ class GatewayApp:
                     cli, cwd, chat_id, self._active_bot_key()
                 )
         except (CodexBackendError, ConfigError, SessionError) as exc:
-            self._send(chat_id, f"创建失败：{exc}")
+            self._send(chat_id, tr("Could not create the session: {error}", error=exc))
             return
         self._send(
             chat_id,
-            f"已创建并切换到 {session.session_id}\nCLI：{session.cli}\n目录：{session.cwd}"
-            f"\n模型：{self._model_display(session)}\n推理力度：{self._effort_display(session)}"
-            "\n权限：免审批",
+            tr(
+                "Created and switched to {session}\nCLI: {cli}\nDirectory: {cwd}\nModel: {model}"
+                "\nReasoning effort: {effort}\nPermissions: no approval prompts",
+                session=session.session_id, cli=session.cli, cwd=session.cwd,
+                model=self._model_display(session), effort=self._effort_display(session),
+            ),
         )
 
     def _send_new_session_picker(self, chat_id: int) -> None:
@@ -506,7 +514,7 @@ class GatewayApp:
         try:
             self.telegram.send_message(
                 chat_id,
-                f"选择要创建的 CLI：\n默认目录：{self.config.default_workdir}",
+                tr("Pick a CLI for the new session:\nDefault directory: {cwd}", cwd=self.config.default_workdir),
                 reply_markup={"inline_keyboard": buttons},
             )
         except TelegramError:
@@ -518,21 +526,24 @@ class GatewayApp:
         if current and current.cli in self.config.enabled_clis:
             buttons.append(
                 [{
-                    "text": f"当前会话（{current.cli}）",
+                    "text": tr("Current session ({cli})", cli=current.cli),
                     "callback_data": f"reload:{current.session_id}",
                 }]
             )
-        buttons.append([{"text": "全部 CLI", "callback_data": "reload:all"}])
+        buttons.append([{"text": tr("All CLIs"), "callback_data": "reload:all"}])
         detail = (
-            f"当前：{current.label} · {current.cli}\n" if current else "当前没有活动会话。\n"
-        )
+            tr("Current: {label} · {cli}", label=current.label, cli=current.cli) if current
+            else tr("No active session.")
+        ) + "\n"
         try:
             self.telegram.send_message(
                 chat_id,
-                "选择重载范围：\n"
+                tr("Choose what to reload:") + "\n"
                 + detail
-                + "运行中的任务不会被强制中断。Codex 是共享后端，重载一个 Codex 会话会恢复全部 Codex 会话。"
-                "此操作不会重读 .env 或 Gateway 源码。",
+                + tr(
+                    "Running tasks are not interrupted. Codex is a shared backend, so reloading one "
+                    "Codex session resumes every Codex session. This does not reread .env or the gateway source."
+                ),
                 reply_markup={"inline_keyboard": buttons},
             )
         except TelegramError:
@@ -542,20 +553,17 @@ class GatewayApp:
         try:
             return shlex.split(raw_args)
         except ValueError as exc:
-            self._send(chat_id, f"参数格式错误：{exc}")
+            self._send(chat_id, tr("Invalid arguments: {error}", error=exc))
             return None
 
     def _handle_command(self, chat_id: int, command: str, raw_args: str) -> None:
         if command in ("start", "help"):
-            supported = "、".join(self.config.enabled_clis)
             self._send(
                 chat_id,
-                HELP_TEXT.replace(
-                    "支持的 CLI：claude、codex、grok、pi。",
-                    f"此 Bot 启用的 CLI：{supported}。",
-                ).replace(
-                    "直连命令扩展（/commands 查看）不调用 AI，也不占用会话上下文。",
-                    _command_help_section(tuple(self.commands.values())),
+                tr(
+                    HELP_TEXT,
+                    clis=join_items(self.config.enabled_clis),
+                    extensions=_command_help_section(tuple(self.commands.values())),
                 ),
             )
             return
@@ -567,33 +575,33 @@ class GatewayApp:
                 self._send_new_session_picker(chat_id)
                 return
             if len(args) > 2:
-                self._send(chat_id, f"用法：/new <{'|'.join(self.config.enabled_clis)}> [目录]")
+                self._send(chat_id, tr("Usage: /new <{clis}> [dir]", clis="|".join(self.config.enabled_clis)))
                 return
             self._new_session(chat_id, args[0], args[1] if len(args) == 2 else None)
             return
         if command == "use":
             target = raw_args.strip().lower()
             if not target:
-                self._send(chat_id, f"用法：/use <会话ID|{'|'.join(self.config.enabled_clis)}>")
+                self._send(chat_id, tr("Usage: /use <session-id|{clis}>", clis="|".join(self.config.enabled_clis)))
                 return
             session = self.sessions.resolve(chat_id, target)
             if session and session.cli in self.config.enabled_clis:
                 self._switch_session(chat_id, session.session_id)
-                self._send(chat_id, f"已切换到 {session.session_id}\n目录：{session.cwd}")
+                self._send(chat_id, tr("Switched to {session}\nDirectory: {cwd}", session=session.session_id, cwd=session.cwd))
                 self._surface_switched_session(session)
             elif target in self.config.enabled_clis:
                 current = self._current_session(chat_id)
                 self._new_session(chat_id, target, current.cwd if current else None)
             else:
-                self._send(chat_id, f"找不到会话：{target}")
+                self._send(chat_id, tr("Session not found: {target}", target=target))
             return
         if command == "back":
             session = self._back_session(chat_id)
             self._send(
                 chat_id,
-                f"已返回 {session.session_id}\n目录：{session.cwd}"
+                tr("Back to {session}\nDirectory: {cwd}", session=session.session_id, cwd=session.cwd)
                 if session
-                else "没有可返回的活动会话。",
+                else tr("No previous active session to return to."),
             )
             if session:
                 self._surface_switched_session(session)
@@ -623,9 +631,12 @@ class GatewayApp:
             if session:
                 self._send(
                     chat_id,
-                    f"当前：{session.session_id}\nCLI：{session.cli}\n目录：{session.cwd}"
-                    f"\n模型：{self._model_display(session)}"
-                    f"\n推理力度：{self._effort_display(session)}\n权限：免审批",
+                    tr(
+                        "Current: {session}\nCLI: {cli}\nDirectory: {cwd}\nModel: {model}"
+                        "\nReasoning effort: {effort}\nPermissions: no approval prompts",
+                        session=session.session_id, cli=session.cli, cwd=session.cwd,
+                        model=self._model_display(session), effort=self._effort_display(session),
+                    ),
                 )
             return
         if command == "interrupt":
@@ -635,39 +646,43 @@ class GatewayApp:
             try:
                 interrupted = self._interrupt_session(session)
             except (CodexBackendError, SessionError) as exc:
-                self._send(chat_id, f"中断失败：{exc}")
+                self._send(chat_id, tr("Could not interrupt: {error}", error=exc))
                 return
-            self._send(chat_id, f"已中断 {session.session_id}。" if interrupted else "当前没有正在运行的任务。")
+            self._send(
+                chat_id,
+                tr("Interrupted {session}.", session=session.session_id) if interrupted else tr("No task is running."),
+            )
             return
         if command == "resume":
             target = raw_args.strip()
             session = self.sessions.resolve(chat_id, target) if target else self._current_session(chat_id)
             if not session:
-                self._send(chat_id, "找不到要恢复的会话。")
+                self._send(chat_id, tr("No session to resume was found."))
                 return
             if self._session_is_busy(session):
-                self._send(chat_id, f"{session.label} 正在运行，无需恢复。")
+                self._send(chat_id, tr("{session} is running; there is nothing to resume.", session=session.label))
                 return
             if not self.sessions.get_in_flight(session.session_id):
-                self._send(chat_id, f"{session.label} 没有待恢复的任务。")
+                self._send(chat_id, tr("{session} has no task to resume.", session=session.label))
                 return
-            self._send(chat_id, f"正在恢复 {session.label} 的任务…")
+            self._send(chat_id, tr("Resuming {session}'s task…", session=session.label))
             self._start_session_turn(chat_id, session, RESUME_PROMPT)
             return
         if command == "cancel":
             target = raw_args.strip()
             session = self.sessions.resolve(chat_id, target) if target else self._current_session(chat_id)
             if not session:
-                self._send(chat_id, "找不到会话。")
+                self._send(chat_id, tr("Session not found."))
                 return
             if self._session_is_busy(session):
-                self._send(chat_id, f"{session.label} 正在运行，请用 /interrupt 中断。")
+                self._send(chat_id, tr("{session} is running; use /interrupt to stop it.", session=session.label))
                 return
             cleared = self.sessions.clear_in_flight(session.session_id)
             self._set_session_state(session.session_id, STATE_IDLE)
             self._send(
                 chat_id,
-                f"已放弃 {session.label} 的待恢复任务。" if cleared else f"{session.label} 没有待恢复的任务。",
+                tr("Gave up {session}'s interrupted task.", session=session.label) if cleared
+                else tr("{session} has no task to resume.", session=session.label),
             )
             return
         if command == "compact":
@@ -677,7 +692,7 @@ class GatewayApp:
             try:
                 self._compact_session(chat_id, session)
             except (CodexBackendError, HeadlessBackendError, SessionError) as exc:
-                self._send(chat_id, f"压缩失败：{exc}")
+                self._send(chat_id, tr("Compaction failed: {error}", error=exc))
             return
         if command == "clear":
             session = self._current_or_reply(chat_id)
@@ -686,7 +701,7 @@ class GatewayApp:
             try:
                 self._clear_session(chat_id, session)
             except (CodexBackendError, SessionError) as exc:
-                self._send(chat_id, f"清空失败：{exc}")
+                self._send(chat_id, tr("Could not clear: {error}", error=exc))
             return
         if command == "reload":
             target = raw_args.strip().lower()
@@ -694,12 +709,12 @@ class GatewayApp:
                 self._send_reload_picker(chat_id)
                 return
             if target not in {"current", "all"}:
-                self._send(chat_id, "用法：/reload [current|all]")
+                self._send(chat_id, tr("Usage: /reload [current|all]"))
                 return
             try:
                 result = self._reload_cli_backends(chat_id, target)
             except (CodexBackendError, SessionError) as exc:
-                result = f"重载失败：{exc}"
+                result = tr("Reload failed: {error}", error=exc)
             self._send(chat_id, result)
             return
         if command == "model":
@@ -716,7 +731,10 @@ class GatewayApp:
                 refreshed = self.sessions.get(session.session_id) or session
                 self._send(
                     chat_id,
-                    f"{session.label} 模型已设为 {self._model_display(refreshed)}（下次任务生效）。",
+                    tr(
+                        "{session} model set to {model} (applies from the next task).",
+                        session=session.label, model=self._model_display(refreshed),
+                    ),
                 )
             else:
                 self._run_in_background(
@@ -737,7 +755,10 @@ class GatewayApp:
                 refreshed = self.sessions.get(session.session_id) or session
                 self._send(
                     chat_id,
-                    f"{session.label} 推理力度已设为 {self._effort_display(refreshed)}（下次任务生效）。",
+                    tr(
+                        "{session} reasoning effort set to {effort} (applies from the next task).",
+                        session=session.label, effort=self._effort_display(refreshed),
+                    ),
                 )
             else:
                 self._send_effort_picker(chat_id, session)
@@ -746,15 +767,15 @@ class GatewayApp:
             target = raw_args.strip()
             session = self.sessions.resolve(chat_id, target) if target else self._current_session(chat_id)
             if not session:
-                self._send(chat_id, "找不到要停止的会话。")
+                self._send(chat_id, tr("No session to stop was found."))
                 return
             try:
                 self._retire_session(session, delete=True)
             except (CodexBackendError, SessionError):
                 LOGGER.exception("could not interrupt %s before stopping", session.session_id)
-                self._send(chat_id, "停止失败，会话记录已保留，请稍后重试。")
+                self._send(chat_id, tr("Could not stop the session; its record was kept. Try again later."))
                 return
-            self._send(chat_id, f"已停止 {session.session_id}。")
+            self._send(chat_id, tr("Stopped {session}.", session=session.session_id))
             return
         if command == "rename":
             args = self._parse_args(chat_id, raw_args)
@@ -762,7 +783,7 @@ class GatewayApp:
                 return
             current = self._current_session(chat_id)
             if not args or not current:
-                self._send(chat_id, "用法：/rename [会话ID] <新名称>")
+                self._send(chat_id, tr("Usage: /rename [session-id] <new name>"))
                 return
             explicit = self.sessions.get(args[0]) if len(args) > 1 else None
             session = explicit if explicit and explicit.chat_id == chat_id else current
@@ -770,15 +791,15 @@ class GatewayApp:
             try:
                 renamed = self.sessions.rename(session.session_id, " ".join(name_parts))
             except SessionError as exc:
-                self._send(chat_id, f"重命名失败：{exc}")
+                self._send(chat_id, tr("Rename failed: {error}", error=exc))
                 return
-            self._send(chat_id, f"已将 {renamed.session_id} 重命名为「{renamed.label}」。")
+            self._send(chat_id, tr("Renamed {session} to “{name}”.", session=renamed.session_id, name=renamed.label))
             return
         if command == "archive":
             target = raw_args.strip()
             session = self.sessions.resolve(chat_id, target) if target else self._current_session(chat_id)
             if not session:
-                self._send(chat_id, "找不到要归档的会话。")
+                self._send(chat_id, tr("No session to archive was found."))
                 return
             self._archive_session(chat_id, session)
             return
@@ -786,13 +807,13 @@ class GatewayApp:
             target = raw_args.strip()
             session = self._session_for_management(chat_id, target)
             if not session:
-                self._send(chat_id, "找不到要删除的会话。")
+                self._send(chat_id, tr("No session to delete was found."))
                 return
             self._send_delete_confirmation(chat_id, session)
             return
         if command == "send":
             if not raw_args:
-                self._send(chat_id, "用法：/send <要发送给当前 CLI 的文本>")
+                self._send(chat_id, tr("Usage: /send <text for the current CLI>"))
                 return
             self._send_to_current(chat_id, raw_args)
             return
@@ -802,28 +823,29 @@ class GatewayApp:
         if command in self.commands:
             self._start_direct_command(chat_id, command, raw_args)
             return
-        self._send(chat_id, "未知命令。使用 /help 查看可用命令。")
+        self._send(chat_id, tr("Unknown command. Use /help to see the available commands."))
 
     def _commands_view(self) -> str:
         if not self.commands:
-            return (
-                "当前未安装直连命令扩展。\n"
-                "把扩展目录放到 extensions/，或配置 COMMAND_DIR。"
+            return tr(
+                "No direct command extensions are installed.\n"
+                "Put an extension directory in extensions/ or set COMMAND_DIR."
             )
-        lines = ["直连命令扩展（不调用 AI）", ""]
+        lines = [tr("Direct command extensions (no AI)"), ""]
         for command in sorted(self.commands.values(), key=lambda item: item.command):
-            detail = command.description or command.name
-            lines.append(f"/{command.command} · {command.name}")
-            lines.append(f"  用法：{command.usage_text()}")
-            lines.append(f"  说明：{detail}")
-            lines.append(f"  目录：{command.cwd}")
-            lines.append(f"  定义：{command.manifest_path}")
+            detail = command.display_description() or command.display_name()
+            lines.append(f"/{command.command} · {command.display_name()}")
+            lines.append(tr("  Usage: {usage}", usage=command.usage_text()))
+            lines.append(tr("  About: {detail}", detail=detail))
+            lines.append(tr("  Directory: {cwd}", cwd=command.cwd))
+            lines.append(tr("  Manifest: {path}", path=command.manifest_path))
         return "\n".join(lines)
 
     def _start_direct_command(self, chat_id: int, command_name: str, raw_args: str) -> None:
-        # 直接命令不做 shell 分词：整段原文交给扩展自己解析（argv[0] 在 TG_ARGV0，
-        # 其余每个换行分隔的非空行是一个参数）。shlex 会因为 Cookie、JSON、r'' 这类
-        # 内容里的引号直接报 "No closing quotation"，而那些字符在这里是数据不是语法。
+        # Direct commands skip shell tokenizing: the extension parses the raw text itself
+        # (argv[0] is in TG_ARGV0; every other non-empty line is one argument). shlex fails
+        # with "No closing quotation" on quotes inside cookies, JSON or r'' strings, which
+        # are data here, not syntax.
         args = [line.strip() for line in raw_args.strip().splitlines()]
         args = [line for line in args if line]
         try:
@@ -866,7 +888,7 @@ class GatewayApp:
             LOGGER.exception("could not send task controls to chat %s", chat_id)
 
     def _tasks_view(self, chat_id: int) -> tuple[str, dict[str, Any]]:
-        lines = ["任务状态："]
+        lines = [tr("Tasks:")]
         buttons: list[list[dict[str, str]]] = []
         found = False
         for session in self.sessions.list_for_chat(chat_id):
@@ -876,25 +898,28 @@ class GatewayApp:
             if busy or queued:
                 found = True
                 lines.append(
-                    f"• {session.label} ({session.session_id})：{self._session_status_text(session)}"
+                    tr(
+                        "• {session} ({id}): {status}",
+                        session=session.label, id=session.session_id, status=self._session_status_text(session),
+                    )
                 )
                 if busy:
                     row = [{
-                        "text": f"中断 {session.label}",
+                        "text": tr("Interrupt {session}", session=session.label),
                         "callback_data": f"taskinterrupt:{session.session_id}",
                     }]
                     if queued:
                         row.append({
-                            "text": "中断并清空",
+                            "text": tr("Interrupt and clear the queue"),
                             "callback_data": f"stopqueue:{session.session_id}",
                         })
                     buttons.append(row)
                 if queued:
                     buttons.append([{
-                        "text": f"清空 {session.label} 的 {queued} 条等待",
+                        "text": tr("Clear {count} queued for {session}", count=queued, session=session.label),
                         "callback_data": f"clearqueue:{session.session_id}",
                     }])
-        text = "\n".join(lines) if found else "当前没有运行中或排队的任务。"
+        text = "\n".join(lines) if found else tr("No tasks are running or queued.")
         return text, {"inline_keyboard": buttons}
 
     def _clear_queue(self, session_id: str) -> int:
@@ -907,9 +932,9 @@ class GatewayApp:
             self._retire_session(session, delete=False)
         except (CodexBackendError, SessionError):
             LOGGER.exception("could not interrupt %s before archiving", session.session_id)
-            self._send(chat_id, "归档失败，会话记录已保留，请稍后重试。")
+            self._send(chat_id, tr("Could not archive the session; its record was kept. Try again later."))
             return
-        self._send(chat_id, f"已归档 {session.label}。用 /sessions all 查看或恢复。")
+        self._send(chat_id, tr("Archived {session}. Use /sessions all to view or restore it.", session=session.label))
 
     def _retire_session(self, session: CliSession, *, delete: bool) -> None:
         # A queue worker may already be waiting to start. Serialize with startup,
@@ -936,14 +961,14 @@ class GatewayApp:
     def _send_delete_confirmation(self, chat_id: int, session: CliSession) -> None:
         markup = {
             "inline_keyboard": [[
-                {"text": "确认删除", "callback_data": f"delete!:{session.session_id}"},
-                {"text": "取消", "callback_data": f"cancel:{session.session_id}"},
+                {"text": tr("Delete"), "callback_data": f"delete!:{session.session_id}"},
+                {"text": tr("Cancel"), "callback_data": f"cancel:{session.session_id}"},
             ]]
         }
         try:
             self.telegram.send_message(
                 chat_id,
-                f"确认永久删除会话 {session.label}（{session.session_id}）？",
+                tr("Permanently delete session {session} ({id})?", session=session.label, id=session.session_id),
                 reply_markup=markup,
             )
         except TelegramError:
@@ -968,16 +993,16 @@ class GatewayApp:
             self._session_states[session_id] = state
 
     def _session_status_text(self, session: CliSession) -> str:
-        """会话状态的展示文本：🟡 运行中 / 🟢 空闲 / ⚫ 上次失败 / 🔴 等待，附排队数。"""
+        """Session state for display (running, idle, last run failed, waiting) plus the queue length."""
         with self._state_lock:
             state = self._session_states.get(session.session_id)
             queued = len(self._queues.get(session.session_id, ()))
         if state is None:
-            # 旧会话/未初始化：回退到实时 busy 判定
+            # Older or uninitialized session: fall back to the live busy check.
             state = STATE_WORKING if self._session_is_busy(session) else STATE_IDLE
-        text = STATE_LABELS.get(state, STATE_LABELS[STATE_IDLE])
+        text = tr(STATE_LABELS.get(state, STATE_LABELS[STATE_IDLE]))
         if queued:
-            text += f" · 排队 {queued}"
+            text += tr(" · {count} queued", count=queued)
         return text
 
     def _send_session_diagnostics(self, chat_id: int, session: CliSession, full: bool) -> None:
@@ -1014,15 +1039,15 @@ class GatewayApp:
                 claude_quota = diagnostics.get("quota_lines") or []
             except HeadlessBackendError:
                 claude_context_unavailable = True
-                claude_quota = ["账户额度：暂时无法查询，请稍后重试。"]
+                claude_quota = [tr("Account quota: temporarily unavailable; try again later.")]
             session = self.sessions.get(session.session_id) or session
-        lines = [f"{session.label}（{session.session_id}） · {session.cli}"]
+        lines = [tr("{session} ({id}) · {cli}", session=session.label, id=session.session_id, cli=session.cli)]
         if full:
             lines.extend([
-                f"状态：{self._session_status_text(session)}",
-                f"目录：{session.cwd}",
-                f"模型：{self._model_display(session)}",
-                f"推理力度：{self._effort_display(session)}",
+                tr("Status: {status}", status=self._session_status_text(session)),
+                tr("Directory: {cwd}", cwd=session.cwd),
+                tr("Model: {model}", model=self._model_display(session)),
+                tr("Reasoning effort: {effort}", effort=self._effort_display(session)),
             ])
             with self._state_lock:
                 view = next((
@@ -1030,26 +1055,32 @@ class GatewayApp:
                     if session_id == session.session_id and view.status == "running"
                 ), None)
                 if view:
-                    lines.append(f"当前任务：已运行 {max(0, int(time.monotonic() - view.started_at))}秒")
+                    lines.append(tr(
+                        "Current task: running for {seconds} s",
+                        seconds=max(0, int(time.monotonic() - view.started_at)),
+                    ))
                     if (
                         view.model_label != self._model_header_label(session)
                         or view.effort_label != self._effort_header_label(session)
                     ):
-                        lines.append(f"当前任务模型：{view.model_label} · 推理力度：{view.effort_label}")
+                        lines.append(tr(
+                            "Current task model: {model} · reasoning effort: {effort}",
+                            model=view.model_label, effort=view.effort_label,
+                        ))
         lines.extend(context_lines(session.usage))
         if claude_context_unavailable:
-            lines.append("Claude 原生窗口查询暂时不可用，当前显示已保存数据。")
+            lines.append(tr("The native Claude context query is unavailable right now; showing saved data."))
         if full:
             lines.extend(usage_lines(session.usage))
             if session.backend == "codex-app-server":
                 try:
                     lines.extend(quota_lines(self.codex.read_rate_limits()))
                 except CodexBackendError:
-                    lines.append("账户额度：暂时无法查询，请稍后重试。")
+                    lines.append(tr("Account quota: temporarily unavailable; try again later."))
             elif session.cli == "claude" and session.backend == "headless-json":
-                lines.extend(claude_quota or ["账户额度：Claude 未返回额度数据。"])
+                lines.extend(claude_quota or [tr("Account quota: Claude returned no quota data.")])
             else:
-                lines.append(f"账户额度：{session.cli} 当前接入方式未提供额度查询。")
+                lines.append(tr("Account quota: {cli} offers no quota query through this integration.", cli=session.cli))
         return "\n".join(lines)
 
     def _surface_switched_session(self, session: CliSession) -> None:
@@ -1057,7 +1088,7 @@ class GatewayApp:
             self._surface_switched_session_locked(session)
 
     def _surface_switched_session_locked(self, session: CliSession) -> None:
-        """切回 session 时把它当前最有用的状态放到聊天底部。"""
+        """When switching back to a session, put its most useful current state at the bottom of the chat."""
         bot_key = self._active_bot_key()
         with self._state_lock:
             pending_views = [
@@ -1074,7 +1105,7 @@ class GatewayApp:
                 None,
             )
             if source_view and source_view.status == "running" and source_view.bot_key == bot_key:
-                # 发起入口的运行态由 status pump 重新钉住。
+                # The status pump re-pins the running state for the bot that started it.
                 return
             if source_view and source_view.bot_key != bot_key:
                 rendered, _answer = self._render_turn(source_view, time.monotonic())
@@ -1083,7 +1114,7 @@ class GatewayApp:
             for view in pending_views:
                 if view.bot_key != bot_key:
                     continue
-                # CLI 已结束但终态尚未发布：强制下一轮在底部发新卡片。
+                # The CLI finished but its final state is unpublished: force a new card at the bottom.
                 self._abandon_view_cards(view)
                 view.dirty = True
         if rendered is not None:
@@ -1162,49 +1193,49 @@ class GatewayApp:
                     )
                     return
 
-        self._send(session.chat_id, f"[{session.session_id}] · 有什么可以帮你？")
+        self._send(session.chat_id, tr("[{session}] · How can I help?", session=session.session_id))
 
     def _sessions_view(
         self, chat_id: int, include_archived: bool = False
     ) -> tuple[str, dict[str, Any]]:
         current = self._current_session(chat_id)
         sessions = self.sessions.list_for_chat(chat_id, include_archived=include_archived)
-        lines = ["会话列表（点击按钮切换）："]
+        lines = [tr("Sessions (tap a button to switch):")]
         buttons: list[list[dict[str, str]]] = []
         for session in sessions:
             selected = bool(current and current.session_id == session.session_id)
             marker = "▶" if selected else " "
             if session.archived:
-                status = "已归档"
+                status = tr("Archived")
             else:
                 status = self._session_status_text(session)
                 if not self.sessions.is_alive(session):
-                    status += " · 已退出"
+                    status += tr(" · exited")
             identity = session.label
             if session.display_name:
                 identity += f" ({session.session_id})"
             lines.append(f"{marker} {identity} · {status}\n    {session.cwd}")
             if session.archived:
                 buttons.append([
-                    {"text": f"恢复 {session.label}", "callback_data": f"restore:{session.session_id}"},
-                    {"text": "删除", "callback_data": f"delete?:{session.session_id}"},
+                    {"text": tr("Restore {session}", session=session.label), "callback_data": f"restore:{session.session_id}"},
+                    {"text": tr("Delete…"), "callback_data": f"delete?:{session.session_id}"},
                 ])
             elif self.sessions.is_alive(session):
                 label = f"✓ {session.label}" if selected else session.label
                 row = [{"text": label, "callback_data": f"use:{session.session_id}"}]
                 if self._session_is_busy(session):
-                    row.append({"text": "中断", "callback_data": f"interrupt:{session.session_id}"})
+                    row.append({"text": tr("Interrupt"), "callback_data": f"interrupt:{session.session_id}"})
                 buttons.append(row)
                 buttons.append([
-                    {"text": "归档", "callback_data": f"archive:{session.session_id}"},
-                    {"text": "删除", "callback_data": f"delete?:{session.session_id}"},
+                    {"text": tr("Archive"), "callback_data": f"archive:{session.session_id}"},
+                    {"text": tr("Delete…"), "callback_data": f"delete?:{session.session_id}"},
                 ])
         return "\n".join(lines), {"inline_keyboard": buttons}
 
     def _send_sessions(self, chat_id: int, include_archived: bool = False) -> None:
         sessions = self.sessions.list_for_chat(chat_id, include_archived=include_archived)
         if not sessions:
-            self._send(chat_id, "目前没有会话。")
+            self._send(chat_id, tr("There are no sessions yet."))
             return
         text, markup = self._sessions_view(chat_id, include_archived=include_archived)
         try:
@@ -1216,8 +1247,8 @@ class GatewayApp:
         models = list_models(session.cli, self.config.cli_commands[session.cli])
         current = self._effective_model(session)
         lines = [
-            f"{session.label} · 当前模型：{self._model_display(session)}",
-            "点击切换（下次任务生效）：",
+            tr("{session} · current model: {model}", session=session.label, model=self._model_display(session)),
+            tr("Tap to switch (applies from the next task):"),
         ]
         buttons: list[list[dict[str, str]]] = []
         for model in models:
@@ -1226,10 +1257,10 @@ class GatewayApp:
                 "text": f"{marker}{model}"[:64],
                 "callback_data": f"model:{session.session_id}:{self._model_choice_id(model)}",
             }])
-        reset_label = "恢复网关默认" if self.config.default_model_for(session.cli) else "恢复默认"
+        reset_label = tr("Restore gateway default") if self.config.default_model_for(session.cli) else tr("Restore default")
         buttons.append([{"text": reset_label, "callback_data": f"modelclear:{session.session_id}"}])
         if not models:
-            lines.append("该 CLI 无法列出模型，请直接 /model <名称>。")
+            lines.append(tr("This CLI cannot list its models; use /model <name> directly."))
         return "\n".join(lines), {"inline_keyboard": buttons}
 
     @staticmethod
@@ -1241,8 +1272,8 @@ class GatewayApp:
         efforts = list_efforts(session.cli)
         current = self._effective_effort(session)
         lines = [
-            f"{session.label} · 当前推理力度：{self._effort_display(session)}",
-            "点击切换（下次任务生效）：",
+            tr("{session} · current reasoning effort: {effort}", session=session.label, effort=self._effort_display(session)),
+            tr("Tap to switch (applies from the next task):"),
         ]
         buttons: list[list[dict[str, str]]] = []
         for index, effort in enumerate(efforts):
@@ -1251,10 +1282,10 @@ class GatewayApp:
                 "text": f"{marker}{effort}",
                 "callback_data": f"effort:{session.session_id}:{index}",
             }])
-        reset_label = "恢复网关默认" if self.config.default_effort_for(session.cli) else "恢复默认"
+        reset_label = tr("Restore gateway default") if self.config.default_effort_for(session.cli) else tr("Restore default")
         buttons.append([{"text": reset_label, "callback_data": f"effortclear:{session.session_id}"}])
         if not efforts:
-            lines.append("该 CLI 不支持手动设置推理力度。")
+            lines.append(tr("This CLI does not support setting the reasoning effort."))
         return "\n".join(lines), {"inline_keyboard": buttons}
 
     def _send_model_picker(self, chat_id: int, session: CliSession) -> None:
@@ -1290,13 +1321,13 @@ class GatewayApp:
             or (chat_type != "private" and not self.config.allow_groups)
         ):
             try:
-                self.telegram.answer_callback_query(query_id, "没有权限")
+                self.telegram.answer_callback_query(query_id, tr("Not allowed"))
             except TelegramError:
                 pass
             return
         if not isinstance(data, str) or ":" not in data:
             try:
-                self.telegram.answer_callback_query(query_id, "未知操作")
+                self.telegram.answer_callback_query(query_id, tr("Unknown action"))
             except TelegramError:
                 pass
             return
@@ -1304,17 +1335,17 @@ class GatewayApp:
         if action == "new":
             if target not in self.config.enabled_clis:
                 try:
-                    self.telegram.answer_callback_query(query_id, "CLI 已失效，请重新 /new")
+                    self.telegram.answer_callback_query(query_id, tr("That CLI is no longer available; use /new again"))
                 except TelegramError:
                     pass
                 return
             try:
-                self.telegram.answer_callback_query(query_id, f"正在创建 {target}")
+                self.telegram.answer_callback_query(query_id, tr("Creating {cli}", cli=target))
             except TelegramError:
                 LOGGER.exception("could not answer new-session callback for chat %s", chat_id)
             if isinstance(message_id, int):
                 try:
-                    self.telegram.edit_message(chat_id, message_id, f"已选择 {target}，正在创建…")
+                    self.telegram.edit_message(chat_id, message_id, tr("Picked {cli}; creating…", cli=target))
                 except TelegramError:
                     LOGGER.exception("could not close new-session picker for chat %s", chat_id)
             self._new_session(chat_id, target, None)
@@ -1322,13 +1353,13 @@ class GatewayApp:
 
         if action == "reload":
             try:
-                self.telegram.answer_callback_query(query_id, "正在重载")
+                self.telegram.answer_callback_query(query_id, tr("Reloading"))
             except TelegramError:
                 LOGGER.exception("could not answer reload callback for chat %s", chat_id)
             try:
                 result = self._reload_cli_backends(chat_id, target)
             except (CodexBackendError, SessionError) as exc:
-                result = f"重载失败：{exc}"
+                result = tr("Reload failed: {error}", error=exc)
             try:
                 if isinstance(message_id, int):
                     self.telegram.edit_message(chat_id, message_id, result)
@@ -1343,31 +1374,31 @@ class GatewayApp:
                 chat_id, target, self._active_bot_key()
             )
             if not resolved:
-                self.telegram.answer_callback_query(query_id, "文件已失效")
+                self.telegram.answer_callback_query(query_id, tr("This file is no longer available"))
                 return
             _session, path = resolved
             try:
                 path = self._validated_local_file(path)
             except (OSError, ValueError) as exc:
                 LOGGER.warning("artifact send failed: %s", exc)
-                self._send(chat_id, f"发送文件失败：{exc}")
+                self._send(chat_id, tr("Could not send the file: {error}", error=exc))
                 return
             with self._state_lock:
                 uploading = target in self._artifact_uploads
                 self._artifact_uploads.add(target)
             if uploading:
                 try:
-                    self.telegram.answer_callback_query(query_id, "正在发送，请稍候")
+                    self.telegram.answer_callback_query(query_id, tr("Already sending; please wait"))
                 except TelegramError:
                     pass
                 return
             try:
-                self.telegram.answer_callback_query(query_id, "正在发送")
+                self.telegram.answer_callback_query(query_id, tr("Sending"))
             except TelegramError as exc:
                 with self._state_lock:
                     self._artifact_uploads.discard(target)
                 LOGGER.warning("artifact send failed: %s", exc)
-                self._send(chat_id, f"发送文件失败：{exc}")
+                self._send(chat_id, tr("Could not send the file: {error}", error=exc))
                 return
             self._run_in_background(
                 f"artifact-{target}", self._send_artifact_file, chat_id, target, path, action
@@ -1375,13 +1406,13 @@ class GatewayApp:
             return
 
         if action == "sendpath":
-            # 超过 Bot API 上传上限的产物没法当文件发，只能回一个本机路径。
+            # An artifact over the Bot API upload limit cannot be sent as a file; return its local path.
             resolved = self.sessions.resolve_artifact(chat_id, target, self._active_bot_key())
             if not resolved:
-                self.telegram.answer_callback_query(query_id, "路径已失效")
+                self.telegram.answer_callback_query(query_id, tr("This path is no longer available"))
                 return
             try:
-                self.telegram.answer_callback_query(query_id, "已发送路径")
+                self.telegram.answer_callback_query(query_id, tr("Path sent"))
             except TelegramError:
                 pass
             path = resolved[1]
@@ -1391,9 +1422,12 @@ class GatewayApp:
                 size = 0
             self._send(
                 chat_id,
-                f"产物超过 Telegram 发送上限，这里只给本机路径：\n`{path}`\n"
-                f"大小 {size / (1024 * 1024):.1f} MiB / 上限 "
-                f"{self.config.telegram_max_file_bytes / (1024 * 1024):.0f} MiB",
+                tr(
+                    "The artifact exceeds Telegram's send limit, so here is its local path:\n`{path}`\n"
+                    "Size {size:.1f} MiB / limit {limit:.0f} MiB",
+                    path=path, size=size / (1024 * 1024),
+                    limit=self.config.telegram_max_file_bytes / (1024 * 1024),
+                ),
             )
             return
 
@@ -1405,19 +1439,22 @@ class GatewayApp:
                 session_id, index = target, -1
             session = self.sessions.get(session_id)
             if not session or session.chat_id != chat_id:
-                self.telegram.answer_callback_query(query_id, "会话已失效")
+                self.telegram.answer_callback_query(query_id, tr("Session expired"))
                 return
             if action == "modelclear":
                 self.sessions.set_model(session_id, None)
                 default_model = self.config.default_model_for(session.cli)
-                notice = f"已恢复网关默认模型 {default_model}" if default_model else "已恢复默认模型"
+                notice = (
+                    tr("Restored the gateway default model {model}", model=default_model) if default_model
+                    else tr("Restored the default model")
+                )
             elif action == "effortclear":
                 self.sessions.set_effort(session_id, None)
                 default_effort = self.config.default_effort_for(session.cli)
                 notice = (
-                    f"已恢复网关默认推理力度 {default_effort}"
+                    tr("Restored the gateway default reasoning effort {effort}", effort=default_effort)
                     if default_effort
-                    else "已恢复默认推理力度"
+                    else tr("Restored the default reasoning effort")
                 )
             elif action == "model":
                 models = list_models(session.cli, self.config.cli_commands[session.cli])
@@ -1425,17 +1462,17 @@ class GatewayApp:
                 if len(selected) == 1:
                     value = selected[0]
                     self.sessions.set_model(session_id, value)
-                    notice = f"模型已设为 {value}"
+                    notice = tr("Model set to {model}", model=value)
                 else:
-                    notice = "选择已失效，请重新 /model"
+                    notice = tr("That choice expired; use /model again")
             else:
                 efforts = list_efforts(session.cli)
                 if 0 <= index < len(efforts):
                     value = efforts[index]
                     self.sessions.set_effort(session_id, value)
-                    notice = f"推理力度已设为 {value}"
+                    notice = tr("Reasoning effort set to {effort}", effort=value)
                 else:
-                    notice = "选择已失效，请重新 /effort"
+                    notice = tr("That choice expired; use /effort again")
             try:
                 self.telegram.answer_callback_query(query_id, notice)
                 if isinstance(message_id, int):
@@ -1453,24 +1490,24 @@ class GatewayApp:
 
         session = self.sessions.get(target)
         if not session or session.chat_id != chat_id:
-            self.telegram.answer_callback_query(query_id, "会话已失效")
+            self.telegram.answer_callback_query(query_id, tr("Session expired"))
             return
         try:
             if action in {"taskinterrupt", "clearqueue", "stopqueue"}:
                 if action == "taskinterrupt":
                     interrupted = self._interrupt_session(session)
-                    notice = "已中断当前任务" if interrupted else "当前没有运行任务"
+                    notice = tr("Interrupted the current task") if interrupted else tr("No task is running")
                 elif action == "clearqueue":
                     cleared = self._clear_queue(session.session_id)
-                    notice = f"已清空 {cleared} 条等待消息" if cleared else "队列已经为空"
+                    notice = tr("Cleared {count} queued messages", count=cleared) if cleared else tr("The queue is already empty")
                 else:
                     # Clear first so the terminal callback cannot start the next queued turn.
                     cleared = self._clear_queue(session.session_id)
                     interrupted = self._interrupt_session(session)
                     if interrupted:
-                        notice = f"已中断并清空 {cleared} 条等待消息"
+                        notice = tr("Interrupted and cleared {count} queued messages", count=cleared)
                     else:
-                        notice = f"已清空 {cleared} 条等待消息" if cleared else "当前没有运行任务"
+                        notice = tr("Cleared {count} queued messages", count=cleared) if cleared else tr("No task is running")
                 self.telegram.answer_callback_query(query_id, notice)
                 if isinstance(message_id, int):
                     text, markup = self._tasks_view(chat_id)
@@ -1483,36 +1520,36 @@ class GatewayApp:
             if action == "use":
                 self._switch_session(chat_id, session.session_id)
                 switched = True
-                notice = f"已切换到 {session.label}"
+                notice = tr("Switched to {session}", session=session.label)
             elif action == "interrupt":
                 interrupted = self._interrupt_session(session)
-                notice = "已中断" if interrupted else "当前没有运行任务"
+                notice = tr("Interrupted") if interrupted else tr("No task is running")
             elif action == "archive":
                 self._retire_session(session, delete=False)
-                notice = "已归档"
+                notice = tr("Archived")
             elif action == "restore":
                 self.sessions.set_archived(session.session_id, False)
-                notice = "已恢复"
+                notice = tr("Restored")
                 include_archived = True
             elif action == "delete?":
-                self.telegram.answer_callback_query(query_id, "请再次确认")
+                self.telegram.answer_callback_query(query_id, tr("Please confirm"))
                 self._send_delete_confirmation(chat_id, session)
                 return
             elif action == "delete!":
                 self._retire_session(session, delete=True)
-                notice = "已删除"
+                notice = tr("Deleted")
                 refresh = False
                 if isinstance(message_id, int):
                     self.telegram.edit_message(
-                        chat_id, message_id, f"已删除 {session.label}（{session.session_id}）。"
+                        chat_id, message_id, tr("Deleted {session} ({id}).", session=session.label, id=session.session_id)
                     )
             elif action == "cancel":
-                notice = "已取消"
+                notice = tr("Cancelled")
                 refresh = False
                 if isinstance(message_id, int):
-                    self.telegram.edit_message(chat_id, message_id, "已取消删除。")
+                    self.telegram.edit_message(chat_id, message_id, tr("Deletion cancelled."))
             else:
-                self.telegram.answer_callback_query(query_id, "未知操作")
+                self.telegram.answer_callback_query(query_id, tr("Unknown action"))
                 return
             self.telegram.answer_callback_query(query_id, notice)
             if refresh and isinstance(message_id, int):
@@ -1546,14 +1583,14 @@ class GatewayApp:
                 self.telegram.send_local_file(chat_id, path, as_photo=False)
         except (OSError, ValueError, TelegramError) as exc:
             LOGGER.warning("artifact send failed: %s", exc)
-            self._send(chat_id, f"发送文件失败：{exc}")
+            self._send(chat_id, tr("Could not send the file: {error}", error=exc))
         finally:
             with self._state_lock:
                 self._artifact_uploads.discard(token)
 
     def _interrupt_session(self, session: CliSession) -> bool:
         if not self.sessions.get_in_flight(session.session_id):
-            # 会话空闲时，/interrupt 退为“中断此聊天当前正在运行的直连命令”。
+            # With the session idle, /interrupt falls back to the direct command running in this chat.
             self.direct_commands.interrupt_chat(session.chat_id, self._active_bot_key())
         return self._interrupt_session_turn(session)
 
@@ -1613,7 +1650,7 @@ class GatewayApp:
                 or focus.archived
                 or focus.cli not in self.config.enabled_clis
             ):
-                raise SessionError("会话已失效，请重新 /reload")
+                raise SessionError(tr("The session expired; use /reload again"))
             target_clis = {focus.cli}
 
         with self._backend_reload_lock:
@@ -1637,11 +1674,10 @@ class GatewayApp:
                         self._pending_codex_compactions or self._codex_compaction_turns
                     )
                 if codex_operation_pending and not busy:
-                    busy.append("Codex 上下文压缩")
+                    busy.append(tr("Codex context compaction"))
             if busy:
-                shown = "、".join(busy[:5])
-                suffix = " 等" if len(busy) > 5 else ""
-                raise SessionError(f"仍有任务运行：{shown}{suffix}；请等待完成后重试")
+                shown = join_items(busy[:5]) + (tr(" etc.") if len(busy) > 5 else "")
+                raise SessionError(tr("Tasks are still running: {tasks}; wait for them to finish and retry", tasks=shown))
 
             clear_listing_cache()
             lines: list[str] = []
@@ -1676,13 +1712,12 @@ class GatewayApp:
                         failed.append(session.label)
                     else:
                         resumed.append(session.label)
-                lines.append(f"Codex 后端已重启，已恢复 {len(resumed)} 个会话。")
+                lines.append(tr("Codex backend restarted; resumed {count} sessions.", count=len(resumed)))
                 if failed:
-                    lines.append(
-                        "恢复失败："
-                        + "、".join(failed[:5])
-                        + (" 等" if len(failed) > 5 else "")
-                    )
+                    lines.append(tr(
+                        "Could not resume: {sessions}",
+                        sessions=join_items(failed[:5]) + (tr(" etc.") if len(failed) > 5 else ""),
+                    ))
 
             headless_clis = [
                 cli
@@ -1690,20 +1725,21 @@ class GatewayApp:
                 if cli in target_clis and cli != "codex"
             ]
             if headless_clis:
-                lines.append(
-                    "、".join(headless_clis)
-                    + " 按任务启动新进程；下次任务会直接使用当前安装版本。"
-                )
-            return "\n".join(lines) or "没有可重载的 CLI。"
+                lines.append(tr(
+                    "{clis}: a new process starts for each task, so the next task uses the installed version.",
+                    clis=join_items(headless_clis),
+                ))
+            return "\n".join(lines) or tr("There is no CLI to reload.")
 
     def _compact_session(self, chat_id: int, session: CliSession) -> None:
-        """压缩当前会话上下文：Codex 用原生 thread/compact/start，Pi 用一次性 RPC。
+        """Compact the current session's context: Codex through native thread/compact/start,
+        Pi through a one-shot RPC.
 
-        会话忙碌时拒绝（压缩需要空闲上下文）；Grok/Claude 无可用手动压缩，
-        回复状态说明而不是假装成功。
+        A busy session is refused (compaction needs an idle context). Grok and Claude have no
+        manual compaction in this mode, so the reply explains that instead of pretending.
         """
         if self._session_is_busy(session):
-            self._send(chat_id, f"{session.label} 正在运行，请先 /interrupt 再压缩。")
+            self._send(chat_id, tr("{session} is running; /interrupt it before compacting.", session=session.label))
             return
         if session.backend == "codex-app-server" and session.external_id:
             thread_id = session.external_id
@@ -1719,7 +1755,7 @@ class GatewayApp:
                 with self._state_lock:
                     self._pending_codex_compactions.pop(thread_id, None)
                 raise
-            self._send(chat_id, f"已触发 {session.label} 的上下文压缩。")
+            self._send(chat_id, tr("Started context compaction for {session}.", session=session.label))
             return
         if session.cli == "pi":
             with self._state_lock:
@@ -1729,9 +1765,9 @@ class GatewayApp:
                 if not busy:
                     self._turn_claims.add(session.session_id)
             if busy:
-                self._send(chat_id, f"{session.label} 正在运行，请先 /interrupt 再压缩。")
+                self._send(chat_id, tr("{session} is running; /interrupt it before compacting.", session=session.label))
                 return
-            self._send(chat_id, f"正在压缩 {session.label} 的上下文…")
+            self._send(chat_id, tr("Compacting {session}'s context…", session=session.label))
             self._run_in_background(
                 f"compact-{session.session_id}", self._run_pi_compaction, chat_id, session
             )
@@ -1739,14 +1775,20 @@ class GatewayApp:
         if session.cli == "claude":
             self._send(
                 chat_id,
-                f"{session.label} 使用 Claude 的 --autocompact 自动压缩；"
-                "手动 /compact 仅交互模式可用，headless 下没有。",
+                tr(
+                    "{session} uses Claude's automatic compaction (--autocompact); manual /compact "
+                    "exists only in interactive mode, not headless.",
+                    session=session.label,
+                ),
             )
             return
         self._send(
             chat_id,
-            f"{session.label}（Grok）无手动压缩；上下文接近 85% 时 Grok 会自动压缩。"
-            "需要重置可 /clear 开新对话。",
+            tr(
+                "{session} (Grok) has no manual compaction; Grok compacts automatically near 85% "
+                "context. Use /clear to start over.",
+                session=session.label,
+            ),
         )
 
     def _run_pi_compaction(self, chat_id: int, session: CliSession) -> None:
@@ -1756,9 +1798,9 @@ class GatewayApp:
             with self._state_lock:
                 interrupted = session.session_id in self._interrupted_sessions
                 self._interrupted_sessions.discard(session.session_id)
-            self._send(chat_id, "压缩已中断。" if interrupted else f"压缩失败：{exc}")
+            self._send(chat_id, tr("Compaction interrupted.") if interrupted else tr("Compaction failed: {error}", error=exc))
         else:
-            self._send(chat_id, f"{session.label}：{result}")
+            self._send(chat_id, tr("{session}: {result}", session=session.label, result=result))
         finally:
             self._finish_turn(session)
 
@@ -1767,13 +1809,15 @@ class GatewayApp:
             self._clear_session_locked(chat_id, session)
 
     def _clear_session_locked(self, chat_id: int, session: CliSession) -> None:
-        """当前会话开新对话：网关记录保留，但 CLI 上下文清零重来。
+        """Start a new conversation in the current session: the gateway record stays, the
+        CLI context starts from zero.
 
-        Codex 建新 thread 并归档旧 thread；headless 换新 external_id 并重置
-        turn_count（下次自动走首轮模式）。会话忙碌时拒绝。
+        Codex gets a new thread and the old one is archived; headless sessions get a new
+        external_id and turn_count resets (the next turn runs in first-turn mode). A busy
+        session is refused.
         """
         if self._session_is_busy(session):
-            self._send(chat_id, f"{session.label} 正在运行，请先 /interrupt 再 /clear。")
+            self._send(chat_id, tr("{session} is running; /interrupt it before /clear.", session=session.label))
             return
         if session.backend == "codex-app-server" and session.external_id:
             old_thread = session.external_id
@@ -1782,8 +1826,8 @@ class GatewayApp:
                     session.cwd, model=self._effective_model(session)
                 )
             except CodexBackendError:
-                # 新建失败则保留原线程，不破坏会话
-                self._send(chat_id, "新建 Codex 线程失败，未清空。")
+                # Keep the old thread when a new one cannot be created.
+                self._send(chat_id, tr("Could not create a new Codex thread; nothing was cleared."))
                 return
             try:
                 self.codex.archive_thread(old_thread)
@@ -1791,14 +1835,14 @@ class GatewayApp:
                 LOGGER.warning("could not archive old Codex thread %s", old_thread)
             self.sessions.update_backend(session.session_id, "codex-app-server", thread_id)
             self._reset_session_result(session)
-            self._send(chat_id, f"{session.label} 已开新对话（旧线程已归档）。")
+            self._send(chat_id, tr("{session} started a new conversation (the old thread was archived).", session=session.label))
             return
         if session.backend == "headless-json":
             self.sessions.rotate_external_id(session.session_id)
             self._reset_session_result(session)
-            self._send(chat_id, f"{session.label} 已开新对话，上下文已清空。")
+            self._send(chat_id, tr("{session} started a new conversation; the context was cleared.", session=session.label))
             return
-        self._send(chat_id, f"{session.label} 不支持 /clear。")
+        self._send(chat_id, tr("{session} does not support /clear.", session=session.label))
 
     def _reset_session_result(self, session: CliSession) -> None:
         with self._state_lock:
@@ -1828,7 +1872,7 @@ class GatewayApp:
     ) -> None:
         bot_key = self._active_bot_key()
         if session.cli not in self.config.enabled_clis:
-            self._send(chat_id, f"此 Bot 未启用 {session.cli}，不能继续该会话。")
+            self._send(chat_id, tr("{cli} is not enabled for this bot, so this session cannot continue.", cli=session.cli))
             return
         if session.backend == "codex-app-server" and session.external_id:
             with self._state_lock:
@@ -1860,12 +1904,15 @@ class GatewayApp:
                         # The publisher may have finished while turn/steer replied.
                         self._run_in_background(
                             "steer-ack", self._send, chat_id,
-                            f"[{session.session_id}] 已追加要求，CLI 已接收。", bot_key,
+                            tr("[{session}] The CLI accepted the added request.", session=session.session_id), bot_key,
                         )
                     return
                 except CodexBackendError as exc:
                     if exc.ambiguous:
-                        self._send(chat_id, "追加请求的结果尚未确认，为避免重复执行，未自动重发。请查看当前任务输出。")
+                        self._send(chat_id, tr(
+                            "The added request was not confirmed, so it was not resent to avoid running it twice. "
+                            "Check the current task output."
+                        ))
                         return
                     LOGGER.warning("Codex steer failed; queued instead: %s", exc)
         self._start_session_turn(chat_id, session, text, attachments)
@@ -1976,11 +2023,11 @@ class GatewayApp:
                     position = self._enqueue(session, pending)
                     if position is None:
                         queued_notice = (
-                            f"{session.label} 的等待队列已满（最多 {MAX_PENDING_INPUTS_PER_SESSION} 条）。"
+                            tr("{session}'s queue is full (at most {limit}).", session=session.label, limit=MAX_PENDING_INPUTS_PER_SESSION)
                         )
                     else:
                         queued_notice = (
-                            f"{session.label} 正在运行；已加入队列（第 {position} 条）。"
+                            tr("{session} is running; queued as #{position}.", session=session.label, position=position)
                         )
                 else:
                     self._turn_claims.add(session.session_id)
@@ -2017,7 +2064,7 @@ class GatewayApp:
         if session.cli not in self.config.enabled_clis:
             self._send(
                 chat_id,
-                f"此 Bot 未启用 {session.cli}，不能启动任务。",
+                tr("{cli} is not enabled for this bot, so the task cannot start.", cli=session.cli),
                 bot_key,
             )
             self._finish_turn(
@@ -2077,14 +2124,14 @@ class GatewayApp:
                     effort_label=effort_label,
                 )
             else:
-                raise SessionError(f"不支持的会话后端：{session.backend}")
+                raise SessionError(tr("Unsupported session backend: {backend}", backend=session.backend))
             self.sessions.set_in_flight(
                 session.session_id, session.chat_id, turn_id, bot_key
             )
             self._set_session_state(session.session_id, STATE_WORKING)
         except (CodexBackendError, HeadlessBackendError, SessionError) as exc:
             start_error = exc
-            self._send(chat_id, f"发送失败：{exc}", bot_key)
+            self._send(chat_id, tr("Could not send: {error}", error=exc), bot_key)
         finally:
             # Replay under the same lock used by the callbacks so later events
             # cannot overtake a buffered completion. No RPC waits occur here.
@@ -2101,7 +2148,10 @@ class GatewayApp:
             if ambiguous:
                 self.sessions.set_in_flight(session.session_id, chat_id, "starting", bot_key)
                 self._set_session_state(session.session_id, STATE_INTERRUPTED)
-                self._send(chat_id, "启动结果未确认，等待队列已暂停。请先核对原生会话，避免重复执行。", bot_key)
+                self._send(chat_id, tr(
+                    "The task start was not confirmed, so the queue is paused. Check the native "
+                    "session first so nothing runs twice."
+                ), bot_key)
             self._finish_turn(
                 session,
                 session.external_id if session.backend == "codex-app-server" else None,
@@ -2229,17 +2279,19 @@ class GatewayApp:
                 if view.turn_id != turn_id:
                     self.sessions.clear_in_flight(session.session_id, view.turn_id)
                 if session.session_id in self._interrupted_sessions:
-                    # 用户主动中断：不显示为失败，恢复空闲
+                    # Interrupted by the user: not a failure, back to idle.
                     self._interrupted_sessions.discard(session.session_id)
                     self._set_session_state(session.session_id, STATE_IDLE)
                 else:
                     self._set_session_state(session.session_id, STATE_FAILED)
             elif kind == "interrupted":
-                # 进程被信号杀死（网关重启/关机连累、用户中断、OOM 等）。
-                # 不清 in_flight：意外中断时保留为恢复候选，供 /resume、/cancel 或重启恢复处理。
+                # Killed by a signal (gateway restart or shutdown, user interrupt, OOM, ...).
+                # Keep in_flight: an unexpected interruption stays a recovery candidate for
+                # /resume, /cancel or restart recovery.
                 view.status = "interrupted"
                 if session.session_id in self._interrupted_sessions:
-                    # 用户主动中断：_interrupt_session 已清 in_flight 并通知，这里静默收尾
+                    # Interrupted by the user: _interrupt_session already cleared in_flight
+                    # and replied, so finish quietly.
                     self._interrupted_sessions.discard(session.session_id)
                     self.sessions.clear_in_flight(session.session_id, turn_id)
                     self._set_session_state(session.session_id, STATE_IDLE)
@@ -2262,12 +2314,12 @@ class GatewayApp:
             return str(value)
 
     def _recover_interrupted_turns(self) -> None:
-        """在网关启动时处理上次遗留的进行中任务。
+        """Handle tasks left in flight when the gateway starts.
 
-        用户主动中断的任务已在中断时清除 in_flight，不会出现在这里；
-        能留下的都是意外中断（网关重启/关机连累、进程被杀死）。
-        默认只发提示，由用户用 /resume 或 /cancel 决定；AUTO_RESUME=true
-        时直接自动恢复（复用 headless 的 resume 模式续跑同一会话）。
+        Tasks the user interrupted cleared in_flight at the time, so only unexpected
+        interruptions remain (gateway restart or shutdown, killed processes). By default the
+        user decides with /resume or /cancel; AUTO_RESUME=true resumes right away through
+        the headless resume mode of the same session.
         """
         for session_id, chat_id, turn_id, bot_key in self.sessions.stale_in_flight_routes():
             if bot_key not in self._telegrams:
@@ -2284,16 +2336,22 @@ class GatewayApp:
                 with self._bot_scope(bot_key):
                     self._send(
                         chat_id,
-                        f"任务中断（网关重启）：{label} 已自动恢复，正在继续上次未完成的工作。"
-                        "如已产生副作用，请 /interrupt 停止。",
+                        tr(
+                            "Task interrupted by a gateway restart: {session} resumed automatically and is "
+                            "continuing the unfinished work. If it already had side effects, stop it with /interrupt.",
+                            session=label,
+                        ),
                     )
                     self._start_session_turn(chat_id, session, RESUME_PROMPT)
             else:
                 with self._bot_scope(bot_key):
                     self._send(
                         chat_id,
-                        f"⚠️ 上次任务被中断：{label}（{session_id}）。"
-                        "回复 /resume 继续，或 /cancel 放弃。",
+                        tr(
+                            "⚠️ The last task was interrupted: {session} ({id}). Reply /resume to continue "
+                            "or /cancel to give up.",
+                            session=label, id=session_id,
+                        ),
                     )
 
     def _on_headless_event(self, session_id: str, turn_id: str, kind: str, data: Any) -> None:
@@ -2431,8 +2489,13 @@ class GatewayApp:
             error = params.get("error")
             detail = error.get("message") if isinstance(error, dict) else error
             detail = detail or params.get("message") or "Codex task error"
-            label = "Codex 正在重试" if params.get("willRetry") is True else "Codex 报错，等待任务结束"
-            self._update_turn(session, turn_id, "notice", f"{label}：{self._display_value(detail)}")
+            label = (
+                tr("Codex is retrying") if params.get("willRetry") is True
+                else tr("Codex reported an error; waiting for the task to end")
+            )
+            self._update_turn(session, turn_id, "notice", tr(
+                "{label}: {detail}", label=label, detail=self._display_value(detail),
+            ))
 
     def _on_codex_disconnect(self) -> None:
         # Keep native IDs and recovery records. Never replay work merely because
@@ -2449,7 +2512,8 @@ class GatewayApp:
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
         }:
-            # 免审批模式下不会触发；保留 blocked 信号供未来 on-request 模式使用。
+            # Never triggered in approval-free mode; the blocked signal stays for a future
+            # on-request mode.
             thread_id = params.get("threadId")
             session = (
                 self.sessions.find_by_external_id(thread_id)
@@ -2463,7 +2527,7 @@ class GatewayApp:
             except CodexBackendError:
                 LOGGER.exception("could not auto-approve Codex request")
                 return
-            # 自动接受后 turn 继续执行
+            # The turn continues after the automatic approval.
             if session:
                 self._set_session_state(session.session_id, STATE_WORKING)
             return
@@ -2510,19 +2574,19 @@ class GatewayApp:
         *, record_text: str | None = None,
     ) -> tuple[str, str]:
         elapsed = max(0, int(now - view.started_at))
-        label = {
-            "running": "运行中",
-            "completed": "完成",
-            "failed": "失败",
-            "interrupted": "已中断",
-        }.get(view.status, view.status)
+        label = tr({
+            "running": N_("Running"),
+            "completed": N_("Done"),
+            "failed": N_("Failed"),
+            "interrupted": N_("Interrupted"),
+        }.get(view.status, view.status))
         if background and view.status == "running":
-            label = "后台运行中"
+            label = tr("Running in background")
         if record_text is not None:
-            label = f"运行记录 · 第 {view.progress_page} 段"
-        status = f"[{view.session.session_id}] · {label} {elapsed}秒"
+            label = tr("Run log · part {page}", page=view.progress_page)
+        status = tr("[{session}] · {label} {seconds}s", session=view.session.session_id, label=label, seconds=elapsed)
         if view.steered:
-            status += f" · 已追加 {view.steered} 次"
+            status += tr(" · {count} added requests", count=view.steered)
         model_label = view.model_label or "CLI default"
         effort_label = view.effort_label or "CLI default"
         header = f"model: {model_label} · effort: {effort_label}\n{status}"
@@ -2545,33 +2609,33 @@ class GatewayApp:
                     self._turn_progress(view), view.progress_offset, STREAM_SEGMENT_UNITS
                 )
                 if body.strip():
-                    sections[0] += f" · 第 {view.progress_page} 段"
+                    sections[0] += tr(" · part {page}", page=view.progress_page)
             if body.strip():
                 sections.append(body.strip("\n"))
             if view.command and not background:
                 command = view.command[-700:].replace("```", "` ` `")
-                sections.append(f"当前命令：\n```text\n{command}\n```")
+                sections.append(tr("Current command:") + f"\n```text\n{command}\n```")
             if view.command_output and not background:
                 output = view.command_output[-500:].replace("```", "` ` `")
-                sections.append(f"命令输出：\n```text\n{output}\n```")
+                sections.append(tr("Command output:") + f"\n```text\n{output}\n```")
         elif answer:
             sections.append(answer)
         elif view.status == "completed":
             if self._turn_progress(view).strip():
-                sections.append("任务已结束，过程输出见运行记录；CLI 没有提供单独的最终回答。")
+                sections.append(tr("The task finished; its progress is in the run log. The CLI gave no separate final answer."))
             else:
-                sections.append(
-                    "⚠️ 模型已结束，但没有返回可见回答。"
-                    "为避免重复执行操作，网关未自动重试。"
-                )
+                sections.append(tr(
+                    "⚠️ The model finished without a visible answer. The gateway did not retry, "
+                    "to avoid repeating actions."
+                ))
         if view.status == "interrupted" and view.resumable:
-            sections.append("⚠️ 任务被中断。回复 /resume 继续，或 /cancel 放弃。")
+            sections.append(tr("⚠️ The task was interrupted. Reply /resume to continue or /cancel to give up."))
         if view.status == "running" and view.notice:
             notice = view.notice.replace("```", "` ` `")
-            sections.append(f"提示：\n```text\n{notice}\n```")
+            sections.append(tr("Notice:") + f"\n```text\n{notice}\n```")
         if view.error:
             error = view.error.replace("```", "` ` `")
-            sections.append(f"错误：\n```text\n{error}\n```")
+            sections.append(tr("Error:") + f"\n```text\n{error}\n```")
         return "\n\n".join(sections), answer
 
     def _view_card_ids(self, view: TurnView) -> list[int]:
@@ -2608,10 +2672,11 @@ class GatewayApp:
             )
 
     def _pin_turn(self, view: TurnView, now: float) -> bool:
-        """把当前 session 的运行进度钉到一条新的底部消息上并开始直播。
+        """Pin the session's running progress to a new message at the bottom and stream it.
 
-        旧卡片（若存在）降级为“后台运行中”，记入 stale_message_ids，待任务
-        终态时一并收尾。每次切回该 session 都会重新把进度钉到最新一条消息。
+        An older card, if any, is downgraded to "running in background" and recorded in
+        stale_message_ids to be closed out when the task ends. Every switch back to the
+        session pins progress to the newest message again.
         """
         with self._publish_lock:
             with self._state_lock:
@@ -2655,7 +2720,7 @@ class GatewayApp:
             return True
 
     def _background_turn(self, view: TurnView, now: float) -> None:
-        """切换走时把当前卡片定格为“后台运行中”，停止周期刷新。"""
+        """On switching away, freeze the current card as "running in background" and stop refreshing it."""
         rendered, _ = self._render_turn(view, now, background=True)
         rendered = self._one_card_text(rendered, view.rich_mode)
         if view.message_id is not None and view.message_id > 0:
@@ -2679,18 +2744,18 @@ class GatewayApp:
             view.live = False
 
     def _resolve_stale(self, view: TurnView) -> None:
-        """任务结束后把历史里残留的旧进度卡片收尾成一句短状态。"""
+        """When a task ends, close out leftover progress cards in the history with a one-line status."""
         with self._state_lock:
             stale_ids = list(view.stale_message_ids)
             view.stale_message_ids.clear()
         if not stale_ids:
             return
         if view.status == "completed":
-            stamp = "✅ 此任务已完成，结果已更新到最新一条进度消息。"
+            stamp = tr("✅ This task finished; the result is in the newest progress message.")
         elif view.status == "failed":
-            stamp = "⚠️ 此任务失败，详情见最新一条进度消息。"
+            stamp = tr("⚠️ This task failed; see the newest progress message for details.")
         else:
-            stamp = "⏹ 此任务已中断。"
+            stamp = tr("⏹ This task was interrupted.")
         for message_id in stale_ids:
             try:
                 self._telegram(view.bot_key).edit_message(
@@ -2804,7 +2869,10 @@ class GatewayApp:
             progress = self._turn_progress(view)
         if not view.progress_closed and self._turn_has_phases(view):
             self._seal_progress(view, progress[:boundary])
-        text = f"[{view.session.session_id}] 已追加第 {number} 次要求，CLI 已接收。\n后续进展会显示在这条消息下方。"
+        text = tr(
+            "[{session}] The CLI accepted added request #{number}.\nFurther progress appears below this message.",
+            session=view.session.session_id, number=number,
+        )
         client = self._telegram(view.bot_key)
         try:
             ids = client.send_rich_markdown_parts(
@@ -2937,25 +3005,26 @@ class GatewayApp:
             self._auto_send_artifacts(view)
         return True
 
-    # 官方 Bot API 默认 45 MiB；配置本地 --local 服务后默认 1 GiB。
+    # 45 MiB by default with the cloud Bot API; 1 GiB with a local --local server.
     @property
     def artifact_send_limit(self) -> int:
         return self.config.telegram_max_file_bytes
 
     def _auto_send_artifacts(self, view: TurnView) -> None:
-        """回答发布后自动把 CLI 产物文件发送给用户。
+        """Send the CLI's artifact files to the user after the answer is published.
 
-        模式（AUTO_SEND_ARTIFACTS）：
-          off    - 不自动发送，仅保留"发送文件/图片/视频"按钮（默认）
-          images - 只自动发送不超过 sendPhoto 上限的图片
-          all    - 图片、MP4 视频和普通文件按各自的 Telegram 类型自动发送
+        Modes (AUTO_SEND_ARTIFACTS):
+          off    - send nothing automatically; keep the "send file/image/video" buttons (default)
+          images - send only images within the sendPhoto limit
+          all    - send images, MP4 videos and other files as their Telegram types
 
-        超过 Bot API 上传上限的产物永远不会自动发送，也不会提供“发送文件”
-        按钮：卡片上只给一个回本机路径的按钮。
+        An artifact over the Bot API upload limit is never sent automatically and gets no
+        "send file" button: the card offers only a button that returns its local path.
 
-        已成功发送的路径记在 view.auto_sent，发布重试时不会重复发送；
-        发送失败的文件保留在按钮里作为手动兑底。只在当前 session 的终态发布时调用；
-        后台完成只更新原卡片上的按钮，不往聊天底部塞文件。
+        Sent paths are recorded in view.auto_sent so publication retries never resend them;
+        files that fail stay on their buttons as a manual fallback. Called only when the
+        current session's final state is published; a background completion only updates
+        the buttons on its own card and never drops files at the bottom of the chat.
         """
         self._auto_send_paths(view.session.chat_id, view.bot_key, view.artifacts, view.auto_sent)
 
@@ -2978,41 +3047,43 @@ class GatewayApp:
                 continue
             mime_type = mimetypes.guess_type(path.name)[0] or ""
             if mime_type.startswith("image/") and size <= PHOTO_UPLOAD_MAX_BYTES:
-                send_options, label = {"as_photo": True}, "图片"
+                send_options, label = {"as_photo": True}, "image"
             elif mode == "all":
                 if path.suffix.lower() == ".mp4":
-                    send_options, label = {"as_video": True}, "视频"
+                    send_options, label = {"as_video": True}, "video"
                 else:
-                    send_options, label = {"as_photo": False}, "文件"
+                    send_options, label = {"as_photo": False}, "file"
             else:
-                continue  # 图片超 sendPhoto 上限且未开启 all：保留按钮
+                continue  # an image over the sendPhoto limit without mode all keeps its button
             try:
                 self._telegram(bot_key).send_local_file(chat_id, path, **send_options)
             except (TelegramError, OSError) as exc:
-                LOGGER.warning("自动发送%s失败 %s: %s", label, path, exc)
+                LOGGER.warning("could not auto-send %s %s: %s", label, path, exc)
                 continue
             auto_sent.append(key)
 
     def _validated_local_file(self, candidate: Path) -> Path:
-        """校验一个可以发出去的本地产物（目录 + 发送上限）。"""
+        """Validate a local artifact that may be sent (directory and send limit)."""
         candidate = self._validated_artifact_path(candidate)
         if candidate.stat().st_size > self.config.telegram_max_file_bytes:
-            raise ValueError("文件超过配置的发送大小限制")
+            raise ValueError(tr("The file exceeds the configured send size limit"))
         return candidate
 
     def _validated_artifact_path(self, candidate: Path) -> Path:
-        """校验一个可以“回路径”的本地产物：只要求存在且在 ALLOWED_WORKDIRS 内。
+        """Validate a local artifact whose path may be returned: it only has to exist inside
+        ALLOWED_WORKDIRS.
 
-        大文件超出 Bot API 上传上限后依然值得告知用户，只是不能当文件发。
+        A file over the Bot API upload limit is still worth telling the user about; it just
+        cannot be sent as a file.
         """
         candidate = candidate.expanduser().resolve(strict=True)
         if not candidate.is_file():
-            raise ValueError("不是普通文件")
+            raise ValueError(tr("Not a regular file"))
         if not any(
             candidate == root or candidate.is_relative_to(root)
             for root in self.config.allowed_roots
         ):
-            raise ValueError("文件不在 ALLOWED_WORKDIRS 中")
+            raise ValueError(tr("The file is not inside ALLOWED_WORKDIRS"))
         return candidate
 
     def _find_artifacts(self, session: CliSession, answer: str) -> list[Path]:
@@ -3072,15 +3143,15 @@ class GatewayApp:
                 continue
             oversized = size > self.artifact_send_limit
             if oversized:
-                action, icon = "sendpath", "路径："
+                action, label = "sendpath", N_("Send path: {name}")
             else:
                 mime_type = mimetypes.guess_type(path.name)[0] or ""
                 if mime_type.startswith("image/"):
-                    action, icon = "photo", "图片："
+                    action, label = "photo", N_("Send image: {name}")
                 elif path.suffix.lower() == ".mp4":
-                    action, icon = "video", "视频："
+                    action, label = "video", N_("Send video: {name}")
                 else:
-                    action, icon = "file", "文件："
+                    action, label = "file", N_("Send file: {name}")
             token = tokens.get(str(path))
             if token is None:
                 token = self.sessions.register_artifact(
@@ -3088,51 +3159,53 @@ class GatewayApp:
                 )
                 tokens[str(path)] = token
             rows.append([{
-                "text": f"发送{icon}{path.name}"[:60],
+                "text": tr(label, name=path.name)[:60],
                 "callback_data": f"{action}:{token}",
             }])
         return {"inline_keyboard": rows} if rows else None
 
-    # --- 直连命令扩展 ---
+    # --- Direct command extensions ---
     #
-    # 命令卡片有意不走 _turns/TurnView 那套流程：命令没有 CLI 会话、不参与队列、
-    # 不写入 last_completed_message，也不应该被“切回会话时复制最后结果”影响。
-    # 它们复用的是产物校验、发送按钮和原地编辑这几个稳定边界。
+    # Command cards deliberately bypass _turns/TurnView: a command has no CLI session, no
+    # queue and no last_completed_message, and switching sessions must not copy its result.
+    # They reuse the stable pieces: artifact validation, send buttons and in-place edits.
 
     def _render_direct_command(self, run: DirectCommandRun, now: float) -> tuple[str, str]:
         elapsed = max(0, int(now - run.started_at))
-        label = {
-            "running": "运行中",
-            "completed": "完成",
-            "failed": "失败",
-            "interrupted": "已中断",
-        }.get(run.status, run.status)
-        header = f"/{run.command.command} · {run.command.name}\n{label} {elapsed}秒"
+        label = tr({
+            "running": N_("Running"),
+            "completed": N_("Done"),
+            "failed": N_("Failed"),
+            "interrupted": N_("Interrupted"),
+        }.get(run.status, run.status))
+        header = f"/{run.command.command} · {run.command.display_name()}\n" + tr(
+            "{label} {seconds}s", label=label, seconds=elapsed,
+        )
         sections = [header]
         if run.args:
-            sections.append("参数：`" + " ".join(run.args)[:300] + "`")
+            sections.append(tr("Arguments: `{args}`", args=" ".join(run.args)[:300]))
         output = run.output_text()
         limit = run.command.max_output_bytes
         truncated = len(output) > limit
         visible = output[-limit:] if truncated else output
         if run.status == "running":
             if run.progress:
-                sections.append(f"进度：{run.progress}")
+                sections.append(tr("Progress: {progress}", progress=run.progress))
             if visible:
-                sections.append("输出：\n```text\n" + visible + "\n```")
+                sections.append(tr("Output:") + "\n```text\n" + visible + "\n```")
             if not run.progress and not visible:
-                sections.append("已启动，等待输出…")
+                sections.append(tr("Started; waiting for output…"))
         else:
             if truncated:
-                sections.append(f"（输出仅保留最后 {limit} 字节）")
-            # 命令输出多是自己排好版的文本（帮助、进度、路径清单）。Telegram 的
-            # Rich Message 渲染器会把单换行当成软换行合并成一个段落，所以这里加上
-            # 硬换行标记，保住插件自己的排版。
-            sections.append(harden_rich_markdown(visible) or "命令没有输出。")
+                sections.append(tr("(Only the last {limit} bytes of output are kept)", limit=limit))
+            # Command output is mostly pre-formatted text (help, progress, path lists).
+            # Telegram's Rich Message renderer joins single newlines into one paragraph,
+            # so hard breaks keep the extension's own layout.
+            sections.append(harden_rich_markdown(visible) or tr("The command printed nothing."))
         error = run.error_text()
         if error and (run.status != "completed" or run.timed_out):
             error = error[-limit:].replace("```", "` ` `")
-            sections.append("错误：\n```text\n" + error + "\n```")
+            sections.append(tr("Error:") + "\n```text\n" + error + "\n```")
         return "\n\n".join(sections), output
 
     def _direct_artifact_markup(self, run: DirectCommandRun) -> dict[str, Any] | None:
@@ -3157,7 +3230,7 @@ class GatewayApp:
     def _publish_direct_command(
         self, run: DirectCommandRun, markup: dict[str, Any] | None = None
     ) -> bool:
-        """发新卡或原地编辑旧卡。返回是否真的写入了 Telegram。"""
+        """Send a new card or edit the old one in place; return whether Telegram was written."""
         now = time.monotonic()
         rendered, _output = self._render_direct_command(run, now)
         rendered = self._one_card_text(rendered, run.rich_mode)
@@ -3170,8 +3243,8 @@ class GatewayApp:
                     and run.message_id is None
                     and not self._direct_run_is_foreground(run)
                 ):
-                    # 用户已经切走会话，或另一条命令卡已是底部卡片：不再抢底部位置，
-                    # 等终态再编辑原卡。
+                    # The user switched away, or another command card is already at the bottom:
+                    # don't take the bottom spot; edit the original card at the final state.
                     return False
             try:
                 if run.rich_mode:
@@ -3264,7 +3337,8 @@ class GatewayApp:
         return newest is not None and newest.turn_id == run.turn_id
 
     def _refresh_direct_command_card(self, run: DirectCommandRun) -> None:
-        """命令启动后立即发第一条卡片；失败只记日志，等状态循环重试。"""
+        """Send the first card right after the command starts; a failure is only logged and
+        the status loop retries."""
         try:
             self._publish_direct_command(run)
         except TelegramError as exc:
@@ -3287,7 +3361,8 @@ class GatewayApp:
         return delay
 
     def _pump_direct_commands(self, now: float) -> None:
-        """状态循环里发布直连命令卡片；终态发布成功后删除运行时状态。"""
+        """Publish direct command cards from the status loop; drop the runtime state once the
+        final state is published."""
         for run in self.direct_commands.runs():
             try:
                 # Lock order matches the CLI path: publish lock, then state lock.
@@ -3323,8 +3398,8 @@ class GatewayApp:
             if published and status != "running":
                 if status == "completed":
                     self._auto_send_direct_artifacts(run, markup)
-                # 终态已写入 Telegram，运行时状态可以释放；回复路由和文件按钮
-                # 分别存在 sessions 的路由表和 artifact 表里，不依赖这个对象。
+                # The final state is in Telegram, so the runtime state can go: reply routes
+                # and file buttons live in the sessions route and artifact tables.
                 self.direct_commands.forget(run.turn_id)
 
     def _status_loop(self) -> None:
@@ -3350,10 +3425,11 @@ class GatewayApp:
                         elif not is_current and view.live:
                             action = "background"
                         elif not is_current:
-                            # 后台冻结中：不周期刷新，等终态或切回前台。
+                            # Frozen in the background: no periodic refresh until the final
+                            # state or a switch back.
                             continue
                     elif not is_current:
-                        # 后台终态绝不能在当前聊天底部发新消息或自动发文件。
+                        # A background final state never posts or auto-sends at the bottom of the chat.
                         if view.message_id is not None and view.message_id > 0:
                             action = "background_final"
                             published_status = view.status
@@ -3496,7 +3572,7 @@ class GatewayApp:
                 or TELEGRAM_FILE_FIELDS[field]
             )
             if not name:
-                # 语音和圆形视频没有文件名，手机现拍的视频通常也没有。
+                # Voice and video notes have no file name; videos shot on a phone usually lack one too.
                 unique = str(media.get("file_unique_id") or uuid.uuid4().hex)
                 name = f"{field}-{unique}{mimetypes.guess_extension(mime_type) or '.bin'}"
             is_image = mime_type.startswith("image/")
@@ -3542,14 +3618,14 @@ class GatewayApp:
                 self._set_session_state(session.session_id, STATE_FAILED)
 
     def _coalesce_updates(self, updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """把同一 media_group_id 的媒体组消息合并成单条更新。
+        """Merge the messages of one media_group_id into a single update.
 
-        Telegram 会把相册/多文件媒体组的每一项作为独立 message 下发，但共享
-        同一个 media_group_id。若逐条处理，第一张图会先启动一个任务，后续
-        图片会因会话忙碌而被当作追加（steer）或排队，而不是组成一个任务。
-        这里按 batch 内顺序把相邻、同 media_group_id 的消息合并成一条携带
-        ``media`` 列表的消息，并把 update_id 提升为组内最大值，避免重复消费。
-        跨 batch 拆开的媒体组（罕见）不受影响，仍按单条处理。
+        Telegram delivers every item of an album or multi-file group as its own message
+        sharing a media_group_id. Handled one by one, the first image would start a task and
+        the rest would become steers or queued turns instead of one task. Adjacent messages
+        with the same media_group_id in a batch become one message carrying a ``media`` list,
+        and update_id becomes the group's highest so nothing is consumed twice. A group
+        split across batches (rare) is unaffected and handled message by message.
         """
         merged: list[dict[str, Any]] = []
         index = 0
@@ -3618,12 +3694,13 @@ class GatewayApp:
     def _coalesce_text_fragments(
         self, updates: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """把被客户端拆开的长文本片段拼回一条更新。
+        """Join long text that the client split back into one update.
 
-        客户端把超长文本拆成多条普通消息，没有 media_group_id 之类的分组标记：
-        片段按顺序到达，除最后一段外每段都不短于 TEXT_FRAGMENT_MIN_CHARS。只合并
-        这种保守模式，避免把用户连续发送的若干条普通消息误当成一条。跨批次到达
-        的片段由 _await_text_fragments 先收进同一批。
+        Clients split long text into ordinary messages without a grouping marker such as
+        media_group_id: parts arrive in order and all but the last are at least
+        TEXT_FRAGMENT_MIN_CHARS long. Only this conservative pattern is merged, so several
+        separate messages are never mistaken for one. Parts from later batches are first
+        gathered by _await_text_fragments.
         """
         merged: list[dict[str, Any]] = []
         index = 0
@@ -3658,12 +3735,14 @@ class GatewayApp:
 
     @staticmethod
     def _may_be_continued(message: dict[str, Any]) -> bool:
-        """客户端拆出的非末段都超过 2048（Desktop 只在后半段找断点），更短的就是末段。"""
+        """Every non-final part a client splits off exceeds 2048 units (Desktop looks for a
+        break only in the second half); a shorter part is the last one."""
         return _utf16_len(message["text"]) >= TEXT_FRAGMENT_MIN_CHARS
 
     @staticmethod
     def _fragment_message(update: dict[str, Any]) -> dict[str, Any] | None:
-        """仅纯文本消息参与片段合并；附件、相册、转发都不属于长文本拆分。"""
+        """Only plain text messages are merged; attachments, albums and forwards are never
+        parts of a split text."""
         message = update.get("message")
         if not isinstance(message, dict):
             return None
@@ -3698,8 +3777,8 @@ class GatewayApp:
                 message.get("direct_messages_topic_id"),
             )
 
-        # 只有第一段能带 reply_to_message（用户在回复某条消息时输入超长文本）。
-        # 后续段都带回复时就说明这是连续发的多条回复，不能拼在一起。
+        # Only the first part may carry reply_to_message (a long reply to some message).
+        # Later parts that also reply are separate replies and must not be joined.
         if isinstance(candidate.get("reply_to_message"), dict):
             return False
         if identity(previous) != identity(candidate):
@@ -3724,7 +3803,7 @@ class GatewayApp:
 
     @staticmethod
     def _stitch_text_fragments(group: list[dict[str, Any]]) -> dict[str, Any]:
-        # 拼接后 entities 的偏移不再对应原文，直接丢掉。
+        # Entity offsets no longer match the joined text, so drop them.
         first = {key: value for key, value in group[0]["message"].items() if key != "entities"}
         parts = [part["message"]["text"] for part in group]
         multiline = any("\n" in part for part in parts)
@@ -3737,11 +3816,13 @@ class GatewayApp:
     def _await_text_fragments(
         self, telegram: TelegramClient, offset: int | None, updates: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """批次末尾像未完的长文本片段时，等后续片段进入同一批再分发。
+        """When a batch ends like an unfinished long text, wait for the rest before dispatching.
 
-        客户端逐条发送片段，Bot API 收到第一条就结束长轮询，后续片段落在下一批。
-        这里用同一个 offset 重新拉取：已拿到的 update 不会被确认，等待中途重启也
-        不会丢；片段停止增长、末段变短或等满上限后，交给 _coalesce_text_fragments。
+        Clients send parts one by one and the Bot API ends the long poll at the first, so
+        later parts land in the next batch. Polling again with the same offset leaves the
+        fetched updates unconfirmed, so a restart while waiting loses nothing. Once the parts
+        stop growing, the last part is short, or the wait cap is reached, the batch goes to
+        _coalesce_text_fragments.
         """
         started = last_growth = time.monotonic()
         while updates:
@@ -3785,7 +3866,7 @@ class GatewayApp:
         replied = message.get("reply_to_message")
         replied_id = replied.get("message_id") if isinstance(replied, dict) else None
         if isinstance(replied_id, int):
-            # 回复一张直连命令卡片不应该把文本送进当前 CLI 会话。
+            # A reply to a direct command card must not send text into the current CLI session.
             if self.sessions.command_route_for_message(
                 chat_id, replied_id, self._active_bot_key()
             ):
@@ -3826,15 +3907,15 @@ class GatewayApp:
                 try:
                     attachment = self._download_attachment(item, session)
                 except TelegramError as exc:
-                    self._send(chat_id, f"接收文件失败：{exc}")
+                    self._send(chat_id, tr("Could not receive the file: {error}", error=exc))
                     return
                 if attachment:
                     attachments.append(attachment)
             if not attachments:
-                self._send(chat_id, "无法识别这个附件。")
+                self._send(chat_id, tr("Could not recognize this attachment."))
                 return
             caption = message.get("caption")
-            prompt = caption.strip() if isinstance(caption, str) and caption.strip() else "请查看并处理这些附件。"
+            prompt = caption.strip() if isinstance(caption, str) and caption.strip() else "Please review and handle these attachments."
             self._send_to_session(chat_id, session, prompt, tuple(attachments))
             return
         if _file_field(message) or isinstance(message.get("photo"), list):
@@ -3844,16 +3925,19 @@ class GatewayApp:
             try:
                 attachment = self._download_attachment(message, session)
             except TelegramError as exc:
-                self._send(chat_id, f"接收文件失败：{exc}")
+                self._send(chat_id, tr("Could not receive the file: {error}", error=exc))
                 return
             if not attachment:
-                self._send(chat_id, "无法识别这个附件。")
+                self._send(chat_id, tr("Could not recognize this attachment."))
                 return
             caption = message.get("caption")
-            prompt = caption.strip() if isinstance(caption, str) and caption.strip() else "请查看并处理这个附件。"
+            prompt = caption.strip() if isinstance(caption, str) and caption.strip() else "Please review and handle this attachment."
             self._send_to_session(chat_id, session, prompt, (attachment,))
             return
-        self._send(chat_id, "目前支持文本和各类文件（图片、音频、视频、语音等）；贴纸这类消息不会转给 CLI。")
+        self._send(chat_id, tr(
+            "Text and files of every kind (images, audio, video, voice and more) are supported; "
+            "stickers and similar messages are not forwarded to the CLI."
+        ))
 
     def stop(self, *_args: object) -> None:
         self.codex.begin_shutdown()
@@ -3868,9 +3952,9 @@ class GatewayApp:
                 self.handle_update(update)
 
     def _command_menu_entries(self) -> tuple[tuple[str, str], ...]:
-        """扩展命令也注册到 Telegram 的 / 菜单，避免用户靠猜。"""
+        """Extension commands also go into Telegram's / menu so users need not guess."""
         return tuple(
-            (command.command, (command.description or command.name)[:120])
+            (command.command, (command.display_description() or command.display_name())[:120])
             for command in sorted(self.commands.values(), key=lambda item: item.command)
         )
 
@@ -3908,7 +3992,10 @@ class GatewayApp:
             self._recover_interrupted_turns()
             for bot_key, telegram in self._telegrams.items():
                 try:
-                    telegram.set_commands((*BOT_COMMANDS, *self._command_menu_entries()))
+                    telegram.set_commands((
+                        *((name, tr(description)) for name, description in BOT_COMMANDS),
+                        *self._command_menu_entries(),
+                    ))
                 except TelegramError as exc:
                     # Command metadata is optional; Telegram flood control must not
                     # prevent the gateway from starting and receiving updates.

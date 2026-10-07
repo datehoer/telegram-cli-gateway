@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .formatting import markdown_to_telegram_html, split_markdown, split_rich_markdown
+from .i18n import tr
 from .telegram_metrics import TelegramMetrics
 
 
@@ -491,7 +492,7 @@ class TelegramClient:
         metadata = self.get_file(file_id)
         reported_size = metadata.get("file_size")
         if isinstance(reported_size, int) and reported_size > max_bytes:
-            raise TelegramError(f"文件超过大小限制（最大 {max_bytes // 1024 // 1024} MB）")
+            raise TelegramError(tr("File exceeds the size limit (max {limit} MB)", limit=max_bytes // 1024 // 1024))
         file_path = metadata["file_path"]
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".part")
@@ -507,7 +508,7 @@ class TelegramClient:
                     total += len(chunk)
                     if total > max_bytes:
                         raise TelegramError(
-                            f"文件超过大小限制（最大 {max_bytes // 1024 // 1024} MB）"
+                            tr("File exceeds the size limit (max {limit} MB)", limit=max_bytes // 1024 // 1024)
                         )
                     handle.write(chunk)
             os.chmod(temporary, 0o600)
@@ -518,7 +519,7 @@ class TelegramClient:
         except (OSError, urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             temporary.unlink(missing_ok=True)
             reason = getattr(exc, "reason", exc)
-            raise TelegramError(f"Telegram 文件下载失败：{reason}") from exc
+            raise TelegramError(tr("Telegram file download failed: {reason}", reason=reason)) from exc
         return total
 
     def send_local_file(
@@ -539,7 +540,7 @@ class TelegramClient:
                     pass
             except OSError as exc:
                 self._metrics.record(method, "failed")
-                raise TelegramError(f"无法读取发送文件：{exc}") from exc
+                raise TelegramError(tr("Could not read the file to send: {error}", error=exc)) from exc
             payload: dict[str, Any] = {"chat_id": chat_id, field_name: resolved.as_uri()}
             if as_video:
                 payload["supports_streaming"] = "true"
@@ -555,7 +556,7 @@ class TelegramClient:
             file_data = path.read_bytes()
         except OSError as exc:
             self._metrics.record(method, "failed")
-            raise TelegramError(f"无法读取发送文件：{exc}") from exc
+            raise TelegramError(tr("Could not read the file to send: {error}", error=exc)) from exc
         parts = [
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode(),
         ]

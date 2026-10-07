@@ -29,10 +29,10 @@ class SessionStateTests(unittest.TestCase):
             project = Path(temporary)
             manager = self.make_manager(project)
             session = manager.create_headless("pi", project, 1)
-            manager.rename(session.session_id, "研究助手")
+            manager.rename(session.session_id, "Research helper")
             manager.bind_message(1, 99, session.session_id)
             reloaded = self.make_manager(project)
-            self.assertEqual(reloaded.session_for_message(1, 99).label, "研究助手")  # type: ignore[union-attr]
+            self.assertEqual(reloaded.session_for_message(1, 99).label, "Research helper")  # type: ignore[union-attr]
             reloaded.set_archived(session.session_id, True)
             self.assertIsNone(reloaded.session_for_message(1, 99))
             self.assertEqual(reloaded.list_for_chat(1), [])

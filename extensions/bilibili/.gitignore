@@ -1,4 +1,4 @@
-# 登录凭据与扫码临时图：绝不入库
+# Sign-in credentials and the temporary QR image: never commit them
 cookie.json
 qrcode-login.png
 __pycache__/

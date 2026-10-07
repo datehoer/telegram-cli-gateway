@@ -79,7 +79,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         view = self.app._turns[(session.session_id, "turn-1")]
         rendered, _ = self.app._render_turn(view, view.started_at)
         self.assertEqual(view.status, "running")
-        self.assertIn("重试", rendered)
+        self.assertIn("retrying", rendered)
         self.assertNotIn((session.session_id, "turn-1"), self.app._finished_turns)
         self.app._on_codex_notification("item/agentMessage/delta", {
             "threadId": "thread-1", "turnId": "turn-1", "delta": "recovered answer",
@@ -335,7 +335,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.app.codex.steer_turn = steer
         self.app._send_to_session(1, session, "do this once")
         self.assertNotIn(session.session_id, self.app._queues)
-        self.assertIn("未自动重发", self.notices[-1])
+        self.assertIn("was not resent", self.notices[-1])
 
     def test_delete_removes_pending_publications_and_queue(self) -> None:
         session = self.running()

@@ -87,7 +87,10 @@ AUTO_RESUME=false
 ENABLED_CLIS=claude,codex,grok,pi
 DEFAULT_CODEX_MODEL=gpt-6-astra
 DEFAULT_CODEX_EFFORT=high
+GATEWAY_LANGUAGE=en
 ```
+
+`GATEWAY_LANGUAGE` sets the language of the gateway's own Telegram text: replies, buttons, the `/` menu and `/help`. It is `en` (English) by default; `zh` switches to Chinese. Extensions receive it as `TG_LANGUAGE`. It does not change what the CLIs answer, and logs and the prompts the gateway sends to CLIs stay English. The Chinese text lives in `src/cli_telegram_gateway/i18n.py`; every string passed to `tr()` needs an entry there, which `tests/test_i18n.py` checks.
 
 With `AUTO_RESUME=true`, the gateway automatically continues tasks that were interrupted by an unexpected restart (excluding tasks you stopped with `/interrupt`); the default is `false`, in which case you reply `/resume` to recover manually or `/cancel` to give up.
 

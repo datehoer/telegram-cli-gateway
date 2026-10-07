@@ -156,7 +156,7 @@ class LoadDirectCommandsTests(unittest.TestCase):
             self.config, reserved=frozenset({"new"}), warn=warnings.append
         )
         self.assertEqual(loaded, {})
-        self.assertIn("内置命令冲突", warnings[0])
+        self.assertIn("clashes with a built-in command", warnings[0])
 
     def test_duplicate_command_keeps_the_first(self) -> None:
         self.add("a-demo", manifest())
@@ -223,7 +223,7 @@ class DirectCommandRunnerTests(unittest.TestCase):
             "print('warned', file=sys.stderr)\n"
         )
         runner = self.make_runner(script)
-        # args[0] 是子命令（走 TG_ARGV0），其余按顺序进 argv。
+        # args[0] is the subcommand (through TG_ARGV0); the rest go to argv in order.
         run = runner.start(1, "demo", ["a b", "--flag"], raw_args="a b --flag", user_id=7)
         finished = self.wait_for(runner, run.turn_id)
         self.assertEqual(finished.status, "completed")
@@ -242,7 +242,7 @@ class DirectCommandRunnerTests(unittest.TestCase):
         run = runner.start(1, "demo", [])
         finished = self.wait_for(runner, run.turn_id)
         self.assertEqual(finished.status, "failed")
-        self.assertIn("退出码 3", finished.error_text())
+        self.assertIn("exit code 3", finished.error_text())
         self.assertIn("boom", finished.error_text())
 
     def test_second_run_of_the_same_command_in_one_chat_is_rejected(self) -> None:
@@ -260,7 +260,7 @@ class DirectCommandRunnerTests(unittest.TestCase):
         finished = self.wait_for(runner, run.turn_id, timeout=15.0)
         self.assertEqual(finished.status, "interrupted")
         self.assertTrue(finished.timed_out)
-        self.assertIn("已终止", finished.error_text())
+        self.assertIn("Stopped after running longer than", finished.error_text())
 
     def test_interrupt_marks_the_run_interrupted(self) -> None:
         runner = self.make_runner("import time\ntime.sleep(30)\n")
@@ -385,10 +385,10 @@ class BundledExampleTests(unittest.TestCase):
 
 
 class RawArgsTests(unittest.TestCase):
-    """直接命令不做 shell 分词。
+    """Direct commands are not shell-tokenized.
 
-    Cookie、JSON、rpdid=example'cookie-marker 这类内容里的引号是数据不是
-    语法，shlex 会直接报 "No closing quotation"。网关必须把原文交给扩展。
+    Quotes inside cookies, JSON or rpdid=example'cookie-marker are data, not syntax,
+    and shlex fails with "No closing quotation". The gateway must pass the raw text on.
     """
 
     COOKIE_WITH_APOSTROPHE = (
@@ -446,16 +446,16 @@ class RawArgsTests(unittest.TestCase):
         return run.output_text(), run.error_text()
 
     def test_cookie_with_apostrophe_survives_verbatim(self) -> None:
-        # 单行输入：argv0 是整行，扩展自己从 TG_RAW_ARGS 里切子命令
+        # Single-line input: argv0 is the whole line; the extension splits subcommands from TG_RAW_ARGS
         raw = f"login cookie {self.COOKIE_WITH_APOSTROPHE}"
         output, error = self.run_with(raw)
         self.assertEqual(error, "")
         self.assertIn("argv0=login cookie", output)
-        # 关键：整段原文一字不差地传到了扩展里
+        # The key point: the raw text reached the extension byte for byte
         self.assertIn(self.COOKIE_WITH_APOSTROPHE, output)
 
     def test_shlex_would_have_failed_on_that_text(self) -> None:
-        """记录这个 regression 的根因，避免有人再改成 shlex.split。"""
+        """Records the root cause of this regression so nobody switches back to shlex.split."""
         import shlex
 
         with self.assertRaises(ValueError) as caught:

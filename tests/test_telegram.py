@@ -51,7 +51,7 @@ class TelegramTests(unittest.TestCase):
     def test_local_file_uri_preserves_spaces_unicode_and_reserved_filename_characters(self) -> None:
         client = TelegramClient("test", local_api_url="http://127.0.0.1:8081")
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "视频 #1+?.mp4"
+            path = Path(temporary) / "vidéo #1+?.mp4"
             path.write_bytes(b"video")
             with patch.object(client, "_call") as call:
                 client.send_local_file(1, path, as_video=True)
@@ -78,7 +78,7 @@ class TelegramTests(unittest.TestCase):
                 self.assertEqual(destination.read_bytes(), b"video bytes")
                 self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
                 destination.write_bytes(b"keep existing")
-                with self.assertRaisesRegex(TelegramError, "大小限制"):
+                with self.assertRaisesRegex(TelegramError, "size limit"):
                     client.download_file("id", destination, 5)
                 self.assertEqual(destination.read_bytes(), b"keep existing")
                 self.assertFalse(destination.with_suffix(".mp4.part").exists())
@@ -346,7 +346,7 @@ class TelegramTests(unittest.TestCase):
                 TelegramError("message is not modified")
             )
         )
-        client.edit_rich_markdown(1, 9, "same content")  # 不应抛出
+        client.edit_rich_markdown(1, 9, "same content")  # must not raise
 
     def test_edit_rich_markdown_edits_existing_chunks_before_sending(self) -> None:
         client = TelegramClient("test")

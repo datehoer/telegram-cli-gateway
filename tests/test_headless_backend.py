@@ -76,9 +76,9 @@ class HeadlessParserTests(unittest.TestCase):
             return {"type": "stream_event", "event": {"type": "message_start", "message": {"id": message_id}}}
 
         stream = [
-            start("msg_1"), text("先查日期。"),
-            start("msg_2"), text("今天是 10 月 6 日"),
-            {"type": "result", "subtype": "success", "is_error": False, "result": "今天是 10 月 6 日"},
+            start("msg_1"), text("Checking the date first."),
+            start("msg_2"), text("It is October 6."),
+            {"type": "result", "subtype": "success", "is_error": False, "result": "It is October 6."},
         ]
 
         def parse(cli: str, values: list[dict[str, object]]) -> list[tuple[str, object]]:
@@ -93,19 +93,19 @@ class HeadlessParserTests(unittest.TestCase):
             return events
 
         self.assertEqual(parse("claude", stream), [
-            ("message_delta", {"id": "msg_1", "delta": "先查日期。"}),
-            ("message_delta", {"id": "msg_2", "delta": "今天是 10 月 6 日"}),
-            ("message_completed", {"id": "msg_2", "phase": "final_answer", "text": "今天是 10 月 6 日"}),
+            ("message_delta", {"id": "msg_1", "delta": "Checking the date first."}),
+            ("message_delta", {"id": "msg_2", "delta": "It is October 6."}),
+            ("message_completed", {"id": "msg_2", "phase": "final_answer", "text": "It is October 6."}),
             ("completed", None),
         ])
         # Grok's result has not been verified to repeat only its last message.
         self.assertEqual(parse("grok", stream), [
-            ("delta", "先查日期。"),
-            ("delta", "今天是 10 月 6 日"),
+            ("delta", "Checking the date first."),
+            ("delta", "It is October 6."),
             ("completed", None),
         ])
         # Without partial messages the result is still the only visible answer.
-        self.assertEqual(parse("claude", stream[-1:]), [("delta", "今天是 10 月 6 日"), ("completed", None)])
+        self.assertEqual(parse("claude", stream[-1:]), [("delta", "It is October 6."), ("completed", None)])
 
     def test_grok_result_returns_errors_list_detail(self) -> None:
         events = self.backend._parse_anthropic_event(
@@ -283,8 +283,8 @@ for value in values:
         self.assertEqual(events, [("completed", None)])
 
     def test_killed_process_emits_interrupted_not_error(self) -> None:
-        """进程被信号杀死（网关重启/关机连累、OOM 等）时上报 interrupted，
-        而不是 error：上层据此保留恢复候选而不是标记失败。"""
+        """A process killed by a signal (gateway restart or shutdown, OOM, ...) reports
+        interrupted, not error, so the caller keeps a recovery candidate instead of a failure."""
         events: list[tuple[str, object]] = []
         backend = HeadlessBackend({}, lambda _sid, _tid, kind, data: events.append((kind, data)))
         process = subprocess.Popen(
@@ -298,9 +298,9 @@ for value in values:
         self.assertEqual(events, [("interrupted", -15)])
 
     def test_abnormal_exit_without_error_event_is_interrupted(self) -> None:
-        """非零退出且 stdout 没有明确 error 事件时也按可恢复的中断处理：
-        有些 CLI 把外部信号转成正的退出码（如 pi 的 143），不能只凭
-        returncode 符号判断。"""
+        """A nonzero exit without an explicit error event on stdout is also a recoverable
+        interruption: some CLIs map external signals to positive exit codes (Pi uses 143),
+        so the sign of returncode alone is not enough."""
         events: list[tuple[str, object]] = []
         backend = HeadlessBackend({}, lambda _sid, _tid, kind, data: events.append((kind, data)))
         process = subprocess.Popen(
@@ -314,7 +314,7 @@ for value in values:
         self.assertEqual([kind for kind, _data in events], ["interrupted"])
 
     def test_stdout_error_event_still_emits_error(self) -> None:
-        """CLI 在 stdout 明确报告 error（如认证失败、模型错误）仍走 error 分支。"""
+        """An explicit error on stdout (authentication failure, model error) still takes the error path."""
         events: list[tuple[str, object]] = []
         backend = HeadlessBackend({}, lambda _sid, _tid, kind, data: events.append((kind, data)))
         process = subprocess.Popen(
@@ -328,7 +328,7 @@ for value in values:
         self.assertEqual([kind for kind, _data in events], ["error"])
 
     def test_compact_session_emits_compact_command_and_returns_summary(self) -> None:
-        """Pi 的 RPC compact：发 compact JSON 命令，收到成功响应后返回摘要。"""
+        """Pi RPC compact: send the compact JSON command and return a summary on success."""
         events: list[tuple[str, object]] = []
         backend = HeadlessBackend(
             {"pi": ("python3", "-c", FAKE_PI_RPC_SCRIPT)},
@@ -336,12 +336,12 @@ for value in values:
         )
         session = CliSession("pi-compact", "pi", "/tmp", "", "", 1, "now", "headless-json", "sess-1")
         result = backend.compact_session(session)
-        self.assertEqual(result, "已触发上下文压缩。")
+        self.assertEqual(result, "Context compaction started.")
         # Compression invalidates the old occupancy without creating an answer turn.
         self.assertEqual(events, [("usage", {"context_tokens": None, "external_id": "sess-1"})])
 
     def test_compact_session_reports_failure(self) -> None:
-        """Pi RPC compact 失败（无可压缩内容等）返回错误摘要而不是抛异常。"""
+        """A failed Pi RPC compact (nothing to compact, ...) returns an error summary instead of raising."""
         events: list[tuple[str, object]] = []
         backend = HeadlessBackend(
             {"pi": ("python3", "-c", FAKE_PI_RPC_FAIL_SCRIPT)},
@@ -349,7 +349,7 @@ for value in values:
         )
         session = CliSession("pi-compact-fail", "pi", "/tmp", "", "", 1, "now", "headless-json", "sess-1")
         result = backend.compact_session(session)
-        self.assertEqual(result, "压缩未执行：Nothing to compact (session too small)")
+        self.assertEqual(result, "Compaction did not run: Nothing to compact (session too small)")
         self.assertEqual([kind for kind, _data in events], [])
 
     def test_build_command_includes_model_and_effort_flags(self) -> None:
@@ -373,16 +373,16 @@ for value in values:
         self.assertIn(("--thinking", "low"), zip(args, args[1:]))
 
     def test_pi_attaches_images_and_lists_other_files(self) -> None:
-        """pi 把非图片的 @file 当文本整段内联，WAV 这类二进制文件只能给路径。"""
+        """Pi inlines a non-image @file as text, so binaries such as WAV only get paths."""
         backend = HeadlessBackend({"pi": ("pi",)}, lambda *_args: None)
         pi = CliSession("p1", "pi", "/tmp", "", "", 1, "now", "headless-json", "id")
         photo = Attachment(Path("/up/photo.jpg"), "photo.jpg", "image/jpeg", True)
         heic = Attachment(Path("/up/shot.heic"), "shot.heic", "image/heic", True)
         wav = Attachment(Path("/up/take.wav"), "take.wav", "audio/x-wav", False)
-        args = backend._build_command(pi, "听一下", (photo, heic, wav))
+        args = backend._build_command(pi, "listen to this", (photo, heic, wav))
         self.assertEqual([arg for arg in args if arg.startswith("@")], ["@/up/photo.jpg"])
         prompt = args[-1]
-        self.assertTrue(prompt.startswith("听一下\n\n"))
+        self.assertTrue(prompt.startswith("listen to this\n\n"))
         self.assertIn("- shot.heic: /up/shot.heic", prompt)
         self.assertIn("- take.wav: /up/take.wav", prompt)
         self.assertNotIn("photo.jpg", prompt)
@@ -411,7 +411,7 @@ for value in values:
         with self.assertRaises(HeadlessBackendError):
             backend.compact_session(claude)
 
-        # 会话忙碌时拒绝（前面有个运行中的进程）
+        # Refused while the session is busy (a process is already running)
         busy = CliSession("pi-busy", "pi", "/tmp", "", "", 1, "now", "headless-json", "sess-1")
         probe = subprocess.Popen(["python3", "-c", "import time; time.sleep(30)"])
         try:

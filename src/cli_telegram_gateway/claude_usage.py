@@ -83,7 +83,7 @@ def read_claude_usage(external_id: str, cwd: str) -> dict[str, Any]:
         snapshot = headless_usage("claude", value)
         if "context_tokens" in snapshot:
             if snapshot["context_tokens"] is not None:
-                snapshot["context_basis"] = "最近成功请求输入 · 历史记录"
+                snapshot["context_basis"] = "history"
                 usage = value["message"]["usage"]
                 for source, target in (
                     ("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"),

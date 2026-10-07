@@ -216,8 +216,8 @@ class SessionManager:
             return session.turn_count
 
     def rotate_external_id(self, session_id: str) -> str:
-        """给 headless 会话换一个新的 external_id 并重置 turn_count：
-        下次 start_turn 会以首轮模式开全新上下文（/clear 用）。"""
+        """Give a headless session a new external_id and reset turn_count, so the
+        next start_turn opens a fresh context in first-turn mode (used by /clear)."""
         with self._lock:
             session = self._session_from_state(session_id)
             if not session:
@@ -468,10 +468,11 @@ class SessionManager:
     def command_route_for_message(
         self, chat_id: int, message_id: int, bot_key: str = "default"
     ) -> str | None:
-        """返回直连命令结果卡片对应的 turn_id。
+        """Return the turn_id behind a direct command result card.
 
-        命令卡片用 ``command_routes`` 与 CLI 会话卡片分开路由：回复一张命令卡片
-        不应该把消息送进当前 CLI 会话。条目有界，并且随命令结束删除。
+        Command cards are routed through ``command_routes``, apart from CLI session
+        cards: replying to a command card must not send text into the current CLI
+        session. Entries are bounded and removed when the command ends.
         """
         with self._lock:
             route = self._message_key(chat_id, message_id, bot_key)
@@ -517,7 +518,7 @@ class SessionManager:
                 "session_id": session_id,
                 "path": str(path),
                 "bot_key": bot_key,
-                # 超过发送上限的产物只能回路径，不能当文件发。
+                # An artifact over the send limit can only be returned as a path.
                 "only_path": bool(only_path),
             }
             if len(artifacts) > 500:
@@ -533,7 +534,8 @@ class SessionManager:
         turn_id: str,
         bot_key: str = "default",
     ) -> None:
-        """记录一个正在执行的任务；网关重启后用它报告中断，而不是留下"运行中"假象。"""
+        """Record a running task so a gateway restart reports the interruption
+        instead of leaving a stale "running" state."""
         with self._lock:
             self._state["in_flight"][session_id] = {
                 "chat_id": chat_id,
@@ -543,7 +545,7 @@ class SessionManager:
             self._save_state()
 
     def clear_in_flight(self, session_id: str, turn_id: str | None = None) -> bool:
-        """清除进行中标记；返回是否确实清除了某个任务。"""
+        """Clear the in-flight marker; return whether a task was actually cleared."""
         with self._lock:
             current = self._state["in_flight"].get(session_id)
             if not current:
@@ -555,7 +557,7 @@ class SessionManager:
             return True
 
     def get_in_flight(self, session_id: str) -> str | None:
-        """返回会话当前未完成任务的 turn_id；无则返回 None。"""
+        """Return the turn_id of the session's unfinished task, or None."""
         with self._lock:
             current = self._state["in_flight"].get(session_id)
             return str(current["turn_id"]) if isinstance(current, dict) and current.get("turn_id") else None
@@ -584,10 +586,10 @@ class SessionManager:
     def resolve_artifact(
         self, chat_id: int, token: str, bot_key: str = "default"
     ) -> tuple[CliSession | None, Path] | None:
-        """按 token 取回本地产物，并校验它属于这个聊天和入口。
+        """Look up a local artifact by token and check it belongs to this chat and bot.
 
-        会话可以是 None：直连命令扩展的产物挂在 turn_id 上，没有对应的 CLI
-        会话。所有权已经由 chat_id + bot_key 保证，不需要会话存在。
+        The session may be None: direct command artifacts hang off a turn_id with no
+        CLI session. chat_id + bot_key already establish ownership.
         """
         with self._lock:
             raw = self._state.get("artifacts", {}).get(token)

@@ -10,30 +10,30 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 EXTENSION = REPO / "extensions" / "bilibili"
 
-# 这个扩展只依赖标准库，但装在 extensions/ 下，不在包的 import 路径里。
-# 直接按文件路径加载，测试不需要网关、不需要网络。
+# The extension needs only the standard library but lives under extensions/, outside the
+# package import path. Load it by file path; the tests need neither the gateway nor a network.
 sys.path.insert(0, str(EXTENSION))
 import bili
 
 MAIN_SPEC = importlib.util.spec_from_file_location("bili_main", EXTENSION / "main.py")
 assert MAIN_SPEC and MAIN_SPEC.loader
 main_module = importlib.util.module_from_spec(MAIN_SPEC)
-# dataclasses 处理注解时要在 sys.modules 里按 __module__ 找到这个模块，
-# 用 spec 直接 exec 必须先手动登记。
+# dataclasses look the module up in sys.modules by __module__ while processing annotations,
+# so executing a spec directly needs a manual registration first.
 sys.modules["bili_main"] = main_module
 MAIN_SPEC.loader.exec_module(main_module)
 
 
 class WbiTests(unittest.TestCase):
     def test_mixin_key_matches_the_documented_golden_value(self) -> None:
-        """混入密钥表是硬编码的常量，必须与 B站文档一致，否则所有签名都会错。"""
+        """The mixin key table is a hard-coded constant; it must match Bilibili's documentation or every signature breaks."""
         img_key = "7cd084941338484aae1ad9425b84077c"
         sub_key = "4932caff0ff746eab6f01bf08b70ac45"
         mixin = "".join((img_key + sub_key)[index] for index in bili.MIXIN_KEY_ENC_TAB[:32])
         self.assertEqual(mixin, "ea1db124af3c7062474693fa704f4ff8")
 
     def test_fnval_combination_is_the_accepted_value(self) -> None:
-        """少 OR 任何一位都会被 B站拒为 -400 或静默降档。"""
+        """Missing any ORed flag gets a -400 from Bilibili or a silent downgrade."""
         self.assertEqual(bili.FNVAL_DEFAULT, 4048)
 
     def test_wbi_query_is_deterministic_and_sorted(self) -> None:
@@ -43,7 +43,7 @@ class WbiTests(unittest.TestCase):
         self.assertTrue(query.startswith("bvid=BV1xx411c7mD&cid=62131&wts=1700000000&w_rid="))
         self.assertEqual(len(query.rsplit("w_rid=", 1)[1]), 32)
         same = bili.wbi_query({"cid": 62131, "bvid": "BV1xx411c7mD"}, img_key, sub_key, now=1700000000)
-        self.assertEqual(query, same, "参数顺序不应影响签名")
+        self.assertEqual(query, same, "parameter order must not change the signature")
 
     def test_wbi_encode_filters_special_characters(self) -> None:
         self.assertEqual(bili._wbi_encode("a b"), "a%20b")
@@ -84,11 +84,11 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(bili.pick_quality(accepted, 120), 120)
 
     def test_falls_back_to_the_best_available_when_request_is_too_high(self) -> None:
-        # 未登录：只有 480P/360P，请求 4K 时应拿到 480P 而不是报错
+        # Signed out: only 480P/360P exist, so a 4K request gets 480P instead of an error
         self.assertEqual(bili.pick_quality([32, 16], 120), 32)
 
     def test_falls_back_upwards_when_request_is_too_low(self) -> None:
-        # 只有 1080P 可用而用户要 360P 时，给 1080P 比直接失败更好用
+        # With only 1080P available and 360P requested, 1080P beats failing outright
         self.assertEqual(bili.pick_quality([80], 16), 80)
 
     def test_unknown_and_empty_input_is_tolerated(self) -> None:
@@ -240,12 +240,37 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue((EXTENSION / "bili.py").is_file())
 
 
+class LanguageTests(unittest.TestCase):
+    def test_every_message_has_chinese_and_no_entry_is_stale(self) -> None:
+        import ast
+
+        literals: set[str] = set()
+        for path in (EXTENSION / "bili.py", EXTENSION / "main.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if (
+                    isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in {"tr", "N_"} and node.args
+                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+                ):
+                    literals.add(node.args[0].value)
+        self.assertEqual(sorted(literals - set(bili.ZH)), [])
+        self.assertEqual(sorted(set(bili.ZH) - literals), [])
+
+    def test_tg_language_switches_messages_to_chinese(self) -> None:
+        signed_out = bili.Account(logged_in=False)
+        self.assertEqual(bili.quality_cap(signed_out), "480P (signed-out cap)")
+        self.addCleanup(setattr, bili, "LANGUAGE", bili.LANGUAGE)
+        bili.LANGUAGE = "zh"
+        self.assertEqual(bili.quality_cap(signed_out), "480P（未登录上限）")
+        self.assertIn("产物目录：/tmp", bili.tr(main_module.HELP, workdir="/tmp"))
+
+
 if __name__ == "__main__":
     unittest.main()
 
 
 class ShortLinkTests(unittest.TestCase):
-    """b23.tv 短链里没有 BV 号，必须先跟随跳转。"""
+    """b23.tv short links carry no BV id; the redirect must be followed first."""
 
     def test_recognizes_short_link_hosts(self) -> None:
         for raw in (
@@ -267,7 +292,7 @@ class ShortLinkTests(unittest.TestCase):
                 self.assertFalse(bili.is_short_link(raw))
 
     def test_short_link_is_resolved_to_a_bv_id(self) -> None:
-        """真网络调用；失败只跳过，不让离线环境挂掉整个测试。"""
+        """A real network call; a failure only skips, so offline runs do not fail the suite."""
         try:
             resolved = bili.resolve_short_link("https://b23.tv/dfBSIGr")
         except bili.BiliError as exc:
@@ -285,7 +310,7 @@ class ShortLinkTests(unittest.TestCase):
 
 
 class MultiUrlTests(unittest.TestCase):
-    """主 CDN 实测会中途静默截断，必须保留备用地址。"""
+    """The primary CDN has been seen to truncate silently, so backup addresses must stay."""
 
     def test_collects_base_and_backup_urls_in_order(self) -> None:
         item = {
@@ -369,11 +394,10 @@ class MultiUrlTests(unittest.TestCase):
 
 class PlayurlDurlTests(unittest.TestCase):
     def test_accept_quality_is_documented_as_availability_not_permission(self) -> None:
-        """accept_quality 列的是视频有哪些档；实际下发看 data.quality。
+        """accept_quality lists the qualities the video has; data.quality is what is delivered.
 
-        未登录时 accept_quality 可能是 [126,120,116,80,64,32,16]，但
-        data.quality 恒为 32/16。这个差异是用户报"分辨率不对"的根因，
-        所以在这里钉住。
+        Signed out, accept_quality may be [126,120,116,80,64,32,16] while data.quality is
+        always 32/16. That gap caused the "wrong resolution" report, so it is pinned here.
         """
         data = {"quality": 32, "accept_quality": [120, 80, 64, 32, 16]}
         videos, _audios = bili.streams_from_dash(

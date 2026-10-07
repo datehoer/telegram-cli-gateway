@@ -1,10 +1,17 @@
 {
   "schema_version": 1,
   "id": "bilibili",
-  "name": "哔哩哔哩下载",
+  "name": "Bilibili download",
   "command": "bili",
-  "usage": "/bili <URL|BV号> [画质]",
-  "description": "下载 B站视频；支持 Cookie / 扫码登录、分P、画质选择",
+  "usage": "/bili <URL|BV id> [quality]",
+  "description": "Download Bilibili videos; cookie or QR sign-in, multi-part videos, quality choice",
+  "i18n": {
+    "zh": {
+      "name": "哔哩哔哩下载",
+      "usage": "/bili <URL|BV号> [画质]",
+      "description": "下载 B站视频；支持 Cookie / 扫码登录、分P、画质选择"
+    }
+  },
   "exec": ["python3", "main.py"],
   "cwd": "/srv/projects/downloads",
   "timeout_seconds": 7200,

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""哔哩哔哩直连命令扩展。
+"""Bilibili direct command extension.
 
-契约（见 telegram-cli-gateway/extensions/README.md）：
-- 参数从 argv 拿；网关不经过 shell。
-- stdout 里 `@@PROGRESS <文本>` 是进度行，网关原地刷新卡片。
-- stdout 里的本机绝对路径会在允许目录内时挂上「发送图片/视频/文件」按钮。
-- 退出码 0 成功，非 0 失败；失败原因写 stderr。
+Contract (see telegram-cli-gateway/extensions/README.md):
+- Arguments come from argv; the gateway uses no shell.
+- `@@PROGRESS <text>` lines on stdout are progress; the gateway updates the card in place.
+- Absolute local paths on stdout inside the allowed directories get "send image/video/file" buttons.
+- Exit code 0 means success, anything else failure; the reason goes to stderr.
+- TG_LANGUAGE (en or zh) selects the message language.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bili
+from bili import N_, tr
 
 PROGRESS = "@@PROGRESS"
 MANIFEST_DIR = Path(os.environ.get("TG_MANIFEST_DIR") or Path(__file__).resolve().parent)
@@ -31,25 +33,25 @@ WORKDIR = Path(os.environ.get("TG_WORKDIR") or os.getcwd())
 COOKIE_FILE = bili.cookie_path(MANIFEST_DIR)
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
-# 单路请求失败后在备用 CDN 上的重试次数。
+# Retries on backup CDNs after one stream request fails.
 RETRY_HOSTS = 3
 
-# 注意：这里不能出现以 "@@PROGRESS" 开头的行 —— 网关会把它当进度行消费掉，
-# 导致 HELP 的第一行静默消失。
-HELP = f"""用法：
-  /bili <URL|BV号|av号|ep号|ss号> [画质] [选项]
-  /bili login cookie <整条 Cookie 串>   # 用 SESSDATA 等 Cookie 登录
-  /bili login                            # 扫码登录
+# No line here may start with "@@PROGRESS": the gateway would consume it as a progress
+# line and the first line of HELP would silently vanish.
+HELP = N_("""Usage:
+  /bili <URL|BV|av|ep|ss id> [quality] [options]
+  /bili login cookie <full cookie string>   # sign in with SESSDATA and other cookies
+  /bili login                               # sign in with a QR code
   /bili logout
   /bili whoami
 
-画质：8k 4k 1080p60 1080p+ 1080p 720p 480p 360p（默认按账号权限取最高）
-选项：-p <分P序号>  --audio-only  --full
-产物目录：{WORKDIR}
+Quality: 8k 4k 1080p60 1080p+ 1080p 720p 480p 360p (default: the best your account allows)
+Options: -p <part number>  --audio-only  --full
+Output directory: {workdir}
 
-说明：未登录时 B站把 DASH 流限制到 480P，只有 durl 单文件能到 720P。
-      --full 走 durl 换清晰度，代价是体积大 3~4 倍。登录后 DASH 就能给到 1080P。
-"""
+Note: signed out, Bilibili limits DASH streams to 480P; only the single-file durl stream reaches 720P.
+      --full uses durl for that resolution at 3-4 times the size. Signed in, DASH reaches 1080P.
+""")
 
 
 @dataclass
@@ -59,7 +61,7 @@ class Args:
     quality_text: str = ""
     page: int = 1
     audio_only: bool = False
-    # 未登录时 DASH 被卡在 480P，durl 单文件能到 720P，但体积大得多。
+    # Signed out, DASH stops at 480P; single-file durl reaches 720P but is much larger.
     full: bool = False
 
 
@@ -69,11 +71,13 @@ HELP_WORDS = frozenset({"-h", "--help", "help"})
 
 
 def dispatch(argv: list[str]) -> tuple[str, list[str]]:
-    """把原始输入拆成 (子命令, 参数行)。
+    """Split the raw input into (subcommand, argument lines).
 
-    网关刻意不做 shell 分词（Cookie 里的引号会炸 shlex），所以拆词在这里做：
-      * 以 login/logout/whoami 开头 → 对应子命令，整段原文交给它自己解析；
-      * 其他情况 → 下载，每行按空格拆成 token。
+    The gateway deliberately skips shell tokenizing (quotes in cookies break shlex), so it
+    happens here:
+      * input starting with login/logout/whoami selects that subcommand, which parses
+        the raw text itself;
+      * anything else is a download, and each line is split into tokens on spaces.
     """
     raw = os.environ.get("TG_RAW_ARGS", "")
     if not raw:
@@ -90,7 +94,7 @@ def dispatch(argv: list[str]) -> tuple[str, list[str]]:
 
 
 def flatten(lines: list[str]) -> list[str]:
-    """把参数行按空格拆成 token（下载参数里没有带空格的值）。"""
+    """Split argument lines into tokens on spaces (download arguments have no values with spaces)."""
     tokens: list[str] = []
     for line in lines:
         tokens.extend(line.split())
@@ -106,7 +110,7 @@ def parse_args(argv: list[str]) -> Args | None:
         if item in {"-p", "--page"}:
             index += 1
             if index >= len(argv) or not argv[index].isdigit():
-                raise bili.BiliError("-p 需要一个分P序号，例如 -p 2")
+                raise bili.BiliError(tr("-p needs a part number, for example -p 2"))
             args.page = int(argv[index])
         elif item == "--audio-only":
             args.audio_only = True
@@ -118,13 +122,13 @@ def parse_args(argv: list[str]) -> Args | None:
             args.quality = bili.QUALITY_ALIASES[item.lower()]
             args.quality_text = item
         elif item.startswith("-"):
-            raise bili.BiliError(f"未知选项：{item}")
+            raise bili.BiliError(tr("Unknown option: {option}", option=item))
         else:
             rest.append(item)
         index += 1
     args.ref = rest[0] if rest else ""
     if not args.ref:
-        raise bili.BiliError("缺少视频地址或 BV 号")
+        raise bili.BiliError(tr("Missing a video URL or BV id"))
     return args
 
 
@@ -134,7 +138,7 @@ def progress(text: str) -> None:
 
 def human_size(size: int) -> str:
     if size <= 0:
-        return "未知"
+        return tr("unknown")
     for unit in ("B", "KiB", "MiB", "GiB"):
         if size < 1024 or unit == "GiB":
             return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
@@ -148,17 +152,18 @@ def sanitize(name: str, limit: int = 80) -> str:
     return (cleaned[:limit] or "bilibili").strip()
 
 
-# --- 下载 ---
+# --- Download ---
 
 
 CHUNK = 1 << 20
 
 
 def fetch_stream(stream: bili.Stream, target: Path, label: str) -> None:
-    """下载单路流，逐个 CDN 地址重试。
+    """Download one stream, retrying each CDN address in turn.
 
-    主地址（akamaized 等）实测会在中途静默截断：连接正常关闭，但收到的字节数
-    远少于 Content-Length。所以每下载完一遍都要校验字节数，对不上就换下一个地址。
+    The primary address (akamaized and others) has been seen to truncate silently: the
+    connection closes normally but far fewer bytes than Content-Length arrive. So every
+    pass checks the byte count and moves to the next address on a mismatch.
     """
     import urllib.request
 
@@ -169,7 +174,7 @@ def fetch_stream(stream: bili.Stream, target: Path, label: str) -> None:
 
     for index, url in enumerate(urls):
         if index:
-            progress(f"{label} 换备用地址重试（{index + 1}/{len(urls)}）")
+            progress(tr("{label}: retrying on backup address {current}/{total}", label=label, current=index + 1, total=len(urls)))
             part.unlink(missing_ok=True)
         done = 0
         total = stream.known_bytes
@@ -201,19 +206,19 @@ def fetch_stream(stream: bili.Stream, target: Path, label: str) -> None:
                                 )
                             else:
                                 progress(f"{label} {human_size(done)}")
-        except Exception as exc:  # noqa: BLE001 - 任何网络/磁盘错误都换下一个地址
-            problems.append(f"地址{index + 1}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - any network or disk error moves to the next address
+            problems.append(tr("address {number}: {error}", number=index + 1, error=exc))
             continue
 
         if total and done != total:
-            problems.append(f"地址{index + 1}: 只收到 {human_size(done)}/{human_size(total)}")
+            problems.append(tr("address {number}: received only {done}/{total}", number=index + 1, done=human_size(done), total=human_size(total)))
             continue
         part.replace(target)
         return
 
     part.unlink(missing_ok=True)
-    detail = "；".join(problems) or "未知原因"
-    raise bili.BiliError(f"下载{label}失败，所有地址都不完整（{detail}）")
+    detail = "; ".join(problems) or tr("unknown reason")
+    raise bili.BiliError(tr("Downloading the {label} failed; every address was incomplete ({detail})", label=label, detail=detail))
 
 
 def has_ffmpeg() -> bool:
@@ -226,7 +231,7 @@ def merge(video: Path, audio: Path | None, target: Path) -> None:
         return
     if not has_ffmpeg():
         raise bili.BiliError(
-            "需要 ffmpeg 才能把音视频合流；请安装 ffmpeg 或使用 --audio-only"
+            tr("ffmpeg is needed to merge audio and video; install ffmpeg or use --audio-only")
         )
     command = [
         FFMPEG,
@@ -244,25 +249,25 @@ def merge(video: Path, audio: Path | None, target: Path) -> None:
         "+faststart",
         str(target),
     ]
-    progress("合流中…")
+    progress(tr("Merging…"))
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         detail = (result.stderr or "").strip()[-500:]
-        raise bili.BiliError(f"ffmpeg 合流失败：{detail}")
+        raise bili.BiliError(tr("ffmpeg merge failed: {detail}", detail=detail))
     video.unlink(missing_ok=True)
     audio.unlink(missing_ok=True)
 
 
-# --- 子命令 ---
+# --- Subcommands ---
 
 
 def cmd_login(lines: list[str]) -> int:
-    """登录。两种写法都支持：
+    """Sign in. Both forms work:
 
-        /bili login cookie SESSDATA=...; bili_jct=...     （子命令与 Cookie 同行）
-        /bili login                                        （扫码）
+        /bili login cookie SESSDATA=...; bili_jct=...     (subcommand and cookie on one line)
+        /bili login                                        (QR code)
         /bili login
-        cookie SESSDATA=...                                （Cookie 换行）
+        cookie SESSDATA=...                                (cookie on the next line)
     """
     text = " ".join(line.strip() for line in lines).strip()
     if text.lower().startswith("login"):
@@ -271,61 +276,62 @@ def cmd_login(lines: list[str]) -> int:
     if text.lower().startswith("cookie"):
         raw = text[len("cookie") :].strip()
         if not raw:
-            raise bili.BiliError("用法：/bili login cookie <整条 Cookie 串>")
+            raise bili.BiliError(tr("Usage: /bili login cookie <full cookie string>"))
         cookies = bili.parse_cookie_header(raw)
         probe = bili.account_info(cookies.as_header())
         if not probe.logged_in:
-            raise bili.BiliError("Cookie 无效或已过期（nav 接口报告未登录）")
+            raise bili.BiliError(tr("The cookie is invalid or expired (the nav API reports no sign-in)"))
         bili.save_cookies(COOKIE_FILE, cookies)
-        print(f"Cookie 登录成功：{probe.uname or '(未知用户)'}")
+        print(tr("Signed in with the cookie: {user}", user=probe.uname or tr("(unknown user)")))
         if probe.vip_label:
-            print(f"会员：{probe.vip_label}")
-        print(f"画质上限：{bili.quality_cap(probe)}")
-        print("已保存到本机 cookie 文件（0600 权限，不在 .env 里）。")
+            print(tr("Membership: {label}", label=probe.vip_label))
+        print(tr("Quality cap: {cap}", cap=bili.quality_cap(probe)))
+        print(tr("Saved to the local cookie file (mode 0600, not in .env)."))
         return 0
     if text:
-        raise bili.BiliError(
-            f"无法识别的登录方式：{text[:60]}\n"
-            "用法：/bili login  （扫码）  或  /bili login cookie <整条 Cookie 串>"
-        )
+        raise bili.BiliError(tr(
+            "Unrecognized sign-in method: {text}\n"
+            "Usage: /bili login (QR code) or /bili login cookie <full cookie string>",
+            text=text[:60],
+        ))
 
 def cmd_logout() -> int:
     if bili.clear_cookies(COOKIE_FILE):
-        print("已删除本机 cookie，后续下载按未登录处理（480P 上限）。")
+        print(tr("Deleted the local cookie; later downloads run signed out (480P cap)."))
     else:
-        print("本机本来就没有保存 cookie。")
+        print(tr("No cookie was saved on this machine."))
     return 0
 
 
 def cmd_whoami() -> int:
     cookies = bili.load_cookies(COOKIE_FILE)
     if not cookies.logged_in:
-        print("未登录。")
-        print(f"画质上限：{bili.quality_cap(bili.Account(logged_in=False))}")
-        print("用 /bili login 扫码，或 /bili login cookie <Cookie 串>。")
+        print(tr("Not signed in."))
+        print(tr("Quality cap: {cap}", cap=bili.quality_cap(bili.Account(logged_in=False))))
+        print(tr("Use /bili login for a QR code, or /bili login cookie <cookie string>."))
         return 0
     account = bili.account_info(cookies.as_header())
     if not account.logged_in:
-        print("保存的 cookie 已失效，请重新 /bili login。")
+        print(tr("The saved cookie expired; run /bili login again."))
         return 1
-    print(f"已登录：{account.uname}（mid {account.mid}）")
+    print(tr("Signed in: {user} (mid {mid})", user=account.uname, mid=account.mid))
     if account.vip_label:
-        print(f"会员：{account.vip_label}")
-    print(f"画质上限：{bili.quality_cap(account)}")
+        print(tr("Membership: {label}", label=account.vip_label))
+    print(tr("Quality cap: {cap}", cap=bili.quality_cap(account)))
     return 0
 
 
 def cmd_download(lines: list[str]) -> int:
     parsed = parse_args(flatten(lines))
     if parsed is None:
-        print(HELP)
+        print(tr(HELP, workdir=WORKDIR))
         return 0
     cookies = bili.load_cookies(COOKIE_FILE)
     cookie_header = cookies.as_header()
-    # 短链（b23.tv 等）要跟随跳转才能拿到 BV 号 / 分P。
+    # Short links (b23.tv and others) must be followed to get the BV id and part.
     target = parsed.ref
     if bili.is_short_link(target):
-        progress("解析短链…")
+        progress(tr("Resolving the short link…"))
         target = bili.resolve_short_link(target)
         if parsed.page == 1:
             query = urllib.parse.parse_qs(urllib.parse.urlparse(target).query)
@@ -336,9 +342,10 @@ def cmd_download(lines: list[str]) -> int:
     if ref.kind == "video":
         info = bili.video_info(ref)
         if parsed.page < 1 or parsed.page > len(info.pages):
-            raise bili.BiliError(
-                f"分P {parsed.page} 不存在；这个视频有 {len(info.pages)} 个分P"
-            )
+            raise bili.BiliError(tr(
+                "Part {page} does not exist; this video has {count} parts",
+                page=parsed.page, count=len(info.pages),
+            ))
         page = info.pages[parsed.page - 1]
         title = info.title
         if len(info.pages) > 1:
@@ -357,7 +364,7 @@ def cmd_download(lines: list[str]) -> int:
         cid = episode.cid
         ep_id = episode.ep_id
 
-    progress(f"已解析：{title}")
+    progress(tr("Resolved: {title}", title=title))
     data, accepted = bili.playurl(
         cid=cid, bvid=bvid, aid=aid, ep_id=ep_id, qn=parsed.quality, cookie=cookie_header
     )
@@ -365,8 +372,8 @@ def cmd_download(lines: list[str]) -> int:
     single_file = False
     durl_data: dict[str, Any] = {}
 
-    # 未登录时 DASH 实际只下发 480P/360P（accept_quality 只是"这视频有哪些档"）。
-    # 用户要更高画质，或显式 --full 时，改走 durl 单文件流。
+    # Signed out, DASH only delivers 480P/360P (accept_quality just lists what the video has).
+    # When the user wants more, or passes --full, switch to the single-file durl stream.
     dash_quality = data.get("quality") or 0
     wants_higher = (
         parsed.quality in bili.QUALITY_ORDER
@@ -385,25 +392,29 @@ def cmd_download(lines: list[str]) -> int:
             videos, audios, single_file = [only], [], True
 
     if not videos:
-        raise bili.BiliError("没有拿到可用的视频流；可能需要登录或该视频有地区限制")
+        raise bili.BiliError(tr("No usable video stream; you may need to sign in, or the video is region-locked"))
 
     chosen = videos[0]
     delivered = chosen.quality
     if bili.QUALITY_ORDER.index(delivered) < bili.QUALITY_ORDER.index(parsed.quality):
         if not cookie_header:
-            progress(
-                f"未登录只有 {bili.quality_name(delivered)}；登录后 DASH 可到 1080P。"
-                f"用 /bili login 登录"
-            )
+            progress(tr(
+                "Signed out, only {quality} is available; signed in, DASH reaches 1080P. "
+                "Sign in with /bili login",
+                quality=bili.quality_name(delivered),
+            ))
         elif accepted:
             cap = bili.quality_name(max(accepted, key=bili.QUALITY_ORDER.index))
-            progress(f"账号最高可用 {cap}，已按 {bili.quality_name(delivered)} 下载")
-    mode = "durl 单文件" if single_file else "DASH"
-    progress(f"画质 {bili.quality_name(delivered)} · {mode} · 编码 {chosen.codec or '未知'}")
+            progress(tr("Your account allows up to {cap}; downloading {quality}", cap=cap, quality=bili.quality_name(delivered)))
+    mode = tr("durl single file") if single_file else "DASH"
+    progress(tr(
+        "Quality {quality} · {mode} · codec {codec}",
+        quality=bili.quality_name(delivered), mode=mode, codec=chosen.codec or tr("unknown"),
+    ))
 
     folder = (WORKDIR / sanitize(title)).resolve()
     stem = sanitize(title)
-    # 提前告诉用户体积，避免下完才发现超过 Telegram 发送上限。
+    # Report the size up front so a file over Telegram's send limit is no surprise.
     if chosen.known_bytes:
         estimate = chosen.known_bytes
     else:
@@ -414,11 +425,11 @@ def cmd_download(lines: list[str]) -> int:
         limit = int(os.environ.get("TELEGRAM_MAX_FILE_BYTES") or 0)
         note = ""
         if limit and estimate > limit:
-            note = f" · 超过发送上限 {human_size(limit)}，只会回本机路径"
-        progress(f"预计体积 ≈{human_size(estimate)}{note}")
+            note = tr(" · over the {limit} send limit; only the local path will be returned", limit=human_size(limit))
+        progress(tr("Estimated size ≈{size}{note}", size=human_size(estimate), note=note))
     if parsed.audio_only:
         if not audios:
-            raise bili.BiliError("没有拿到音频流")
+            raise bili.BiliError(tr("No audio stream"))
         target = folder / f"{stem}.m4a"
     else:
         target = folder / f"{stem}.mp4"
@@ -427,10 +438,10 @@ def cmd_download(lines: list[str]) -> int:
     audio_temp = folder / f".{stem}.audio.m4a.part"
     if not parsed.audio_only:
         video_temp = folder / f".{stem}.video.tmp"
-        fetch_stream(chosen, video_temp, "视频流")
+        fetch_stream(chosen, video_temp, tr("video stream"))
     audio_stream = audios[0] if audios else None
     if audio_stream is not None:
-        fetch_stream(audio_stream, audio_temp, "音频流")
+        fetch_stream(audio_stream, audio_temp, tr("audio stream"))
 
     if parsed.audio_only:
         audio_temp.replace(target)
@@ -440,19 +451,19 @@ def cmd_download(lines: list[str]) -> int:
         merge(video_temp, audio_temp if audio_stream else None, target)
 
     size = target.stat().st_size
-    print(f"完成：{bili.quality_name(chosen.quality)} · {human_size(size)}")
-    print(f"时长：{duration // 60} 分 {duration % 60} 秒")
-    print(f"产物：{target}")
+    print(tr("Done: {quality} · {size}", quality=bili.quality_name(chosen.quality), size=human_size(size)))
+    print(tr("Duration: {minutes} min {seconds} s", minutes=duration // 60, seconds=duration % 60))
+    print(tr("Output: {path}", path=target))
     limit = int(os.environ.get("TELEGRAM_MAX_FILE_BYTES") or 0)
     if limit and size > limit:
-        print(f"注意：超过 Telegram 发送上限（{human_size(limit)}），只会回本机路径。")
+        print(tr("Note: over Telegram's send limit ({limit}); only the local path will be returned.", limit=human_size(limit)))
     return 0
 
 
 def main(argv: list[str]) -> int:
     command, lines = dispatch(argv)
     if command in {"", "help"}:
-        print(HELP)
+        print(tr(HELP, workdir=WORKDIR))
         return 0
     if command == "login":
         return cmd_login(lines)
@@ -467,9 +478,9 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
     except bili.BiliError as error:
-        progress("失败")
-        print(f"错误：{error}", file=sys.stderr)
+        progress(tr("Failed"))
+        print(tr("Error: {error}", error=error), file=sys.stderr)
         raise SystemExit(1)
     except KeyboardInterrupt:
-        progress("已取消")
+        progress(tr("Cancelled"))
         raise SystemExit(130)

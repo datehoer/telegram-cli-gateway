@@ -39,6 +39,7 @@ It uses the existing manifest contract and requires no gateway core changes.
   "command": "bili",
   "usage": "/bili <URL> [1080p|720p]",
   "description": "Download a Bilibili video and send it back to Telegram",
+  "i18n": {"zh": {"name": "哔哩哔哩下载", "description": "下载 B站视频并发回 Telegram"}},
   "exec": ["python3", "main.py"],
   "cwd": "/srv/projects/downloads",
   "timeout_seconds": 1800,
@@ -60,6 +61,7 @@ It uses the existing manifest contract and requires no gateway core changes.
 | `timeout_seconds` | ❌ | 1–21600, default 1800; on timeout the process group is `SIGTERM`ed and `SIGKILL`ed 5 seconds later |
 | `max_output_bytes` | ❌ | Trailing bytes of output kept for display, default 16384. Raise it for long-running tasks such as downloads |
 | `enabled` | ❌ | `false` skips the extension (without a warning) |
+| `i18n` | ❌ | Display text per gateway language, for example `{"zh": {"name": …, "usage": …, "description": …}}`. Only `name`, `usage` and `description` can be translated; missing fields fall back to the top-level values |
 
 ## Plugin Contract
 
@@ -74,6 +76,7 @@ What the gateway passes to the plugin:
 | `TG_CHAT_ID` / `TG_USER_ID` | Requester context |
 | `TG_WORKDIR` | The resolved `cwd` |
 | `TG_MANIFEST_DIR` | Absolute path of the extension directory |
+| `TG_LANGUAGE` | The gateway language from `GATEWAY_LANGUAGE`: `en` or `zh`. Extensions may use it for their own messages |
 | `cwd` | Same as `TG_WORKDIR` |
 
 What the plugin returns to the gateway:

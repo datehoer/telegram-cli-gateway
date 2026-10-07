@@ -171,11 +171,12 @@ def split_rich_markdown(markdown: str, limit: int = 30000) -> list[str]:
 
 
 def harden_rich_markdown(text: str) -> str:
-    """把单换行标记成硬换行，保住插件自己排好的版式。
+    """Mark single newlines as hard breaks so an extension's own layout survives.
 
-    Telegram 的 Rich Message 渲染器把段落里的单个 \n 当作软换行，会合并成一行
-    （实测：多行帮助文本被拼成 "用法： /bili <URL> /bili login /bili whoami"）。
-    两个空格或行尾反斜杠会渲染成真正的换行。代码块内部本来就保留换行，跳过不动。
+    Telegram's Rich Message renderer treats a single \n inside a paragraph as a soft
+    break and joins the lines (observed: multi-line help text became
+    "Usage: /bili <URL> /bili login /bili whoami"). Two trailing spaces or a trailing
+    backslash render as a real line break. Code blocks keep their newlines and are skipped.
     """
     if not text:
         return text

@@ -8,6 +8,8 @@ import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .i18n import LANGUAGES
+
 
 class ConfigError(ValueError):
     pass
@@ -75,6 +77,13 @@ def _auto_send_mode(values: dict[str, str], key: str, default: str) -> str:
     return raw
 
 
+def _language(values: dict[str, str]) -> str:
+    raw = values.get("GATEWAY_LANGUAGE", "en").strip().lower()
+    if raw not in LANGUAGES:
+        raise ConfigError(f"GATEWAY_LANGUAGE must be one of {', '.join(LANGUAGES)}")
+    return raw
+
+
 def _local_api_url(values: dict[str, str]) -> str | None:
     raw = values.get("TELEGRAM_LOCAL_API_URL", "").strip()
     if not raw:
@@ -118,10 +127,11 @@ class Config:
     cli_default_efforts: dict[str, str] = field(default_factory=dict)
     command_dir: Path | None = None
     telegram_local_api_url: str | None = None
+    language: str = "en"
 
     @property
     def direct_command_roots(self) -> tuple[Path, ...]:
-        """直连命令扩展的扫描目录。缺失的目录直接跳过。"""
+        """Directories scanned for direct command extensions; missing ones are skipped."""
         roots = [
             root
             for root in (self.command_dir, self.project_dir / "extensions")
@@ -290,4 +300,5 @@ class Config:
             cli_default_models=default_models,
             cli_default_efforts=default_efforts,
             command_dir=command_dir,
+            language=_language(values),
         )

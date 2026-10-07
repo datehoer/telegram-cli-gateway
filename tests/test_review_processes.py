@@ -70,7 +70,7 @@ class ProcessRegressionTests(unittest.TestCase):
         backend = HeadlessBackend({"pi": (sys.executable, "-c", script)}, lambda *_: None)
         session = CliSession("pi-compact", "pi", "/tmp", "", "", 1, "now", "headless-json", "id")
         started = time.monotonic()
-        with self.assertRaisesRegex(HeadlessBackendError, "超时"):
+        with self.assertRaisesRegex(HeadlessBackendError, "timed out"):
             backend.compact_session(session, timeout=0.2)
         self.assertLess(time.monotonic() - started, 3)
         self.assertFalse(backend.is_active(session.session_id))

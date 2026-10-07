@@ -93,10 +93,10 @@ class OffDispatchTests(unittest.TestCase):
         self.app._telegrams["default"].send_local_file = slow_upload  # type: ignore[method-assign]
         self.tap("default", "q1", f"video:{token}")
         self.assertTrue(started.wait(WAIT))
-        self.assertIn(("default", "answer:正在发送"), self.replies)
+        self.assertIn(("default", "answer:Sending"), self.replies)
 
         self.app._dispatch_update("worker", self.text_update("/where"))
-        self.assertTrue(any(bot == "worker" and "当前" in text for bot, text in self.replies))
+        self.assertTrue(any(bot == "worker" and "Current" in text for bot, text in self.replies))
         self.assertFalse(finished.is_set())
         release.set()
         self.assertTrue(finished.wait(WAIT))
@@ -118,7 +118,7 @@ class OffDispatchTests(unittest.TestCase):
         self.tap("default", "q1", f"photo:{token}")
         self.wait_until(lambda: len(uploads) == 1)
         self.tap("default", "q2", f"photo:{token}")
-        self.assertIn(("default", "answer:正在发送，请稍候"), self.replies)
+        self.assertIn(("default", "answer:Already sending; please wait"), self.replies)
         release.set()
         self.wait_until(lambda: not self.app._artifact_uploads)
         self.assertEqual(len(uploads), 1)
@@ -135,7 +135,7 @@ class OffDispatchTests(unittest.TestCase):
         def slow_compaction(_session) -> str:
             compaction_started.set()
             release.wait(WAIT)
-            return "压缩完成。"
+            return "Compaction finished."
 
         def start_turn(_session, text: str, _attachments=()) -> str:
             turns.append(text)
@@ -146,16 +146,16 @@ class OffDispatchTests(unittest.TestCase):
         self.app.headless.start_turn = start_turn  # type: ignore[method-assign]
         self.app._dispatch_update("default", self.text_update("/compact"))
         self.assertTrue(compaction_started.wait(WAIT))
-        self.assertTrue(any("正在压缩" in text for _bot, text in self.replies))
+        self.assertTrue(any("Compacting" in text for _bot, text in self.replies))
 
         self.app._dispatch_update("default", self.text_update("continue please"))
-        self.assertTrue(any("已加入队列" in text for _bot, text in self.replies))
+        self.assertTrue(any("queued as #" in text for _bot, text in self.replies))
         self.assertEqual(turns, [])
 
         release.set()
         self.assertTrue(turn_started.wait(WAIT))
         self.assertEqual(turns, ["continue please"])
-        self.assertTrue(any("压缩完成" in text for _bot, text in self.replies))
+        self.assertTrue(any("Compaction finished" in text for _bot, text in self.replies))
         self.wait_until(lambda: self.app.sessions.get_in_flight(session.session_id) == "turn-after-compact")
 
     def test_interrupted_pi_compaction_is_reported_as_interrupted(self) -> None:
@@ -163,14 +163,14 @@ class OffDispatchTests(unittest.TestCase):
 
         def interrupted_compaction(compacting) -> str:
             self.app._interrupted_sessions.add(compacting.session_id)  # what /interrupt records
-            raise HeadlessBackendError("pi RPC 未返回 compact 结果（exit -15）")
+            raise HeadlessBackendError("pi RPC returned no compact result (exit -15)")
 
         self.app.headless.compact_session = interrupted_compaction  # type: ignore[method-assign]
         self.app._run_in_background = (  # type: ignore[method-assign]
             lambda _name, target, *args: target(*args)
         )
         self.app._dispatch_update("default", self.text_update("/compact"))
-        self.assertIn(("default", "压缩已中断。"), self.replies)
+        self.assertIn(("default", "Compaction interrupted."), self.replies)
         self.assertNotIn(session.session_id, self.app._interrupted_sessions)
         self.assertFalse(self.app._session_is_busy(session))
 
@@ -182,15 +182,15 @@ class OffDispatchTests(unittest.TestCase):
         def slow_diagnostics(_session, *, full: bool) -> str:
             probe_started.set()
             release.wait(WAIT)
-            return f"诊断结果 full={full}"
+            return f"diagnostics full={full}"
 
         self.app._session_diagnostics_text = slow_diagnostics  # type: ignore[method-assign]
         self.app._dispatch_update("default", self.text_update("/status"))
         self.assertTrue(probe_started.wait(WAIT))
         self.app._dispatch_update("worker", self.text_update("/where"))
-        self.assertTrue(any(bot == "worker" and "当前" in text for bot, text in self.replies))
+        self.assertTrue(any(bot == "worker" and "Current" in text for bot, text in self.replies))
         release.set()
-        self.wait_until(lambda: ("default", "诊断结果 full=True") in self.replies)
+        self.wait_until(lambda: ("default", "diagnostics full=True") in self.replies)
 
     def test_auto_send_runs_after_the_publish_lock_is_released(self) -> None:
         session = self.app.sessions.create_headless("pi", self.project, 1)

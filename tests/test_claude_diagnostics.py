@@ -53,7 +53,7 @@ class ClaudeDiagnosticsParsingTests(unittest.TestCase):
 
     def test_native_meter_rows_show_limits_scopes_zero_usage_and_utc_resets(self) -> None:
         text = "\n".join(claude_quota_lines(QUOTA_RESPONSE))
-        for expected in ("Claude（max）", "5小时额度：剩余 100%", "7天额度：剩余 98%", "10-01 12:00 UTC", "Opus：剩余 75%", "额外用量：未启用"):
+        for expected in ("Claude (max)", "5-hour quota: 100% left", "7-day quota: 98% left", "10-01 12:00 UTC", "Opus: 75% left", "Extra usage: off"):
             self.assertIn(expected, text)
         self.assertNotIn("private-account-data", text)
         self.assertNotIn("private-transcript", text)
@@ -66,24 +66,24 @@ class ClaudeDiagnosticsParsingTests(unittest.TestCase):
                 "extra_usage": {"is_enabled": True, "utilization": 20},
             },
         }))
-        self.assertIn("5小时额度：剩余 0%", text)
-        self.assertIn("Sonnet：剩余 90%", text)
-        self.assertIn("额外用量：已启用，已用 20%", text)
+        self.assertIn("5-hour quota: 0% left", text)
+        self.assertIn("Sonnet: 90% left", text)
+        self.assertIn("Extra usage: on, 20% used", text)
         self.assertNotIn("invalid", text)
 
     def test_unavailable_and_malformed_quotas_do_not_imply_available_allowance(self) -> None:
-        self.assertIn("登录方式", "\n".join(claude_quota_lines({"rate_limits_available": False})))
+        self.assertIn("sign-in", "\n".join(claude_quota_lines({"rate_limits_available": False})))
         for value in (None, {}, {"rate_limits": {"limits": [
             {"percent": True}, {"percent": -1}, {"percent": float("nan")},
         ]}}):
             text = "\n".join(claude_quota_lines(value))
-            self.assertIn("未返回", text)
-            self.assertNotIn("剩余", text)
+            self.assertIn("returned no", text)
+            self.assertNotIn("% left", text)
         # Invalid identifiers must not raise or become user-facing labels.
         text = "\n".join(claude_quota_lines({
             "subscription_type": {}, "rate_limits": {"limits": [{"kind": {}, "percent": 50}]},
         }))
-        self.assertIn("剩余 50%", text)
+        self.assertIn("50% left", text)
 
 
 class ClaudeControlQueryTests(unittest.TestCase):
@@ -129,7 +129,7 @@ class ClaudeControlQueryTests(unittest.TestCase):
         backend = self.backend()
         result = backend.read_claude_diagnostics(self.session, model="main-model", include_quota=True)
         self.assertEqual(result["context"], {"model": "main-model", "context_window": 1000000})
-        self.assertIn("剩余 98%", "\n".join(result["quota_lines"]))
+        self.assertIn("98% left", "\n".join(result["quota_lines"]))
         self.assertNotIn("private-account-data", json.dumps(result))
         self.assertNotIn("/private/memory.md", json.dumps(result))
         self.assertEqual(backend._active, {})
@@ -154,27 +154,27 @@ class ClaudeControlQueryTests(unittest.TestCase):
     def test_quota_failure_preserves_successful_window(self) -> None:
         result = self.backend(error_subtype="get_usage").read_claude_diagnostics(self.session, include_quota=True)
         self.assertEqual(result["context"]["context_window"], 1000000)
-        self.assertIn("暂时无法查询", "\n".join(result["quota_lines"]))
+        self.assertIn("temporarily unavailable", "\n".join(result["quota_lines"]))
         self.assertNotIn("private-account-data", json.dumps(result))
 
     def test_unsupported_context_control_still_reads_quotas(self) -> None:
         result = self.backend(error_subtype="get_context_usage").read_claude_diagnostics(self.session, include_quota=True)
         self.assertEqual(result["context"], {})
-        self.assertIn("剩余 98%", "\n".join(result["quota_lines"]))
+        self.assertIn("98% left", "\n".join(result["quota_lines"]))
 
     def test_partial_response_is_bounded_by_timeout_and_cleans_up(self) -> None:
         backend = self.backend(partial=True)
         start = time.monotonic()
-        with self.assertRaisesRegex(HeadlessBackendError, "超时"):
+        with self.assertRaisesRegex(HeadlessBackendError, "timed out"):
             backend.read_claude_diagnostics(self.session, timeout=0.2)
         self.assertLess(time.monotonic() - start, 3)
         self.assertEqual(backend._active, {})
 
     def test_oversized_response_and_missing_executable_fail_without_raw_output(self) -> None:
-        with self.assertRaisesRegex(HeadlessBackendError, "超过限制"):
+        with self.assertRaisesRegex(HeadlessBackendError, "exceeded the size limit"):
             self.backend(oversized=True).read_claude_diagnostics(self.session)
         backend = HeadlessBackend({"claude": ("/missing/claude",)}, lambda *_: None)
-        with self.assertRaisesRegex(HeadlessBackendError, "无法启动"):
+        with self.assertRaisesRegex(HeadlessBackendError, "Could not start"):
             backend.read_claude_diagnostics(self.session)
 
 

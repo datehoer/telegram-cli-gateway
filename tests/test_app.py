@@ -181,7 +181,7 @@ class GatewayEventTests(unittest.TestCase):
                     "text": command,
                 }})
 
-            self.assertEqual(sent, ["未知命令。使用 /help 查看可用命令。"] * 2)
+            self.assertEqual(sent, ["Unknown command. Use /help to see the available commands."] * 2)
 
     def test_tgstats_command_formats_daily_and_recent_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -224,10 +224,10 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(len(sent), 1)
             self.assertIn("UTC 2026-08-26", sent[0])
-            self.assertIn("新消息 4 · 编辑 6 · 其他 2", sent[0])
-            self.assertIn("429 1 · 本地延后 3", sent[0])
-            self.assertIn("近 7 天", sent[0])
-            self.assertIn("flood wait：7 秒", sent[0])
+            self.assertIn("4 new messages · 6 edits · 2 other", sent[0])
+            self.assertIn("1 rate-limited (429) · 3 deferred locally", sent[0])
+            self.assertIn("last 7 days", sent[0])
+            self.assertIn("flood wait: 7 s", sent[0])
             self.assertIn("editMessageText 10", sent[0])
 
     def test_run_continues_when_command_refresh_is_rate_limited(self) -> None:
@@ -268,7 +268,7 @@ class GatewayEventTests(unittest.TestCase):
             }})
 
             self.assertEqual(len(sent), 1)
-            self.assertIn(f"默认目录：{project}", sent[0][0])
+            self.assertIn(f"Default directory: {project}", sent[0][0])
             callbacks = {
                 button["callback_data"]
                 for row in sent[0][1]["inline_keyboard"]
@@ -303,8 +303,8 @@ class GatewayEventTests(unittest.TestCase):
             }})
 
             self.assertEqual(created, [(1, "pi", None)])
-            self.assertEqual(answered, [("new-pi", "正在创建 pi")])
-            self.assertEqual(edited, [(1, 42, "已选择 pi，正在创建…")])
+            self.assertEqual(answered, [("new-pi", "Creating pi")])
+            self.assertEqual(edited, [(1, 42, "Picked pi; creating…")])
 
     def test_new_codex_session_uses_gateway_default_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -326,8 +326,8 @@ class GatewayEventTests(unittest.TestCase):
             app._new_session(1, "codex", None)
 
             self.assertEqual(started, [(str(project), "gpt-6-astra")])
-            self.assertIn("模型：gpt-6-astra（网关默认）", sent[0])
-            self.assertIn("推理力度：high（网关默认）", sent[0])
+            self.assertIn("Model: gpt-6-astra (gateway default)", sent[0])
+            self.assertIn("Reasoning effort: high (gateway default)", sent[0])
 
     def test_new_callback_rejects_disabled_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -350,7 +350,7 @@ class GatewayEventTests(unittest.TestCase):
             }})
 
             self.assertEqual(created, [])
-            self.assertEqual(answered, ["CLI 已失效，请重新 /new"])
+            self.assertEqual(answered, ["That CLI is no longer available; use /new again"])
 
     def test_new_callback_rejects_unapproved_user(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -373,7 +373,7 @@ class GatewayEventTests(unittest.TestCase):
             }})
 
             self.assertEqual(created, [])
-            self.assertEqual(answered, ["没有权限"])
+            self.assertEqual(answered, ["Not allowed"])
 
     def test_reload_command_without_args_shows_current_and_all_buttons(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -396,7 +396,7 @@ class GatewayEventTests(unittest.TestCase):
                 for button in row
             }
             self.assertEqual(callbacks, {f"reload:{session.session_id}", "reload:all"})
-            self.assertIn("Codex 是共享后端", sent[0][0])
+            self.assertIn("Codex is a shared backend", sent[0][0])
 
     def test_reload_current_codex_restarts_shared_backend_and_resumes_all_threads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -427,7 +427,7 @@ class GatewayEventTests(unittest.TestCase):
                 resumed,
                 [("thread-1", "gpt-6-astra"), ("thread-2", "gpt-test")],
             )
-            self.assertEqual(result, "Codex 后端已重启，已恢复 2 个会话。")
+            self.assertEqual(result, "Codex backend restarted; resumed 2 sessions.")
             self.assertEqual(app.sessions.get(first.session_id).external_id, "thread-1")  # type: ignore[union-attr]
 
     def test_reload_current_headless_uses_new_binary_on_next_turn(self) -> None:
@@ -441,8 +441,8 @@ class GatewayEventTests(unittest.TestCase):
 
             result = app._reload_cli_backends(1, session.session_id)
 
-            self.assertIn("pi 按任务启动新进程", result)
-            self.assertIn("下次任务会直接使用当前安装版本", result)
+            self.assertIn("pi: a new process starts for each task", result)
+            self.assertIn("the next task uses the installed version", result)
 
     def test_reload_all_restarts_resident_backend_and_covers_headless_clis(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -463,8 +463,8 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(lifecycle, ["close", "start"])
             self.assertEqual(resumed, ["thread-1"])
-            self.assertIn("Codex 后端已重启", result)
-            self.assertIn("claude、grok、pi 按任务启动新进程", result)
+            self.assertIn("Codex backend restarted", result)
+            self.assertIn("claude, grok, pi: a new process starts for each task", result)
 
     def test_reload_all_rejects_when_a_headless_turn_is_busy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -509,7 +509,7 @@ class GatewayEventTests(unittest.TestCase):
             answers: list[tuple[str, str]] = []
             edits: list[tuple[int, int, str]] = []
             app._reload_cli_backends = (  # type: ignore[method-assign]
-                lambda chat_id, target: targets.append((chat_id, target)) or "重载完成"
+                lambda chat_id, target: targets.append((chat_id, target)) or "reloaded"
             )
             app.telegram.answer_callback_query = (  # type: ignore[method-assign]
                 lambda query_id, text="": answers.append((query_id, text))
@@ -528,8 +528,8 @@ class GatewayEventTests(unittest.TestCase):
             }})
 
             self.assertEqual(targets, [(1, selected.session_id)])
-            self.assertEqual(answers, [("reload-current", "正在重载")])
-            self.assertEqual(edits, [(1, 42, "重载完成")])
+            self.assertEqual(answers, [("reload-current", "Reloading")])
+            self.assertEqual(edits, [(1, 42, "reloaded")])
 
     def test_codex_deltas_accumulate_and_render_as_one_completed_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -551,7 +551,7 @@ class GatewayEventTests(unittest.TestCase):
             view = app._turns[(session.session_id, "turn-1")]
             rendered, answer = app._render_turn(view, view.started_at + 2)
             self.assertEqual(answer, "hello world")
-            self.assertIn("完成 2秒", rendered)
+            self.assertIn("Done 2s", rendered)
             self.assertNotIn("thread-1", app._codex_active_turns)
 
     def test_disabled_cli_cannot_create_or_switch_session(self) -> None:
@@ -576,11 +576,11 @@ class GatewayEventTests(unittest.TestCase):
             sent: list[str] = []
             app._send = lambda _chat_id, text: sent.append(text)  # type: ignore[method-assign]
             app._new_session(1, "claude", None)
-            self.assertIn("未启用 claude", sent[-1])
+            self.assertIn("claude is not enabled", sent[-1])
             app._handle_command(1, "use", disabled.session_id)
             self.assertEqual(app.sessions.current(1).session_id, enabled.session_id)  # type: ignore[union-attr]
             app._send_to_session(1, disabled, "do not run")
-            self.assertIn("不能继续该会话", sent[-1])
+            self.assertIn("this session cannot continue", sent[-1])
 
     def test_codex_approval_is_automatically_accepted_for_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -625,18 +625,18 @@ class GatewayEventTests(unittest.TestCase):
                     "message": {
                         "from": {"id": 1},
                         "chat": {"id": 1, "type": "private"},
-                        "caption": "看看这张图",
+                        "caption": "look at this image",
                         "photo": [{"file_id": "small", "file_size": 1}, {"file_id": "large", "file_size": 9}],
                     }
                 }
             )
             self.assertEqual(downloaded[0][0], "large")
-            self.assertEqual(forwarded[0][1], "看看这张图")
+            self.assertEqual(forwarded[0][1], "look at this image")
             self.assertTrue(forwarded[0][2][0].is_image)
             self.assertEqual(app.sessions.current(1).session_id, session.session_id)  # type: ignore[union-attr]
 
     def test_audio_video_and_voice_updates_are_forwarded_as_files(self) -> None:
-        """WAV 常以 audio 到达；视频、语音、圆形视频和 GIF 也都是文件，一样转交给 CLI。"""
+        """WAV usually arrives as audio; video, voice, video notes and GIFs are files too and reach the CLI."""
         gif = {"file_id": "g", "file_name": "cat.gif.mp4", "mime_type": "video/mp4"}
         cases: list[tuple[dict[str, Any], str, str]] = [
             ({"audio": {"file_id": "a", "file_name": "take.wav", "mime_type": "audio/x-wav"}},
@@ -646,7 +646,7 @@ class GatewayEventTests(unittest.TestCase):
             ({"voice": {"file_id": "o", "file_unique_id": "u1", "mime_type": "audio/ogg"}},
              "voice-u1.", "audio/ogg"),
             ({"video_note": {"file_id": "n", "file_unique_id": "u2"}}, "video_note-u2.mp4", "video/mp4"),
-            # Bot API 给 GIF 同时下发 animation 和 document，只算一个附件。
+            # The Bot API sends a GIF as both animation and document; it counts as one attachment.
             ({"animation": gif, "document": gif}, "cat.gif.mp4", "video/mp4"),
         ]
         with tempfile.TemporaryDirectory() as temporary:
@@ -675,7 +675,7 @@ class GatewayEventTests(unittest.TestCase):
                         {"message": {"from": {"id": 1}, "chat": {"id": 1, "type": "private"}, **fields}}
                     )
                     self.assertEqual(len(forwarded), 1)
-                    self.assertEqual(forwarded[0][1], "请查看并处理这个附件。")
+                    self.assertEqual(forwarded[0][1], "Please review and handle this attachment.")
                     (attachment,) = forwarded[0][2]
                     self.assertTrue(attachment.name.startswith(name_prefix), attachment.name)
                     self.assertEqual(attachment.mime_type, mime_type)
@@ -703,7 +703,7 @@ class GatewayEventTests(unittest.TestCase):
             )
             self.assertEqual(forwarded, [])
             self.assertEqual(len(sent), 1)
-            self.assertIn("贴纸", sent[0])
+            self.assertIn("stickers", sent[0])
 
     def test_media_group_is_coalesced_into_single_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -716,7 +716,7 @@ class GatewayEventTests(unittest.TestCase):
                         "from": {"id": 1},
                         "chat": {"id": 1, "type": "private"},
                         "media_group_id": "mg-1",
-                        "caption": "看这些图",
+                        "caption": "look at these images",
                         "photo": [{"file_id": "a"}],
                     },
                 },
@@ -756,7 +756,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(merged["update_id"], 12)
             message = merged["message"]
             self.assertEqual(message["media_group_id"], "mg-1")
-            self.assertEqual(message["caption"], "看这些图")
+            self.assertEqual(message["caption"], "look at these images")
             self.assertEqual(
                 [item["photo"][0]["file_id"] if "photo" in item else item["document"]["file_id"]
                  for item in message["media"]],
@@ -796,7 +796,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(len(coalesced), 1)
             self.assertEqual(coalesced[0]["update_id"], 21)
             self.assertEqual(coalesced[0]["message"]["text"], "a" * 4096 + tail)
-            # 单段文本不受影响
+            # Single-part text is unaffected
             self.assertEqual(app._coalesce_text_fragments([updates[1]]), [updates[1]])
 
     def test_ordinary_consecutive_messages_stay_separate(self) -> None:
@@ -926,8 +926,8 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(turns, ["x" * 4096 + "last part"])
 
     def test_desktop_split_parts_restore_the_trimmed_line_breaks(self) -> None:
-        # Telegram Desktop 在 2048~4096 之间按段落/换行断开，服务端去掉断点处的空白，
-        # 所以非末段常常远短于 4000。
+        # Telegram Desktop breaks between 2048 and 4096 at paragraphs or newlines and the server
+        # strips the whitespace there, so non-final parts are often well under 4000.
         with tempfile.TemporaryDirectory() as temporary:
             app = self.make_app(Path(temporary))
             head = "\n".join(f"const value{n} = {n};" for n in range(120))
@@ -954,11 +954,11 @@ class GatewayEventTests(unittest.TestCase):
             coalesced = app._coalesce_text_fragments(updates)
             self.assertEqual(len(coalesced), 1)
             self.assertEqual(coalesced[0]["message"]["text"], prose + " the end.")
-            # 拼接后原 entities 的偏移已失效。
+            # Entity offsets are invalid after joining.
             self.assertNotIn("entities", coalesced[0]["message"])
 
     def test_hard_cut_is_measured_in_utf16_units(self) -> None:
-        # 2048 个 emoji 正好是 4096 个 UTF-16 码元：客户端在这里硬切，不能补空白。
+        # 2048 emoji are exactly 4096 UTF-16 units: the client cuts hard here, so no whitespace is restored.
         with tempfile.TemporaryDirectory() as temporary:
             app = self.make_app(Path(temporary))
             emoji = "😀" * 2048
@@ -978,7 +978,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(app._coalesce_text_fragments(updates), updates)
 
     def test_stitched_text_stays_below_the_argv_limit(self) -> None:
-        # claude -p / pi 的 prompt 走 argv，单个参数不能超过 128 KiB。
+        # claude -p and pi take the prompt through argv; one argument cannot exceed 128 KiB.
         with tempfile.TemporaryDirectory() as temporary:
             app = self.make_app(Path(temporary))
             updates = [
@@ -1001,7 +1001,7 @@ class GatewayEventTests(unittest.TestCase):
                 text_update(71, 601, middle),
                 text_update(72, 602, "done"),
             ]
-            # 长轮询先只返回第一段，之后的重拉陆续多出后续片段。
+            # The long poll first returns only the first part; later re-polls add the following parts.
             responses = [parts[:1], parts[:1], parts[:2], parts[:3]]
             calls: list[tuple[int | None, int]] = []
 
@@ -1023,7 +1023,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(len(dispatched), 1)
             self.assertEqual(dispatched[0]["update_id"], 72)
             self.assertEqual(dispatched[0]["message"]["text"], f"{head}\n{middle}\ndone")
-            # 等待时一直用原 offset 重拉，片段在分发前不会被确认。
+            # While waiting, re-polls keep the original offset, so parts are not confirmed before dispatch.
             self.assertEqual(calls, [(None, 1), (None, 0), (None, 0), (None, 0), (73, 1)])
             self.assertEqual(app.sessions.get_telegram_offset("default"), 73)
 
@@ -1106,7 +1106,7 @@ class GatewayEventTests(unittest.TestCase):
                         "from": {"id": 1},
                         "chat": {"id": 1, "type": "private"},
                         "media_group_id": "mg-1",
-                        "caption": "一起看",
+                        "caption": "together",
                         "media": [
                             {"photo": [{"file_id": "p1", "file_size": 2}]},
                             {"document": {"file_id": "d1", "file_name": "a.pdf"}},
@@ -1116,7 +1116,7 @@ class GatewayEventTests(unittest.TestCase):
             )
             self.assertEqual(downloaded, ["p1", "d1"])
             self.assertEqual(len(forwarded), 1)
-            self.assertEqual(forwarded[0][1], "一起看")
+            self.assertEqual(forwarded[0][1], "together")
             self.assertEqual(len(forwarded[0][2]), 2)
             self.assertTrue(forwarded[0][2][0].is_image)
             self.assertFalse(forwarded[0][2][1].is_image)
@@ -1149,7 +1149,7 @@ class GatewayEventTests(unittest.TestCase):
                     }
                 }
             )
-            self.assertEqual(forwarded[0][1], "请查看并处理这些附件。")
+            self.assertEqual(forwarded[0][1], "Please review and handle these attachments.")
 
     def test_audio_album_is_coalesced_and_forwarded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1179,7 +1179,7 @@ class GatewayEventTests(unittest.TestCase):
                         "from": {"id": 1},
                         "chat": {"id": 1, "type": "private"},
                         "media_group_id": "mg-audio",
-                        **({"caption": "混一下"} if index == 0 else {}),
+                        **({"caption": "mixed"} if index == 0 else {}),
                         "audio": {"file_id": f"a{index}", "file_name": name, "mime_type": "audio/x-wav"},
                     },
                 }
@@ -1191,7 +1191,7 @@ class GatewayEventTests(unittest.TestCase):
             app.handle_update(merged)
             self.assertEqual(downloaded, ["a0", "a1"])
             self.assertEqual(len(forwarded), 1)
-            self.assertEqual(forwarded[0][1], "混一下")
+            self.assertEqual(forwarded[0][1], "mixed")
             self.assertEqual([item.name for item in forwarded[0][2]], ["drums.wav", "bass.wav"])
 
     def test_running_turn_render_includes_command_and_elapsed_time(self) -> None:
@@ -1203,12 +1203,12 @@ class GatewayEventTests(unittest.TestCase):
             app._update_turn(session, "turn-1", "command", "ls -la")
             app._update_turn(session, "turn-1", "command_output", "file.txt")
             rendered, _answer = app._render_turn(view, view.started_at + 7)
-            self.assertIn("运行中 7秒", rendered)
-            self.assertIn("当前命令：\n```text\nls -la\n```", rendered)
+            self.assertIn("Running 7s", rendered)
+            self.assertIn("Current command:\n```text\nls -la\n```", rendered)
             self.assertIn("file.txt", rendered)
 
     def test_status_loop_does_not_edit_without_new_cli_events(self) -> None:
-        """CLI 无新输出时保留现有预览，避免只为刷新计时持续调用 Telegram。"""
+        """Without new CLI output the preview stays as it is, so the timer alone never keeps calling Telegram."""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
@@ -1261,10 +1261,10 @@ class GatewayEventTests(unittest.TestCase):
             app._status_loop()
 
             self.assertEqual(len(published), 1)
-            self.assertIn("运行中", published[0])
+            self.assertIn("Running", published[0])
 
     def test_completion_during_running_publish_still_publishes_final_status(self) -> None:
-        """运行态编辑期间到达 completed 时，下一轮必须补发完成态，不能提前移除。"""
+        """When completed arrives during a running edit, the next pass must publish the final state instead of dropping the view."""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
@@ -1300,21 +1300,21 @@ class GatewayEventTests(unittest.TestCase):
             app._status_loop()
 
             self.assertEqual(len(running_updates), 1)
-            self.assertIn("运行中", running_updates[0])
+            self.assertIn("Running", running_updates[0])
             self.assertEqual(len(final_updates), 1)
-            self.assertIn("完成", final_updates[0])
+            self.assertIn("Done", final_updates[0])
             self.assertNotIn((session.session_id, view.turn_id), app._turns)
             self.assertEqual(app.sessions.stale_in_flight(), [])
             saved = app.sessions.get(session.session_id)
             self.assertEqual(saved.last_completed_message_id, 88)  # type: ignore[union-attr]
 
     def test_switching_away_backgrounds_running_turn(self) -> None:
-        """切走后，运行中的 turn 定格为“后台运行中”，不再周期直播。"""
+        """After switching away, a running turn freezes as "running in background" and stops streaming."""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
             first = app.sessions.create_headless("pi", project, 1)
-            app.sessions.create_headless("pi", project, 1)  # 第二个成为当前，切走第一个
+            app.sessions.create_headless("pi", project, 1)  # the second becomes current, switching away from the first
             view = app._register_turn(first, "turn-a")
             view.published = True
             view.live = True
@@ -1345,12 +1345,12 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(len(edited), 1)
             self.assertEqual(edited[0][0], 88)
-            self.assertIn("后台运行中", edited[0][1])
+            self.assertIn("Running in background", edited[0][1])
             self.assertEqual(published, [])
             self.assertFalse(view.live)
 
     def test_background_completion_edits_old_card_without_dumping_chat(self) -> None:
-        """后台任务完成时只原地更新原卡片，不在当前会话底部发新消息或文件。"""
+        """A background task that finishes only updates its own card; nothing is posted at the bottom of the current session."""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             image = project / "chart.png"
@@ -1398,13 +1398,13 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(files, [])
             self.assertEqual(len(edited), 1)
             self.assertFalse(edited[0][2])
-            self.assertIn("完成", edited[0][1])
+            self.assertIn("Done", edited[0][1])
             self.assertNotIn((first.session_id, view.turn_id), app._turns)
             saved = app.sessions.get(first.session_id)
             self.assertEqual(saved.last_completed_message_id, 88)  # type: ignore[union-attr]
 
     def test_background_completion_without_card_waits_for_switch_back(self) -> None:
-        """第一张进度卡发出前就切走：完成后不往当前聊天塞结果，切回后再发。"""
+        """Switching away before the first progress card: the result is not pushed into the current chat; it appears on switching back."""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
@@ -1459,15 +1459,15 @@ class GatewayEventTests(unittest.TestCase):
             self.assertNotIn((first.session_id, view.turn_id), app._turns)
 
     def test_switching_back_pins_running_turn_to_fresh_card(self) -> None:
-        """切回运行中的 session 时，把进度重新钉到一条新卡片，旧卡片记入 stale。"""
+        """Switching back to a running session pins progress to a new card and marks the old card stale."""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
             session = app.sessions.create_headless("pi", project, 1)
             view = app._register_turn(session, "turn-a")
             view.published = True
-            view.live = False  # 之前被冻结
-            view.message_id = 88  # 旧卡片
+            view.live = False  # frozen earlier
+            view.message_id = 88  # the old card
             view.dirty = True
             view.last_edit = -10.0
 
@@ -1500,7 +1500,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(view.stale_message_ids, [88])
             self.assertEqual(len(edited), 1)
             self.assertEqual(edited[0][0], 88)
-            self.assertIn("后台运行中", edited[0][1])
+            self.assertIn("Running in background", edited[0][1])
 
     def test_completed_turn_keeps_full_rich_markdown_table(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1613,7 +1613,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(app.sessions.stale_in_flight(), [])
 
     def test_restart_recovery_reports_interrupted_turns_and_keeps_state(self) -> None:
-        """意外中断的任务：重启后提示 /resume、/cancel，但保留 in_flight 供用户决定。"""
+        """An unexpectedly interrupted task: after a restart the user is offered /resume or /cancel and in_flight stays for that decision."""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
@@ -1642,10 +1642,10 @@ class GatewayEventTests(unittest.TestCase):
             app._send = lambda _chat, text: sent.append(text)  # type: ignore[method-assign]
             app._recover_interrupted_turns()
             self.assertEqual(started, [RESUME_PROMPT])
-            self.assertIn("已自动恢复", sent[0])
+            self.assertIn("resumed automatically", sent[0])
 
     def test_unexpected_kill_marks_resumable_and_keeps_in_flight(self) -> None:
-        """进程意外被杀（非用户主动）：标记可恢复、状态待恢复，in_flight 保留。"""
+        """A process killed unexpectedly (not by the user) is marked resumable, awaits recovery and keeps in_flight."""
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             app = self.make_app(project)
@@ -1661,7 +1661,7 @@ class GatewayEventTests(unittest.TestCase):
                 app.sessions.stale_in_flight(), [(session.session_id, 1, "turn-1")]
             )
             rendered, _answer = app._render_turn(view, view.started_at + 2)
-            self.assertIn("已中断 2秒", rendered)
+            self.assertIn("Interrupted 2s", rendered)
             self.assertIn("/resume", rendered)
 
     def test_user_interrupt_clears_in_flight_and_ignores_late_kill(self) -> None:
@@ -1674,7 +1674,7 @@ class GatewayEventTests(unittest.TestCase):
             app.headless.interrupt = lambda _session_id: True  # type: ignore[method-assign]
             self.assertTrue(app._interrupt_session(session))
             self.assertEqual(app.sessions.stale_in_flight(), [])
-            # 读线程随后上报 interrupted：用户主动，静默收尾，不进入恢复候选
+            # The reader then reports interrupted: user-initiated, so it ends quietly and is no recovery candidate
             app._update_turn(session, "turn-1", "interrupted", 15)
             view = app._turns[(session.session_id, "turn-1")]
             self.assertFalse(view.resumable)
@@ -1699,7 +1699,7 @@ class GatewayEventTests(unittest.TestCase):
                 "text": "/resume",
             }})
             self.assertEqual(started, [RESUME_PROMPT])
-            self.assertIn("正在恢复", sent[0])
+            self.assertIn("Resuming", sent[0])
 
     def test_resume_without_pending_task_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1718,7 +1718,7 @@ class GatewayEventTests(unittest.TestCase):
                 "text": "/resume",
             }})
             self.assertEqual(started, [])
-            self.assertIn("没有待恢复的任务", sent[0])
+            self.assertIn("has no task to resume", sent[0])
 
     def test_cancel_command_discards_pending_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1735,7 +1735,7 @@ class GatewayEventTests(unittest.TestCase):
             }})
             self.assertEqual(app.sessions.stale_in_flight(), [])
             self.assertEqual(app._session_states[session.session_id], STATE_IDLE)
-            self.assertIn("已放弃", sent[0])
+            self.assertIn("Gave up", sent[0])
 
     def test_compact_command_uses_pi_rpc(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1744,7 +1744,7 @@ class GatewayEventTests(unittest.TestCase):
             session = app.sessions.create_headless("pi", project, 1)
             compacted: list[str] = []
             app.headless.compact_session = (  # type: ignore[method-assign]
-                lambda _session: compacted.append(_session.session_id) or "已触发上下文压缩。"
+                lambda _session: compacted.append(_session.session_id) or "Context compaction started."
             )
             sent: list[str] = []
             app._send = lambda _chat, text: sent.append(text)  # type: ignore[method-assign]
@@ -1754,8 +1754,8 @@ class GatewayEventTests(unittest.TestCase):
                 "text": "/compact",
             }})
             self.assertEqual(compacted, [session.session_id])
-            self.assertIn("正在压缩", sent[0])
-            self.assertIn("已触发上下文压缩", sent[1])
+            self.assertIn("Compacting", sent[0])
+            self.assertIn("Context compaction started", sent[1])
             self.assertFalse(app._session_is_busy(session))
 
     def test_compact_rejects_busy_session(self) -> None:
@@ -1771,7 +1771,7 @@ class GatewayEventTests(unittest.TestCase):
                 "chat": {"id": 1, "type": "private"},
                 "text": "/compact",
             }})
-            self.assertIn("请先 /interrupt", sent[0])
+            self.assertIn("/interrupt it before", sent[0])
 
     def test_compact_codex_uses_thread_compact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1792,7 +1792,7 @@ class GatewayEventTests(unittest.TestCase):
                 "text": "/compact",
             }})
             self.assertEqual(compacted, ["thread-1"])
-            self.assertIn("已触发", sent[0])
+            self.assertIn("Started context compaction", sent[0])
 
     def test_compact_codex_background_turn_is_not_published_by_default_bot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1849,7 +1849,7 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(
                 sent_by,
-                [("3", f"已触发 {session.label} 的上下文压缩。")],
+                [("3", f"Started context compaction for {session.label}.")],
             )
             self.assertNotIn((session.session_id, "compact-turn"), app._turns)
             self.assertNotIn("thread-30", app._codex_active_turns)
@@ -1886,7 +1886,7 @@ class GatewayEventTests(unittest.TestCase):
                     "text": "/compact",
                 }})
 
-            self.assertEqual(sent_by, [("3", "压缩失败：compact failed")])
+            self.assertEqual(sent_by, [("3", "Compaction failed: compact failed")])
             self.assertEqual(app._pending_codex_compactions, {})
 
     def test_clear_headless_rotates_external_id(self) -> None:
@@ -1908,7 +1908,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertNotEqual(refreshed.external_id, old_external)  # type: ignore[union-attr]
             self.assertEqual(refreshed.turn_count, 0)  # type: ignore[union-attr]
             self.assertIsNone(refreshed.last_completed_message_id)  # type: ignore[union-attr]
-            self.assertIn("已开新对话", sent[0])
+            self.assertIn("started a new conversation", sent[0])
 
     def test_clear_codex_starts_and_archives_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1938,7 +1938,7 @@ class GatewayEventTests(unittest.TestCase):
             refreshed = app.sessions.get(session.session_id)
             self.assertEqual(refreshed.external_id, "thread-new")  # type: ignore[union-attr]
             self.assertIsNone(refreshed.last_completed_message_id)  # type: ignore[union-attr]
-            self.assertIn("旧线程已归档", sent[0])
+            self.assertIn("the old thread was archived", sent[0])
 
     def test_clear_rejects_busy_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1953,7 +1953,7 @@ class GatewayEventTests(unittest.TestCase):
                 "chat": {"id": 1, "type": "private"},
                 "text": "/clear",
             }})
-            self.assertIn("请先 /interrupt", sent[0])
+            self.assertIn("/interrupt it before", sent[0])
             self.assertEqual(
                 app.sessions.get(session.session_id).external_id,  # type: ignore[union-attr]
                 session.external_id,
@@ -1991,10 +1991,10 @@ class GatewayEventTests(unittest.TestCase):
                 }
             )
             self.assertEqual(app.sessions.current(1).session_id, first.session_id)  # type: ignore[union-attr]
-            self.assertEqual(answered, [("query-1", f"已切换到 {first.session_id}")])
+            self.assertEqual(answered, [("query-1", f"Switched to {first.session_id}")])
             self.assertIn(f"▶ {first.session_id}", edited[0][2])
             self.assertTrue(edited[0][3]["inline_keyboard"])
-            self.assertEqual(sent, [f"[{first.session_id}] · 有什么可以帮你？"])
+            self.assertEqual(sent, [f"[{first.session_id}] · How can I help?"])
 
     def test_switching_to_completed_session_copies_last_result_to_bottom(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2126,7 +2126,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(edited, [])
             self.assertEqual(list(view.steer_notices), [(1, 0)])
             app._publish_steer_notice(view)
-            self.assertIn("CLI 已接收", rich_sent[0])
+            self.assertIn("The CLI accepted", rich_sent[0])
             self.assertIsNone(view.message_id)
             self.assertEqual(view.stale_message_ids, [41])
             self.assertEqual(list(view.steer_notices), [])
@@ -2176,7 +2176,7 @@ class GatewayEventTests(unittest.TestCase):
             app._start_session_turn(1, session, "sneak")
             self.assertEqual(started, [])
             self.assertEqual(len(app._queues[session.session_id]), 1)
-            self.assertIn("已加入队列", sent[0])
+            self.assertIn("queued as #", sent[0])
 
     def test_turn_completion_keeps_busy_until_queued_start_begins(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2255,7 +2255,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(queued[0].bot_key, "worker")
             self.assertEqual(
                 sent_by_worker,
-                [f"{session.label} 正在运行；已加入队列（第 1 条）。"],
+                [f"{session.label} is running; queued as #1."],
             )
 
             started_from: list[tuple[str, str]] = []
@@ -2311,7 +2311,7 @@ class GatewayEventTests(unittest.TestCase):
                 for row in markup["inline_keyboard"]
                 for button in row
             }
-            self.assertIn("🟡 运行中 · 排队 2", text)
+            self.assertIn("🟡 Running · 2 queued", text)
             self.assertIn(f"taskinterrupt:{session.session_id}", callbacks)
             self.assertIn(f"clearqueue:{session.session_id}", callbacks)
 
@@ -2343,7 +2343,7 @@ class GatewayEventTests(unittest.TestCase):
                 }
             })
             self.assertEqual(interrupted, [session.session_id])
-            self.assertEqual(answered, ["已中断并清空 2 条等待消息"])
+            self.assertEqual(answered, ["Interrupted and cleared 2 queued messages"])
             self.assertNotIn(session.session_id, app._queues)
             self.assertTrue(edited)
 
@@ -2355,15 +2355,15 @@ class GatewayEventTests(unittest.TestCase):
 
             app._set_session_state(session.session_id, STATE_WORKING)
             text, _markup = app._sessions_view(1)
-            self.assertIn("🟡 运行中", text)
+            self.assertIn("🟡 Running", text)
 
             app._set_session_state(session.session_id, STATE_IDLE)
             text, _markup = app._sessions_view(1)
-            self.assertIn("🟢 空闲", text)
+            self.assertIn("🟢 Idle", text)
 
             app._set_session_state(session.session_id, STATE_FAILED)
             text, _markup = app._sessions_view(1)
-            self.assertIn("⚫ 上次失败", text)
+            self.assertIn("⚫ Last run failed", text)
 
     def test_update_turn_transitions_working_to_idle_or_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2371,13 +2371,13 @@ class GatewayEventTests(unittest.TestCase):
             app = self.make_app(project)
             session = app.sessions.create_headless("pi", project, 1)
 
-            # 正常完成：working → idle
+            # Normal completion: working → idle
             app._set_session_state(session.session_id, STATE_WORKING)
             view = app._register_turn(session, "turn-done")
             app._update_turn(session, "turn-done", "completed")
             self.assertEqual(app._session_states[session.session_id], STATE_IDLE)
 
-            # 出错：working → failed
+            # Error: working → failed
             app._set_session_state(session.session_id, STATE_WORKING)
             view = app._register_turn(session, "turn-fail")
             app._update_turn(session, "turn-fail", "error", "boom")
@@ -2399,10 +2399,10 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(view.status, "completed")
             self.assertEqual(answer, "")
-            self.assertIn("没有返回可见回答", rendered)
-            self.assertIn("未自动重试", rendered)
+            self.assertIn("without a visible answer", rendered)
+            self.assertIn("did not retry", rendered)
             self.assertNotIn("private reasoning", rendered)
-            self.assertNotIn("正在自动重试", rendered)
+            self.assertNotIn("retrying", rendered)
 
     def test_interrupted_session_does_not_show_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2412,7 +2412,7 @@ class GatewayEventTests(unittest.TestCase):
             app._set_session_state(session.session_id, STATE_WORKING)
             app._interrupted_sessions.add(session.session_id)
             app._register_turn(session, "turn-killed")
-            # 中断后读线程会以非零退出码上报 error，不应把状态置为 failed
+            # After an interrupt the reader reports error with a nonzero exit code; the state must not become failed
             app._update_turn(session, "turn-killed", "error", "exited with status -15")
             self.assertEqual(app._session_states[session.session_id], STATE_IDLE)
             self.assertNotIn(session.session_id, app._interrupted_sessions)
@@ -2424,7 +2424,7 @@ class GatewayEventTests(unittest.TestCase):
             session = app.sessions.create_headless("pi", project, 1)
             app._enqueue(session, PendingInput(1, "one"))
             app._enqueue(session, PendingInput(1, "two"))
-            self.assertIn("排队 2", app._session_status_text(session))
+            self.assertIn("2 queued", app._session_status_text(session))
 
     def test_publish_retry_caps_local_backoff_but_honors_retry_after(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2460,7 +2460,7 @@ class GatewayEventTests(unittest.TestCase):
             self.assertEqual(paths, [artifact])
             view.artifacts = paths
             markup = app._artifact_markup(view)
-            self.assertIn("发送文件：report.csv", markup["inline_keyboard"][0][0]["text"])  # type: ignore[index]
+            self.assertIn("Send file: report.csv", markup["inline_keyboard"][0][0]["text"])  # type: ignore[index]
 
     def test_mp4_button_sends_video_even_from_an_existing_file_button(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2472,7 +2472,7 @@ class GatewayEventTests(unittest.TestCase):
             view = app._register_turn(session, "turn-video")
             view.artifacts = [video]
             button = app._artifact_markup(view)["inline_keyboard"][0][0]  # type: ignore[index]
-            self.assertEqual(button["text"], "发送视频：reunion.MP4")
+            self.assertEqual(button["text"], "Send video: reunion.MP4")
             self.assertTrue(button["callback_data"].startswith("video:"))
 
             sent: list[tuple[Path, bool]] = []
@@ -2595,7 +2595,7 @@ class GatewayEventTests(unittest.TestCase):
             session = app.sessions.create_headless("pi", project, 1)
             view = app._register_turn(session, "turn-auto")
             view.artifacts = [image]
-            app._auto_send_artifacts(view)  # 不应抛出
+            app._auto_send_artifacts(view)  # must not raise
             self.assertEqual(view.auto_sent, [])
 
     def test_model_command_sets_model_on_session(self) -> None:
@@ -2611,7 +2611,7 @@ class GatewayEventTests(unittest.TestCase):
                 "text": "/model gpt-5.5",
             }})
             self.assertEqual(app.sessions.get(session.session_id).model, "gpt-5.5")  # type: ignore[union-attr]
-            self.assertIn("下次任务生效", sent[0])
+            self.assertIn("applies from the next task", sent[0])
 
     def test_model_command_without_arg_shows_picker_buttons(self) -> None:
         import cli_telegram_gateway.app as app_module
@@ -2641,7 +2641,7 @@ class GatewayEventTests(unittest.TestCase):
                 self.assertIn(f"model:{session.session_id}:{app._model_choice_id('m1')}", callbacks)
                 self.assertIn(f"model:{session.session_id}:{app._model_choice_id('m2')}", callbacks)
                 self.assertIn(f"modelclear:{session.session_id}", callbacks)
-                self.assertIn("当前模型：CLI 默认", sent[0][0])
+                self.assertIn("current model: CLI default", sent[0][0])
             finally:
                 app_module.list_models = original
 
@@ -2672,8 +2672,8 @@ class GatewayEventTests(unittest.TestCase):
                     }
                 })
                 self.assertEqual(app.sessions.get(session.session_id).model, "m2")  # type: ignore[union-attr]
-                self.assertEqual(answered, ["模型已设为 m2"])
-                self.assertIn("当前模型：m2", edited[0])
+                self.assertEqual(answered, ["Model set to m2"])
+                self.assertIn("current model: m2", edited[0])
             finally:
                 app_module.list_models = original
 
@@ -2699,7 +2699,7 @@ class GatewayEventTests(unittest.TestCase):
                 }
             })
             self.assertIsNone(app.sessions.get(session.session_id).model)  # type: ignore[union-attr]
-            self.assertEqual(answered, ["已恢复默认模型"])
+            self.assertEqual(answered, ["Restored the default model"])
 
     def test_effort_command_sets_effort_on_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2714,7 +2714,7 @@ class GatewayEventTests(unittest.TestCase):
                 "text": "/effort high",
             }})
             self.assertEqual(app.sessions.get(session.session_id).effort, "high")  # type: ignore[union-attr]
-            self.assertIn("推理力度已设为 high", sent[0])
+            self.assertIn("reasoning effort set to high", sent[0])
 
     def test_start_session_turn_passes_model_and_effort_to_codex(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2752,7 +2752,7 @@ class GatewayEventTests(unittest.TestCase):
             app._update_turn(session, "turn-1", "completed")
             rendered, answer = app._render_turn(view, view.started_at + 3)
             self.assertTrue(rendered.startswith("model: gpt-5.5 · effort: low\n"))
-            self.assertIn("完成 3秒", rendered)
+            self.assertIn("Done 3s", rendered)
             self.assertEqual(answer, "answer text")
             self.assertNotIn("changed-later", rendered)
             self.assertNotIn("private reasoning", rendered)
@@ -2818,8 +2818,8 @@ class GatewayEventTests(unittest.TestCase):
 
             self.assertEqual(captured, {"model": "gpt-6-astra", "effort": "high"})
             self.assertIsNone(app.sessions.get(session.session_id).model)  # type: ignore[union-attr]
-            self.assertIn("gpt-6-astra（网关默认）", app._model_view(session)[0])
-            self.assertIn("high（网关默认）", app._effort_view(session)[0])
+            self.assertIn("gpt-6-astra (gateway default)", app._model_view(session)[0])
+            self.assertIn("high (gateway default)", app._effort_view(session)[0])
 
     def test_headless_session_inherits_gateway_defaults_without_persisting_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
