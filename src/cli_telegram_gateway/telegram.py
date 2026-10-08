@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import shutil
 import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -21,6 +24,15 @@ from .telegram_metrics import TelegramMetrics
 # inbound file metadata stay available so the gateway can keep receiving updates.
 FLOOD_WAIT_GRACE_SECONDS = 1.0
 FLOOD_WAIT_EXEMPT_METHODS = frozenset({"getUpdates", "getFile"})
+
+# Telegram measures small video uploads itself, but a large MP4 sent without its size
+# is stored as a 320x320 clip with no duration and no thumbnail, so clients draw a square
+# box until the file is downloaded. ffprobe and ffmpeg are optional: without them, or on
+# any failure, the video is sent as before.
+VIDEO_TOOL_TIMEOUT_SECONDS = 30
+# Bot API thumbnail limits: JPEG, under 200 kB, at most 320 px per side.
+VIDEO_THUMBNAIL_MAX_SIDE = 320
+VIDEO_THUMBNAIL_MAX_BYTES = 200 * 1000
 
 
 class TelegramError(RuntimeError):
@@ -56,6 +68,82 @@ def split_message(text: str, limit: int = 3800) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def _video_metadata(path: Path) -> dict[str, int]:
+    """Return a video's displayed width and height and its duration, or {} if ffprobe can't tell."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return {}
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "V:0", "-show_entries",
+                (
+                    "stream=width,height,sample_aspect_ratio:stream_side_data=rotation"
+                    ":stream_tags=rotate:format=duration"
+                ),
+                "-of", "json", str(path),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=VIDEO_TOOL_TIMEOUT_SECONDS,
+            check=True,
+        )
+        probe = json.loads(completed.stdout)
+        stream = probe["streams"][0]
+        width, height = int(stream["width"]), int(stream["height"])
+        # Clients size the message from these numbers, so report what the player shows:
+        # widen non-square pixels and swap the sides of a video turned a quarter turn.
+        numerator, _, denominator = str(stream.get("sample_aspect_ratio", "")).partition(":")
+        if numerator.isdigit() and denominator.isdigit() and int(numerator) and int(denominator):
+            width = round(width * int(numerator) / int(denominator))
+        rotation = stream.get("tags", {}).get("rotate", 0)  # ffprobe before 5.0
+        for side_data in stream.get("side_data_list", []):
+            rotation = side_data.get("rotation", rotation)
+        if round(float(rotation)) % 180 == 90:
+            width, height = height, width
+        duration = probe.get("format", {}).get("duration")
+    except (OSError, subprocess.SubprocessError, ValueError, LookupError, TypeError, AttributeError):
+        return {}
+    if width <= 0 or height <= 0:
+        return {}
+    metadata = {"width": width, "height": height}
+    try:
+        seconds = float(duration)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if math.isfinite(seconds) and seconds > 0:
+        metadata["duration"] = max(1, round(seconds))
+    return metadata
+
+
+def _video_thumbnail(path: Path, metadata: dict[str, int]) -> bytes | None:
+    """Return one JPEG frame within the Bot API thumbnail limits, or None if ffmpeg can't make it."""
+    ffmpeg = shutil.which("ffmpeg")
+    width, height = metadata.get("width", 0), metadata.get("height", 0)
+    if not ffmpeg or width <= 0 or height <= 0:
+        return None
+    scale = min(1.0, VIDEO_THUMBNAIL_MAX_SIDE / max(width, height))
+    size = f"{max(1, round(width * scale))}:{max(1, round(height * scale))}"
+    # One second in skips a fade from black; a shorter clip uses its first frame.
+    offset = "1" if metadata.get("duration", 0) >= 2 else "0"
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg, "-v", "error", "-nostdin", "-ss", offset, "-i", str(path),
+                "-map", "0:V:0", "-frames:v", "1", "-vf", f"scale={size},setsar=1",
+                "-q:v", "4", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=VIDEO_TOOL_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    thumbnail = completed.stdout
+    return thumbnail if 0 < len(thumbnail) < VIDEO_THUMBNAIL_MAX_BYTES else None
 
 
 class TelegramClient:
@@ -533,6 +621,14 @@ class TelegramClient:
             method, field_name = "sendVideo", "video"
         else:
             method, field_name = "sendDocument", "document"
+        fields: dict[str, Any] = {"chat_id": chat_id}
+        files: list[tuple[str, str, str, bytes]] = []
+        if as_video:
+            metadata = _video_metadata(path)
+            fields.update(supports_streaming="true", **metadata)
+            thumbnail = _video_thumbnail(path, metadata)
+            if thumbnail is not None:
+                files.append(("thumbnail", "thumbnail.jpg", "image/jpeg", thumbnail))
         if self._local_api:
             try:
                 resolved = path.resolve(strict=True)
@@ -541,47 +637,62 @@ class TelegramClient:
             except OSError as exc:
                 self._metrics.record(method, "failed")
                 raise TelegramError(tr("Could not read the file to send: {error}", error=exc)) from exc
-            payload: dict[str, Any] = {"chat_id": chat_id, field_name: resolved.as_uri()}
-            if as_video:
-                payload["supports_streaming"] = "true"
             # The --local server recognizes local inputs by the file:/ prefix;
             # a bare absolute path is interpreted as a remote file identifier.
             # It reads the file itself without buffering it in the gateway.
-            self._call(method, payload, timeout=3600)
+            fields[field_name] = resolved.as_uri()
+            if not files:
+                self._call(method, fields, timeout=3600)
+                return
+            # The thumbnail travels in the request body, so the server never needs
+            # to read a temporary file of the gateway.
+            self._begin_api_call(method)
+            self._send_multipart(method, fields, files, timeout=3600)
             return
         self._begin_api_call(method)
         content_type = "video/mp4" if as_video else "application/octet-stream"
-        boundary = f"----telegram-cli-gateway-{uuid.uuid4().hex}"
         try:
             file_data = path.read_bytes()
         except OSError as exc:
             self._metrics.record(method, "failed")
             raise TelegramError(tr("Could not read the file to send: {error}", error=exc)) from exc
+        files.insert(0, (field_name, path.name.replace('"', "_"), content_type, file_data))
+        self._send_multipart(method, fields, files, timeout=90, connection_error="failed")
+
+    def _send_multipart(
+        self,
+        method: str,
+        fields: dict[str, Any],
+        files: list[tuple[str, str, str, bytes]],
+        *,
+        timeout: float,
+        connection_error: str = "connection failed",
+    ) -> Any:
+        """Send form fields and (field, filename, content type, data) file parts."""
+        boundary = f"----telegram-cli-gateway-{uuid.uuid4().hex}"
         parts = [
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode(),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
+            for name, value in fields.items()
         ]
-        if as_video:
-            parts.append(
-                f"--{boundary}\r\nContent-Disposition: form-data; name=\"supports_streaming\"\r\n\r\ntrue\r\n".encode()
+        for name, filename, content_type, data in files:
+            parts.extend(
+                [
+                    (
+                        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; "
+                        f"filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+                    ).encode("utf-8"),
+                    data,
+                    b"\r\n",
+                ]
             )
-        parts.extend(
-            [
-                (
-                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; "
-                    f"filename=\"{path.name.replace(chr(34), '_')}\"\r\n"
-                    f"Content-Type: {content_type}\r\n\r\n"
-                ).encode("utf-8"),
-                file_data,
-                f"\r\n--{boundary}--\r\n".encode(),
-            ]
-        )
+        parts.append(f"--{boundary}--\r\n".encode())
         request = urllib.request.Request(
             self._base_url + method,
             data=b"".join(parts),
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             method="POST",
         )
-        self._send_request(method, request, timeout=90, connection_error="failed")
+        return self._send_request(method, request, timeout=timeout, connection_error=connection_error)
 
     def send_action(self, chat_id: int, action: str = "typing") -> None:
         self._call("sendChatAction", {"chat_id": chat_id, "action": action})

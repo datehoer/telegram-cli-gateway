@@ -64,6 +64,11 @@ TELEGRAM_MAX_FILE_BYTES=1073741824
 Local uploads pass `file:///` URIs to `sendVideo`/`sendDocument`, so the gateway never
 loads the whole file into memory. A bare absolute path would be read by the server as a
 remote file identifier and cannot replace the file URI. Uploads wait up to 3600 seconds.
+A video's thumbnail travels in the request body, so the server never reads a gateway
+temporary file. The server reuses an earlier upload of the same path for as long as it
+runs (it keeps no file database), together with the size and thumbnail sent the first
+time: a video first sent without them stays a 320x320 square on every resend until the
+server restarts or the file is copied to a new path.
 After a network failure nothing is uploaded again automatically, to avoid duplicate
 messages. When an incoming `getFile` returns an absolute path, the gateway copies it in
 chunks and keeps the size limit, private permissions and atomic replacement.

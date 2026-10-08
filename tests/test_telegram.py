@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 import urllib.error
@@ -9,7 +11,13 @@ import urllib.parse
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from cli_telegram_gateway.telegram import TelegramClient, TelegramError, split_message
+from cli_telegram_gateway.telegram import (
+    TelegramClient,
+    TelegramError,
+    _video_metadata,
+    _video_thumbnail,
+    split_message,
+)
 
 
 class TelegramTests(unittest.TestCase):
@@ -201,6 +209,90 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(today["new_messages"], 1)
         self.assertEqual(today["methods"]["sendVideo"]["success"], 1)
 
+    def test_local_video_upload_sends_its_size_duration_and_thumbnail(self) -> None:
+        # Without these fields Telegram stores a large video as 320x320 with no
+        # thumbnail, and clients show a square box until it is downloaded.
+        client = TelegramClient("test", local_api_url="http://127.0.0.1:8081")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true, "result": {"message_id": 7}}'
+        metadata = {"width": 1280, "height": 720, "duration": 139}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "clip.mp4"
+            path.write_bytes(b"video bytes")
+            with (
+                patch("cli_telegram_gateway.telegram._video_metadata", return_value=metadata),
+                patch(
+                    "cli_telegram_gateway.telegram._video_thumbnail", return_value=b"\xff\xd8jpeg"
+                ) as thumbnail,
+                patch.object(Path, "read_bytes", side_effect=AssertionError("must not buffer")),
+                patch("urllib.request.urlopen", return_value=response) as upload,
+            ):
+                client.send_local_file(1, path, as_video=True)
+            thumbnail.assert_called_once_with(path, metadata)
+            request = upload.call_args.args[0]
+            self.assertEqual(request.full_url, "http://127.0.0.1:8081/bottest/sendVideo")
+            self.assertEqual(upload.call_args.kwargs["timeout"], 3600)
+            for name, value in (
+                ("video", path.resolve().as_uri()),
+                ("supports_streaming", "true"),
+                ("width", "1280"),
+                ("height", "720"),
+                ("duration", "139"),
+            ):
+                self.assertIn(f'name="{name}"\r\n\r\n{value}\r\n'.encode(), request.data)
+            self.assertIn(
+                b'name="thumbnail"; filename="thumbnail.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
+                b"\xff\xd8jpeg\r\n",
+                request.data,
+            )
+            self.assertNotIn(b"video bytes", request.data)
+        self.assertEqual(client.metrics_snapshot()["today"]["methods"]["sendVideo"]["success"], 1)
+
+    def test_cloud_video_upload_sends_its_size_duration_and_thumbnail(self) -> None:
+        client = TelegramClient("test")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true, "result": {"message_id": 7}}'
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "clip.mp4"
+            path.write_bytes(b"video bytes")
+            with (
+                patch(
+                    "cli_telegram_gateway.telegram._video_metadata",
+                    return_value={"width": 720, "height": 1280, "duration": 5},
+                ),
+                patch("cli_telegram_gateway.telegram._video_thumbnail", return_value=b"jpeg"),
+                patch("urllib.request.urlopen", return_value=response) as upload,
+            ):
+                client.send_local_file(1, path, as_video=True)
+        request = upload.call_args.args[0]
+        self.assertIn(
+            b'name="video"; filename="clip.mp4"\r\nContent-Type: video/mp4\r\n\r\nvideo bytes\r\n',
+            request.data,
+        )
+        for name, value in (("width", b"720"), ("height", b"1280"), ("duration", b"5")):
+            self.assertIn(f'name="{name}"\r\n\r\n'.encode() + value + b"\r\n", request.data)
+        boundary = request.get_header("Content-type").split("boundary=")[1]
+        self.assertTrue(request.data.endswith(
+            b'name="thumbnail"; filename="thumbnail.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
+            + f"jpeg\r\n--{boundary}--\r\n".encode()
+        ))
+
+    def test_video_is_sent_as_before_when_ffprobe_is_missing(self) -> None:
+        client = TelegramClient("test", local_api_url="http://127.0.0.1:8081")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "clip.mp4"
+            path.write_bytes(b"video")
+            with (
+                patch("cli_telegram_gateway.telegram.shutil.which", return_value=None),
+                patch.object(client, "_call") as call,
+            ):
+                client.send_local_file(1, path, as_video=True)
+            self.assertEqual(call.call_args.args, ("sendVideo", {
+                "chat_id": 1, "supports_streaming": "true", "video": path.resolve().as_uri()
+            }))
+
     def test_markdown_fallback_does_not_retry_rate_limit_immediately(self) -> None:
         client = TelegramClient("test")
         calls: list[str] = []
@@ -377,6 +469,74 @@ class TelegramTests(unittest.TestCase):
         ids = client.edit_rich_markdown(1, 9, "a" * 30001, allow_split=False)
         self.assertEqual(ids, [9])
         self.assertEqual(calls, ["editMessageText"])
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg is not installed")
+class VideoMetadataTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+
+    def _clip(self, name: str, *options: str) -> Path:
+        path = self.directory / name
+        subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi",
+                "-i", "testsrc=size=320x240:rate=10:duration=3", *options, "-c:v", "mpeg4", str(path),
+            ],
+            check=True,
+        )
+        return path
+
+    def _jpeg_size(self, jpeg: bytes) -> str:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0", "-"],
+            input=jpeg,
+            capture_output=True,
+            check=True,
+        )
+        return probe.stdout.decode().strip()
+
+    def test_plain_video_reports_its_size_and_duration(self) -> None:
+        path = self._clip("plain.mp4")
+        metadata = _video_metadata(path)
+        self.assertEqual(metadata, {"width": 320, "height": 240, "duration": 3})
+        thumbnail = _video_thumbnail(path, metadata)
+        assert thumbnail is not None
+        self.assertTrue(thumbnail.startswith(b"\xff\xd8"))
+        self.assertEqual(self._jpeg_size(thumbnail), "320,240")
+
+    def test_non_square_pixels_widen_the_reported_size(self) -> None:
+        path = self._clip("anamorphic.mp4", "-vf", "setsar=2")
+        metadata = _video_metadata(path)
+        self.assertEqual(metadata, {"width": 640, "height": 240, "duration": 3})
+        thumbnail = _video_thumbnail(path, metadata)
+        assert thumbnail is not None
+        self.assertEqual(self._jpeg_size(thumbnail), "320,120")
+
+    def test_a_quarter_turn_swaps_the_reported_sides(self) -> None:
+        plain = self._clip("plain.mp4")
+        rotated = self.directory / "rotated.mp4"
+        remux = subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-display_rotation", "90", "-i", str(plain),
+             "-c", "copy", str(rotated)],
+            capture_output=True,
+            check=False,
+        )
+        if remux.returncode:
+            self.skipTest("this ffmpeg cannot set a display rotation")
+        metadata = _video_metadata(rotated)
+        self.assertEqual(metadata, {"width": 240, "height": 320, "duration": 3})
+        thumbnail = _video_thumbnail(rotated, metadata)
+        assert thumbnail is not None
+        self.assertEqual(self._jpeg_size(thumbnail), "240,320")
+
+    def test_a_file_that_is_not_a_video_reports_nothing(self) -> None:
+        path = self.directory / "fake.mp4"
+        path.write_bytes(b"not a video")
+        self.assertEqual(_video_metadata(path), {})
+        self.assertIsNone(_video_thumbnail(path, {}))
 
 
 if __name__ == "__main__":
